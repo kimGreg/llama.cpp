@@ -90,6 +90,15 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     int id = -1; // in case cudaGetDevice fails
     (void)cudaGetDevice(&id);
 
+    // Also write directly to stderr with fflush — GGML_LOG_ERROR's
+    // callback can be filtered or buffered, losing the error string
+    // before GGML_ABORT terminates the process. This guarantees the
+    // message is visible.
+    std::fprintf(stderr, GGML_CUDA_NAME " error: %s\n", msg);
+    std::fprintf(stderr, "  current device: %d, in function %s at %s:%d\n", id, func, file, line);
+    std::fprintf(stderr, "  %s\n", stmt);
+    std::fflush(stderr);
+
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
@@ -2224,6 +2233,23 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+// streamllm-ext fusion-skip hook: returns true if the given weight
+// tensor is runtime-managed (src0 data is a placeholder) and must be
+// dispatched via the regular mul_mat path so the streamllm hook gets
+// a chance to claim it. Used by the ffn_up + ffn_gate + glu fusion
+// predicate and the mul_mat_vec fusion predicates. Definition is
+// early so the predicates below can refer to it.
+typedef bool (*ggml_cuda_fusion_skip_hook_t)(const ggml_tensor *);
+static ggml_cuda_fusion_skip_hook_t g_cuda_fusion_skip_hook = nullptr;
+
+extern "C" void ggml_cuda_set_fusion_skip_hook(void * hook_fn) {
+    g_cuda_fusion_skip_hook = (ggml_cuda_fusion_skip_hook_t) hook_fn;
+}
+
+static inline bool ggml_cuda_fusion_is_blocked(const ggml_tensor * w) {
+    return g_cuda_fusion_skip_hook != nullptr && g_cuda_fusion_skip_hook(w);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -2241,6 +2267,14 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
+        return false;
+    }
+
+    // streamllm-ext: skip fusion if either weight is runtime-managed.
+    // The mul_mat must go through the regular dispatch so the hook can
+    // claim it; otherwise the fused kernel would dereference a placeholder.
+    if (ggml_cuda_fusion_is_blocked(ffn_up->src[0]) ||
+        ggml_cuda_fusion_is_blocked(ffn_gate->src[0])) {
         return false;
     }
 
@@ -2314,6 +2348,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // streamllm-ext: skip fusion if the weight is runtime-managed.
+    if (ggml_cuda_fusion_is_blocked(src0)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -2349,6 +2388,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // streamllm-ext: skip fusion if the weight is runtime-managed.
+    if (ggml_cuda_fusion_is_blocked(src0)) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -2382,7 +2426,34 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// streamllm-ext hook: optional override for GGML_OP_MUL_MAT. When set
+// (streamllm-ext's runtime registers it after model load), called before
+// the default dispatch. Return value true means the hook handled the op;
+// false falls through to the normal path. No-op when the hook pointer
+// is null (i.e. stock builds without streamllm-ext linked in).
+typedef bool (*ggml_cuda_mul_mat_hook_t)(
+    cudaStream_t stream,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    ggml_tensor * dst);
+
+static ggml_cuda_mul_mat_hook_t g_cuda_mul_mat_hook = nullptr;
+
+// Exposed via ggml-cuda.h as ``void *`` so external callers don't need
+// ggml-cuda's internal types to link against us.
+extern "C" void ggml_cuda_set_mul_mat_hook(void * hook_fn) {
+    g_cuda_mul_mat_hook = (ggml_cuda_mul_mat_hook_t) hook_fn;
+}
+
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // streamllm-ext override path. Runs first so the extension can claim
+    // managed weights before cuBLAS / custom quant kernels do anything.
+    if (g_cuda_mul_mat_hook != nullptr &&
+        g_cuda_mul_mat_hook(ctx.stream(), src0, src1, dst)) {
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -3087,6 +3158,19 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+
+    // streamllm-ext's mul_mat hook previously used per-call
+    // cudaMallocAsync for pointer-array + acc_f32 staging, which is
+    // graph-unsafe. Post-refactor the hook uses a runtime-owned
+    // single-stream scratch and pre-uploaded per-tensor device ptr
+    // arrays — all hot-path ops are cudaMemsetAsync + kernel launches
+    // which ARE graph-safe. Opt into graph capture via env var for now;
+    // flip to always-on once swap1 / multi-stream cases are validated.
+    if (g_cuda_mul_mat_hook != nullptr) {
+        const char * enable = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
+        const bool allow = enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
+        if (!allow) return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph

@@ -573,6 +573,13 @@ llama_model_loader::llama_model_loader(
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            // streamllm-ext byte-blob tensors (named ``streamllm.bytes.*``)
+            // are consumed out-of-band by StreamllmRuntime — they never
+            // correspond to an arch-level ``create_tensor()`` call, so
+            // skip them here to keep ``n_tensors`` matched to the arch.
+            if (tensor_name.rfind("streamllm.bytes.", 0) == 0) {
+                continue;
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -683,6 +690,13 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset info of the main file.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            // streamllm-ext byte-blob tensors (named ``streamllm.bytes.*``)
+            // are consumed out-of-band by StreamllmRuntime — they never
+            // correspond to an arch-level ``create_tensor()`` call, so
+            // skip them here to keep ``n_tensors`` matched to the arch.
+            if (tensor_name.rfind("streamllm.bytes.", 0) == 0) {
+                continue;
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -700,6 +714,27 @@ llama_model_loader::llama_model_loader(
     n_tensors = weights_map.size();
 
     fver = (enum llama_fver) gguf_get_version(metadata);
+
+    // streamllm-ext: read the managed-tensor name list once. Their F16
+    // placeholders in the GGUF are never read by any backend — the
+    // runtime's mul_mat hook resolves them by name, so we skip both
+    // the backend-buffer allocation and the disk copy for those
+    // tensors. If the file has no ``streamllm.version`` KV this is a
+    // stock GGUF and the set stays empty.
+    if (gguf_find_key(metadata, "streamllm.version") >= 0) {
+        const int64_t mid = gguf_find_key(metadata, "streamllm.managed_tensors");
+        if (mid >= 0) {
+            const size_t n = gguf_get_arr_n(metadata, mid);
+            streamllm_managed.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                const char * s = gguf_get_arr_str(metadata, mid, i);
+                if (s && s[0]) streamllm_managed.emplace(s);
+            }
+            LLAMA_LOG_INFO("%s: streamllm-ext: %zu tensors will be skipped "
+                "from the backend buffer (owned by runtime)\n",
+                __func__, streamllm_managed.size());
+        }
+    }
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
             __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
@@ -1525,6 +1560,17 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // streamllm-ext: the F16 placeholder for a managed tensor is
+        // never read by the runtime (the mul_mat hook resolves it by
+        // name from the GGUF's streamllm.* blob instead). Skip the
+        // disk copy entirely — the CUDA buffer has no allocation for
+        // it either, so there's nothing to write into.
+        if (!streamllm_managed.empty() &&
+            streamllm_managed.find(cur->name) != streamllm_managed.end()) {
+            size_done += n_size;
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

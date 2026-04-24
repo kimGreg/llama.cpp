@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -102,6 +103,13 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+
+    // streamllm-ext: names listed in ``streamllm.managed_tensors``.
+    // Their F16 placeholders in the GGUF are NOT copied into the
+    // CUDA backend buffer — the runtime owns their bytes and the
+    // mul_mat hook resolves them by name at dispatch time. Empty on
+    // stock GGUFs.
+    std::unordered_set<std::string> streamllm_managed;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {

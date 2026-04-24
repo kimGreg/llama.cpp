@@ -15,6 +15,10 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#if defined(STREAMLLM_EXT_ENABLED)
+#include "runtime_hook.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
@@ -377,6 +381,23 @@ static struct llama_model * llama_model_load_from_file_impl(
         llama_model_free(model);
         return nullptr;
     }
+
+#if defined(STREAMLLM_EXT_ENABLED)
+    // Install the streamllm-ext runtime + register the ggml-cuda hook
+    // if this GGUF carries streamllm.* metadata. No-op on stock files.
+    // Failures throw — caught here so a bad streamllm artifact doesn't
+    // leave a half-torn-down model behind.
+    if (!path_model.empty()) {
+        try {
+            streamllm_ext::install_for_gguf(path_model.c_str());
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: streamllm-ext install failed: %s\n",
+                __func__, e.what());
+            llama_model_free(model);
+            return nullptr;
+        }
+    }
+#endif
 
     return model;
 }

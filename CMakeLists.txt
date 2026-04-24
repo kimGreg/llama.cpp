@@ -190,6 +190,15 @@ endif()
 # build the library
 #
 
+# StreamLLM extension (opt-in, OFF by default). Built BEFORE src so
+# libllama can link against it when STREAMLLM_EXT=ON. When OFF, this
+# branch's build is bit-identical to upstream ggml-org/llama.cpp at the
+# pinned commit cd03ec76. See streamllm-ext/CMakeLists.txt.
+option(STREAMLLM_EXT "Build StreamLLM chunked-weight extension" OFF)
+if (STREAMLLM_EXT)
+    add_subdirectory(streamllm-ext)
+endif()
+
 add_subdirectory(src)
 
 #

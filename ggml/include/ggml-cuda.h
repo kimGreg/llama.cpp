@@ -45,6 +45,25 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// streamllm-ext integration: register an override for GGML_OP_MUL_MAT.
+// The hook is called before the default dispatch inside ggml_cuda_mul_mat;
+// returning true signals "op handled", false falls through. Stream is the
+// current CUDA compute stream; src0/src1/dst are the op's operands (src0
+// is the weight, src1 the activations). Set to null to unregister.
+//
+// Declared as a raw ``void *`` to keep this header CUDA-runtime-clean;
+// the implementation casts to the concrete function-pointer type.
+GGML_BACKEND_API void ggml_cuda_set_mul_mat_hook(void * hook_fn);
+
+// streamllm-ext integration: fusion-skip query. When set, ggml-cuda calls
+// this before fusing a mul_mat into a larger subgraph (ffn_up + ffn_gate
+// + glu, mul_mat_vec + glu, etc.). If it returns true for the candidate
+// weight tensor, fusion is disabled and the mul_mat is dispatched via the
+// normal path where the streamllm hook can claim it. Callback signature:
+//   bool fn(const struct ggml_tensor * weight_tensor);
+// Set to null to unregister. Independent of the mul_mat hook.
+GGML_BACKEND_API void ggml_cuda_set_fusion_skip_hook(void * hook_fn);
+
 #ifdef  __cplusplus
 }
 #endif

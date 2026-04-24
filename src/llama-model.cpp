@@ -19,6 +19,11 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#if defined(STREAMLLM_EXT_ENABLED)
+#include "runtime_hook.h"
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -645,7 +650,13 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+#if defined(STREAMLLM_EXT_ENABLED)
+        for (void * p : streamllm_seed_ptrs) {
+            if (p) cudaFree(p);
+        }
+#endif
+    }
 
     uint64_t n_elements = 0;
 
@@ -662,6 +673,14 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+
+#if defined(STREAMLLM_EXT_ENABLED)
+    // streamllm-ext: dummy CUDA allocations used as safe ``t->data``
+    // placeholders for managed-tensor weights. They prevent any stray
+    // read from faulting; the actual weight bytes live in the runtime
+    // pool.
+    std::vector<void *> streamllm_seed_ptrs;
+#endif
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -7975,7 +7994,42 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                // streamllm-ext: managed weights are owned by the runtime,
+                // not the backend buffer. Seed ``t->data`` to a real
+                // CUDA allocation so ggml-alloc's size pass (see
+                // ggml_backend_alloc_ctx_tensors_from_buft_impl) treats
+                // them as already-placed and skips their bytes, and any
+                // stray dereference hits valid (if meaningless) memory
+                // rather than faulting. After allocation we set
+                // ``t->buffer`` to the CUDA buffer so ggml_backend_sched
+                // routes mul_mat to this backend; the hook claims the
+                // op before any kernel reads it.
+                void * streamllm_seed = nullptr;
+                const bool has_managed =
+                    !ml.streamllm_managed.empty() &&
+                    ggml_backend_buft_is_host(buft) == false &&
+                    ggml_backend_buft_get_device(buft) != nullptr;
+                if (has_managed) {
+                    if (cudaMalloc(&streamllm_seed, 4096) != cudaSuccess) {
+                        streamllm_seed = nullptr;
+                    }
+                }
+                if (streamllm_seed) {
+                    pimpl->streamllm_seed_ptrs.push_back(streamllm_seed);
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        if (ml.streamllm_managed.find(t->name) != ml.streamllm_managed.end()) {
+                            t->data = streamllm_seed;
+                        }
+                    }
+                }
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (buf != nullptr && streamllm_seed) {
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        if (t->data == streamllm_seed) {
+                            t->buffer = buf;
+                        }
+                    }
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -9107,6 +9161,13 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+#if defined(STREAMLLM_EXT_ENABLED)
+    // Unregister the mul_mat hook + tear down the VRAM pool before
+    // the model itself goes away, so we release managed weights on
+    // exactly the same device ``llama_model_load_from_file_impl``
+    // installed them on.
+    streamllm_ext::clear();
+#endif
     delete model;
 }
 
