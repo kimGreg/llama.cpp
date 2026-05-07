@@ -168,44 +168,66 @@ UpstreamLayoutHost build_upstream_layout_host(
     };
 
     for (int32_t p = 0; p < P; ++p) {
-        const uint8_t * signs_in = tensor_data + plane_off;
-        const float *   alpha_in = reinterpret_cast<const float *>(
-            signs_in + plane_sign_bytes);
-
-        uint8_t * chunk    = out.chunks[p].data();
-        uint32_t * qw_out  = reinterpret_cast<uint32_t *>(chunk);
-        uint16_t * a_out   = reinterpret_cast<uint16_t *>(chunk + out.qw_bytes_per_chunk);
-
-        // alpha[d1 = row*ng + kg] → α_out[kg, row] fp16.
-        for (int32_t row = 0; row < n; ++row) {
-            for (int32_t kg = 0; kg < ng; ++kg) {
-                a_out[(size_t)kg * n + row] =
-                    fp32_to_fp16_rne(alpha_in[row * ng + kg]);
-            }
-        }
-
-        // Signs: per-row, pack 32 MSB-first bits of each byte into
-        // LSB-first uint32. Result in qw_out[kt, row].
-        for (int32_t row = 0; row < n; ++row) {
-            const uint8_t * row_bytes = signs_in + (size_t)row * bytes_per_row;
-            for (int32_t kt = 0; kt < K_over_32; ++kt) {
-                uint32_t packed = 0;
-                for (int32_t byte_idx = 0; byte_idx < 4; ++byte_idx) {
-                    uint8_t b = row_bytes[kt * 4 + byte_idx];
-                    for (int32_t bit_in_byte = 0; bit_in_byte < 8; ++bit_in_byte) {
-                        int32_t col_in_tile = byte_idx * 8 + bit_in_byte;
-                        int32_t sign_bit = (b >> (7 - bit_in_byte)) & 1;
-                        if (sign_bit) packed |= kPow2[col_in_tile];
-                    }
-                }
-                qw_out[(size_t)kt * n + row] = packed;
-            }
-        }
-
+        const uint8_t * disk_plane = tensor_data + plane_off;
+        plane_disk_to_kernel(
+            disk_plane, out.chunks[p].data(),
+            /*n=*/n, /*padded_m=*/padded_m, /*ng=*/ng);
         plane_off += layout.chunk_bytes[p];
     }
 
     return out;
+}
+
+void plane_disk_to_kernel(
+    const uint8_t * disk_in,
+    uint8_t       * kernel_out,
+    int32_t         n,
+    int32_t         padded_m,
+    int32_t         ng)
+{
+    const int32_t K_over_32      = padded_m / 32;
+    const int32_t bytes_per_row  = padded_m / 8;
+    const int32_t plane_sign_bytes = (int32_t)((size_t)n * (size_t)bytes_per_row);
+    const size_t  qw_bytes        = (size_t)K_over_32 * (size_t)n * sizeof(uint32_t);
+
+    static const uint32_t kPow2[32] = {
+        1u<<0,  1u<<1,  1u<<2,  1u<<3,  1u<<4,  1u<<5,  1u<<6,  1u<<7,
+        1u<<8,  1u<<9,  1u<<10, 1u<<11, 1u<<12, 1u<<13, 1u<<14, 1u<<15,
+        1u<<16, 1u<<17, 1u<<18, 1u<<19, 1u<<20, 1u<<21, 1u<<22, 1u<<23,
+        1u<<24, 1u<<25, 1u<<26, 1u<<27, 1u<<28, 1u<<29, 1u<<30, 1u<<31,
+    };
+
+    const uint8_t * signs_in = disk_in;
+    const float   * alpha_in = reinterpret_cast<const float *>(
+        disk_in + plane_sign_bytes);
+    uint32_t * qw_out = reinterpret_cast<uint32_t *>(kernel_out);
+    uint16_t * a_out  = reinterpret_cast<uint16_t *>(kernel_out + qw_bytes);
+
+    // alpha[d1 = row*ng + kg] → α_out[kg, row] fp16.
+    for (int32_t row = 0; row < n; ++row) {
+        for (int32_t kg = 0; kg < ng; ++kg) {
+            a_out[(size_t)kg * n + row] =
+                fp32_to_fp16_rne(alpha_in[row * ng + kg]);
+        }
+    }
+
+    // Signs: per-row, pack 32 MSB-first bits of each byte into LSB-first
+    // uint32. Result in qw_out[kt, row].
+    for (int32_t row = 0; row < n; ++row) {
+        const uint8_t * row_bytes = signs_in + (size_t)row * bytes_per_row;
+        for (int32_t kt = 0; kt < K_over_32; ++kt) {
+            uint32_t packed = 0;
+            for (int32_t byte_idx = 0; byte_idx < 4; ++byte_idx) {
+                uint8_t b = row_bytes[kt * 4 + byte_idx];
+                for (int32_t bit_in_byte = 0; bit_in_byte < 8; ++bit_in_byte) {
+                    int32_t col_in_tile = byte_idx * 8 + bit_in_byte;
+                    int32_t sign_bit = (b >> (7 - bit_in_byte)) & 1;
+                    if (sign_bit) packed |= kPow2[col_in_tile];
+                }
+            }
+            qw_out[(size_t)kt * n + row] = packed;
+        }
+    }
 }
 
 } // namespace streamllm_ext

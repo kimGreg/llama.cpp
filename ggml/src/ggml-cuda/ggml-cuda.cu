@@ -2445,6 +2445,34 @@ extern "C" void ggml_cuda_set_mul_mat_hook(void * hook_fn) {
     g_cuda_mul_mat_hook = (ggml_cuda_mul_mat_hook_t) hook_fn;
 }
 
+// streamllm-ext mul_mat_id hook. Same pattern as the dense hook but for
+// GGML_OP_MUL_MAT_ID (MoE expert dispatch).
+typedef bool (*ggml_cuda_mul_mat_id_hook_t)(
+    cudaStream_t stream,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    ggml_tensor * dst);
+
+static ggml_cuda_mul_mat_id_hook_t g_cuda_mul_mat_id_hook = nullptr;
+
+extern "C" void ggml_cuda_set_mul_mat_id_hook(void * hook_fn) {
+    g_cuda_mul_mat_id_hook = (ggml_cuda_mul_mat_id_hook_t) hook_fn;
+}
+
+// streamllm-ext: notification before ggml_cuda_op_topk_moe. See header.
+typedef void (*ggml_cuda_topk_moe_hook_t)(
+    cudaStream_t stream,
+    const ggml_tensor * logits,
+    ggml_tensor *       weights,
+    ggml_tensor *       ids);
+
+static ggml_cuda_topk_moe_hook_t g_cuda_topk_moe_hook = nullptr;
+
+extern "C" void ggml_cuda_set_topk_moe_hook(void * hook_fn) {
+    g_cuda_topk_moe_hook = (ggml_cuda_topk_moe_hook_t) hook_fn;
+}
+
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // streamllm-ext override path. Runs first so the extension can claim
@@ -2542,6 +2570,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    // streamllm-ext override path. Mirrors the dense ggml_cuda_mul_mat
+    // hook protocol: returning true means "op handled", false falls
+    // through to the normal MoE dispatch below.
+    if (g_cuda_mul_mat_id_hook != nullptr &&
+        g_cuda_mul_mat_id_hook(ctx.stream(), src0, src1, ids, dst)) {
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -3166,11 +3202,25 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // arrays — all hot-path ops are cudaMemsetAsync + kernel launches
     // which ARE graph-safe. Opt into graph capture via env var for now;
     // flip to always-on once swap1 / multi-stream cases are validated.
-    if (g_cuda_mul_mat_hook != nullptr) {
+    //
+    // The mul_mat_id hook (F1 fused MoE) goes through the same env knob:
+    // when registered + the env is on, our hook handles the op without
+    // a stream sync, and the F16 mul_mat_id guard at the bottom of this
+    // function gets bypassed too.
+    const bool stream_llm_hook =
+        (g_cuda_mul_mat_hook    != nullptr) ||
+        (g_cuda_mul_mat_id_hook != nullptr);
+    if (stream_llm_hook) {
         const char * enable = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
         const bool allow = enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
         if (!allow) return false;
     }
+    const bool stream_llm_id_hook_active =
+        (g_cuda_mul_mat_id_hook != nullptr) &&
+        ([] {
+            const char * e = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
+            return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+        })();
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -3191,16 +3241,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
-                use_cuda_graph = false;
+            // streamllm-ext: when our F1 fused MoE hook handles this
+            // op (no in-op stream sync), the upstream sync-required
+            // condition doesn't apply. Skip the disable check in that
+            // case so F2 (graph capture for MoE) can proceed.
+            if (!stream_llm_id_hook_active) {
+                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+                if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+                    // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+                    // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+                    // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+                    use_cuda_graph = false;
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
+                }
             }
         }
 
@@ -3898,6 +3954,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
+                                    if (g_cuda_topk_moe_hook != nullptr) {
+                                        g_cuda_topk_moe_hook(cuda_ctx->stream(), logits, weights, ids);
+                                    }
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
@@ -3914,6 +3973,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
+                                    if (g_cuda_topk_moe_hook != nullptr) {
+                                        g_cuda_topk_moe_hook(cuda_ctx->stream(), logits, weights, ids);
+                                    }
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;

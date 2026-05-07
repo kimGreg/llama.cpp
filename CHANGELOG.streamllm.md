@@ -91,7 +91,8 @@ margin.
 
 ## 2026-04-24 — loader skip for managed weight tensors
 
-See `docs/BENCH_MEMO_QWEN3_4B.md` for the memory-savings story.
+Memory savings: ~7.6 GB of redundant CUDA0 backend buffer dropped on
+Qwen3-4B (the managed tensors no longer get a regular fp16 mirror).
 
 - `src/llama-model-loader.h`: add `std::unordered_set<std::string>
   streamllm_managed` (names listed in the GGUF's
@@ -199,3 +200,28 @@ Rationale: the fusion paths are compiled-in optimisations that
 predate the hook protocol. A one-line call per predicate is enough
 to opt managed weights out of fusion; the unfused mul_mat then hits
 the existing hook dispatch.
+
+## 2026-04-25 — mul_mat_id hook (MoE Phase B)
+
+- `ggml/include/ggml-cuda.h`: add
+  `ggml_cuda_set_mul_mat_id_hook(void *)`. Mirrors the existing
+  dense `ggml_cuda_set_mul_mat_hook` but for `GGML_OP_MUL_MAT_ID`
+  (the MoE expert dispatch).
+- `ggml/src/ggml-cuda/ggml-cuda.cu`:
+  - Add `ggml_cuda_mul_mat_id_hook_t` typedef + static
+    `g_cuda_mul_mat_id_hook` ptr + setter (mirrors the dense
+    pattern at lines 2440-2446).
+  - At the top of `ggml_cuda_mul_mat_id` (line 2541), call the
+    registered hook before any of the dispatch branches; return
+    early if the hook returns true.
+
+Total: ~13 lines of upstream-touch (1 in the header, 12 in the
+.cu). Rebase cost matches the dense hook entry from 2025 plus the
+fusion-skip entry from 2026-04-24.
+
+The streamllm-ext side currently lands as a Phase B *skeleton*:
+the hook registers correctly, fires on managed expert-stack
+tensors, and logs a one-time trace per tensor name; it returns
+false (falls through) until Phase C's per-(token, expert)
+`chunk_matmul` loop lands. The `streamllm-moe-hook-test` binary
+exercises the protocol — setter accepts fn + nullptr, idempotent.

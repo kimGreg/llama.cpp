@@ -1,22 +1,26 @@
-// streamllm-ext — VRAM chunk pool (cudaMalloc arena + first-fit + LRU).
+// streamllm-ext — VRAM chunk pool (dumb slot allocator).
 //
-// A single arena of size `capacity_bytes` is `cudaMalloc`-ed once. Callers
-// load byte ranges from the host — typically one `.gguf` tensor's chunk
-// subset — and receive a VRAM pointer they can pass to kernel launches.
-// When the arena is full, LRU evicts the oldest unpinned chunk.
+// A single arena of size ``capacity_bytes`` is ``cudaMalloc``-ed once.
+// Callers ``load()`` byte ranges from the host — typically one ``.gguf``
+// tensor's chunk subset — and receive a VRAM pointer they can pass to
+// kernel launches.
+//
+// **Pool is algorithm-blind and policy-free.** It does NOT maintain
+// LRU, pin/unpin state, or auto-evict on full. When ``load()`` cannot
+// allocate the request (arena fragmented or bytes simply don't fit),
+// it returns ``ChunkHandle{}`` (null device_ptr). The caller — usually
+// a model-specific scheduler — decides which resident chunk to evict
+// and explicitly calls ``evict()`` before retrying ``load()``.
 //
 // Async mode: pass ``copy_stream = true`` to allocate a dedicated CUDA
-// copy stream for H2D transfers. Per-chunk load returns a future-like
-// handle (event) the caller can chain onto a compute stream before
+// copy stream for H2D transfers. ``load()`` then returns a handle whose
+// ``ready_event`` the caller chains onto its compute stream before
 // reading the chunk. No-op in sync mode.
-//
-// Port of the Python streamllm.runtime.vram_pool.VramChunkPool.
 
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -36,13 +40,13 @@ using StreamHandle = CUstream_st *;
 using EventHandle  = CUevent_st *;
 
 // Uniform handle for "chunk-in-VRAM": device pointer + optional event to
-// wait on before reading. ``wait(stream)`` makes ``stream`` wait on the
-// event (no-op in sync mode). ``device_ptr`` is valid until the chunk is
-// evicted.
+// wait on before reading. ``device_ptr == nullptr`` means the load
+// failed (arena full / fragmented). ``ready_event`` is non-null only in
+// async mode and only when the H2D hasn't been waited on yet.
 struct ChunkHandle {
-    void *       device_ptr = nullptr;
-    size_t       nbytes     = 0;
-    EventHandle  ready_event = nullptr;  // nullptr in sync mode
+    void *       device_ptr  = nullptr;
+    size_t       nbytes      = 0;
+    EventHandle  ready_event = nullptr;
 };
 
 // Chunks are identified by (wid, cid). wid is a string — usually the
@@ -77,9 +81,11 @@ public:
 
     // Upload ``nbytes`` of host memory into VRAM, associated with
     // (wid, cid). If already resident, no re-upload happens (and host_ptr
-    // may be null). Returns a handle with device_ptr + optional ready
-    // event. LRU-evicts unpinned chunks to make room. Throws if the
-    // requested size is larger than capacity.
+    // may be null) — the existing handle is returned.
+    //
+    // If the arena cannot fit ``nbytes``, returns ``ChunkHandle{}`` (null
+    // device_ptr). The caller is responsible for evicting another chunk
+    // and retrying — the pool itself does NOT pick a victim.
     //
     // ``compute_stream`` is optional and only consulted under CUDA graph
     // capture: when the provided stream is in an active capture, the
@@ -91,13 +97,9 @@ public:
                      const void * host_ptr, size_t nbytes,
                      StreamHandle compute_stream = nullptr);
 
-    // Evict a chunk. No-op if not resident. If the chunk is pinned this
-    // is a no-op (use unpin() first).
+    // Evict a chunk. No-op if not resident. Always evicts when resident
+    // — pool does not track pin state.
     void evict(const std::string & wid, int cid);
-
-    // Pin / unpin — pinned chunks are excluded from LRU eviction.
-    void pin(const std::string & wid, int cid);
-    void unpin(const std::string & wid, int cid);
 
     // View an already-resident chunk. Returns nullptr device_ptr if not
     // resident (caller can then load() it).
@@ -119,14 +121,13 @@ public:
     size_t used_bytes()     const { return used_bytes_; }
     size_t peak_used_bytes() const { return peak_used_bytes_; }
     size_t n_resident()     const { return residents_.size(); }
-    size_t n_pinned()       const { return pinned_.size(); }
     bool   has_copy_stream() const { return copy_stream_ != nullptr; }
     StreamHandle copy_stream() const { return copy_stream_; }
     int device() const { return device_; }
 
     // Cumulative H2D transfer statistics. Incremented each time the pool
     // actually copies bytes (``load()`` with ``host_ptr != nullptr`` and
-    // the chunk not already resident). LRU touches don't count.
+    // the chunk not already resident).
     size_t total_h2d_bytes() const { return total_h2d_bytes_; }
     size_t total_h2d_calls() const { return total_h2d_calls_; }
     // Reset the cumulative counters — useful between benchmark phases
@@ -140,18 +141,13 @@ private:
     };
 
     struct Resident {
-        Slot slot;
+        Slot        slot;
         EventHandle ready_event;  // nullptr if sync-copied or already waited on
-        // LRU list iterator for O(1) remove/move-to-end.
-        std::list<ChunkKey>::iterator lru_it;
     };
 
     // First-fit free-list helpers.
     std::optional<size_t> allocate_(size_t nbytes);
     void free_(size_t offset, size_t nbytes);
-    // Try to LRU-evict until ``nbytes`` can be allocated. Returns false
-    // if no more evictable chunks and still no space.
-    bool make_room_(size_t nbytes);
 
     void launch_copy_(size_t dst_offset, const void * src, size_t nbytes,
                       EventHandle & out_event,
@@ -165,17 +161,16 @@ private:
     EventHandle  latest_compute_event_;  // set by record_compute_event
     EventHandle  capture_fork_event_;    // persistent; used to fork copy_stream into a CUDA graph capture
     std::vector<EventHandle> pending_event_destroys_;  // events deferred for destroy until after capture
+    std::vector<EventHandle> event_free_list_;  // recycled per-chunk ready events — avoids cudaEventCreate/Destroy on every move
 
     // Free-list: ordered (offset, length). We keep it sorted and coalesce.
     struct FreeSpan { size_t offset; size_t nbytes; };
     std::vector<FreeSpan> free_list_;
 
-    // Resident map + LRU list (front = oldest).
+    // Resident map. Lookup-only — no LRU / pin / eviction priority is
+    // tracked here. Schedulers maintain their own residency / policy
+    // structures and call evict() explicitly.
     std::unordered_map<ChunkKey, Resident, ChunkKeyHash> residents_;
-    std::list<ChunkKey> lru_;
-
-    // Pinned set.
-    std::unordered_map<ChunkKey, bool, ChunkKeyHash> pinned_;
 
     size_t used_bytes_      = 0;
     size_t peak_used_bytes_  = 0;

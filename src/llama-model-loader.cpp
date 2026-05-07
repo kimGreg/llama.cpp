@@ -734,6 +734,58 @@ llama_model_loader::llama_model_loader(
                 "from the backend buffer (owned by runtime)\n",
                 __func__, streamllm_managed.size());
         }
+
+        // streamllm-ext: slim canonical placeholder support. The encoder
+        // may write a stack-of-experts canonical (e.g.
+        // ``blk.<N>.ffn_<kind>_exps.weight``) as a 1-element fp16 stub
+        // and record the real shape under
+        // ``streamllm.tensor.<canonical>.canonical_shape = [n_experts,
+        // M, K]``. The runtime never reads the bytes anyway (mul_mat_id
+        // hook resolves expert chunks by name), so the slim form drops
+        // ~55 GB of zeros from a Qwen3-30B-A3B encode without runtime
+        // impact. Patch each managed tensor's ne[]/nb[] in the GGUF
+        // meta-context here so downstream check_tensor_dims and
+        // ggml_dup_tensor see the canonical shape. Legacy artifacts
+        // that wrote the full zero stack lack the key and pass through
+        // unchanged.
+        size_t n_patched = 0;
+        for (const std::string & name : streamllm_managed) {
+            const std::string key =
+                std::string("streamllm.tensor.") + name + ".canonical_shape";
+            const int64_t kid = gguf_find_key(metadata, key.c_str());
+            if (kid < 0) continue;
+            const size_t ndim = gguf_get_arr_n(metadata, kid);
+            if (ndim == 0 || ndim > GGML_MAX_DIMS) continue;
+            int64_t new_ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+            const enum gguf_type at = gguf_get_arr_type(metadata, kid);
+            const void * arr_data = gguf_get_arr_data(metadata, kid);
+            for (size_t d = 0; d < ndim; ++d) {
+                int64_t v = 1;
+                switch (at) {
+                    case GGUF_TYPE_INT32:  v = (int64_t)((const int32_t  *)arr_data)[d]; break;
+                    case GGUF_TYPE_UINT32: v = (int64_t)((const uint32_t *)arr_data)[d]; break;
+                    case GGUF_TYPE_INT64:  v = (int64_t)((const int64_t  *)arr_data)[d]; break;
+                    case GGUF_TYPE_UINT64: v = (int64_t)((const uint64_t *)arr_data)[d]; break;
+                    default: v = 1; break;
+                }
+                new_ne[d] = v;
+            }
+            // Look up the meta tensor by name and patch its ne / nb.
+            // weights_map keys are tensor names; meta lives in contexts.
+            ggml_tensor * t = get_tensor_meta(name.c_str());
+            if (t == nullptr) continue;
+            for (size_t d = 0; d < GGML_MAX_DIMS; ++d) {
+                t->ne[d] = new_ne[d];
+                t->nb[d] = (d == 0) ? ggml_type_size(t->type)
+                                    : t->nb[d-1] * t->ne[d-1];
+            }
+            ++n_patched;
+        }
+        if (n_patched > 0) {
+            LLAMA_LOG_INFO("%s: streamllm-ext: %zu canonical placeholders "
+                "resized via canonical_shape KV\n",
+                __func__, n_patched);
+        }
     }
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",

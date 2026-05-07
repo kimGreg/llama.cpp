@@ -1,4 +1,4 @@
-// streamllm-ext — end-to-end GPU test for M4a.
+// streamllm-ext — end-to-end GPU kernel test.
 //
 // Reads a streamllm GGUF, picks one managed tensor, builds the
 // upstream layout host-side, uploads it into a VramChunkPool, runs

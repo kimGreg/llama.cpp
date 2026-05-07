@@ -25,6 +25,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct gguf_context;
@@ -83,12 +84,39 @@ public:
     const GlobalMeta & global() const { return global_; }
 
     // Ordered list of GGUF tensor names that are StreamLLM-managed.
+    // Includes both *chunked* tensors (regular dense managed tensors,
+    // and per-expert MoE chunks under synthetic wids `<canonical>:e<X>`)
+    // and *placeholder-only* tensors (canonical MoE stacked names whose
+    // disk-copy must be skipped but which carry no chunk metadata at
+    // this name level). Use ``is_placeholder_only(name)`` to distinguish
+    // — schedulers / install paths typically want to skip those.
     const std::vector<std::string> & managed_tensor_names() const { return managed_; }
+
+    // Subset of ``managed_tensor_names()`` excluding placeholder-only
+    // entries. Schedulers iterate this for install-time chunk uploads
+    // so they don't trip on canonical MoE stacked names.
+    std::vector<std::string> chunked_tensor_names() const {
+        std::vector<std::string> out;
+        out.reserve(managed_.size());
+        for (const auto & n : managed_) {
+            if (!is_placeholder_only(n)) out.push_back(n);
+        }
+        return out;
+    }
 
     // Layout for a managed tensor, or nullptr if the name isn't managed.
     const TensorLayout * layout(const std::string & name) const {
         auto it = layouts_.find(name);
         return it == layouts_.end() ? nullptr : &it->second;
+    }
+
+    // True for managed tensors that exist only as placeholders in the
+    // GGUF (loader-skip + seed pointer). These have no chunk metadata
+    // because their bytes are accessed via per-expert sub-wids — the
+    // canonical MoE stacked tensors (`blk.<N>.ffn_<kind>_exps.weight`)
+    // fit this pattern. Schedulers / install paths should skip these.
+    bool is_placeholder_only(const std::string & name) const {
+        return placeholder_only_.count(name) != 0;
     }
 
     // The GGUF file path — useful for a runtime pread / mmap of chunk
@@ -102,11 +130,12 @@ private:
     GlobalMeta global_{};
     std::vector<std::string> managed_;
     std::unordered_map<std::string, TensorLayout> layouts_;
+    std::unordered_set<std::string> placeholder_only_;
     std::string gguf_path_;
 };
 
-// Pretty-print the parsed metadata to stdout — convenient for the
-// M2 CLI tool ``streamllm-gguf-dump``.
+// Pretty-print the parsed metadata to stdout — used by the
+// streamllm-gguf-dump CLI.
 void dump(const StreamReader & r);
 
 } // namespace streamllm_ext

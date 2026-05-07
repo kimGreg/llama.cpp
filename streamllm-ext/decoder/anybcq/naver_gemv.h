@@ -45,8 +45,8 @@ struct NaverKernelScratch {
 //                                            [K_groups, M] fp16 α.
 //   d_q_bias_fp16      (K_groups, M) fp16    shared across planes
 //
-// ``precision`` is the number of planes consumed and ≤ kMaxChunksPerTensor. M8
-// allows precision < P_total so the kernel runs at runtime-tunable bpw.
+// ``precision`` is the number of planes consumed and ≤ kMaxChunksPerTensor.
+// Setting precision < P_total lets the kernel run at runtime-tunable bpw.
 // Constraints: group_size % 64 == 0, K % 64 == 0. Throws on violation.
 // If ``d_q_weight_planes_device`` and ``d_alpha_planes_device`` are both
 // non-null, they are used as the plane-pointer arrays directly (must be

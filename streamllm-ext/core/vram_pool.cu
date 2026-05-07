@@ -1,4 +1,7 @@
 // streamllm-ext — VRAM chunk pool implementation.
+//
+// Dumb slot allocator. No LRU, no pin/unpin, no auto-eviction.
+// load() returns a null handle on full; the caller drives policy.
 
 #include "vram_pool.h"
 
@@ -68,6 +71,9 @@ VramChunkPool::~VramChunkPool() {
     for (auto h : pending_event_destroys_) {
         cudaEventDestroy((cudaEvent_t)h);
     }
+    for (auto h : event_free_list_) {
+        cudaEventDestroy((cudaEvent_t)h);
+    }
     if (copy_stream_) {
         cudaStreamDestroy((cudaStream_t)copy_stream_);
     }
@@ -119,44 +125,6 @@ void VramChunkPool::free_(size_t offset, size_t nbytes) {
             prev->nbytes += it->nbytes;
             free_list_.erase(it);
         }
-    }
-}
-
-
-bool VramChunkPool::make_room_(size_t nbytes) {
-    while (true) {
-        if (allocate_(nbytes).has_value()) {
-            // We over-consumed by committing early; undo and re-attempt.
-            // Simpler: just do a dry check by iterating free_list_.
-            // (allocate_ above already popped a span; nothing to undo —
-            // caller should have called make_room_ only to decide eviction.)
-            // We don't use this path — see below.
-            return true;
-        }
-        // Find an evictable (unpinned) chunk at the LRU head.
-        bool evicted = false;
-        for (auto it = lru_.begin(); it != lru_.end(); ++it) {
-            auto pin_it = pinned_.find(*it);
-            if (pin_it != pinned_.end() && pin_it->second) continue;
-            // Evict.
-            const ChunkKey key = *it;
-            auto res_it = residents_.find(key);
-            if (res_it == residents_.end()) {
-                lru_.erase(it);
-                evicted = true;
-                break;
-            }
-            if (res_it->second.ready_event) {
-                cudaEventDestroy((cudaEvent_t)res_it->second.ready_event);
-            }
-            Slot slot = res_it->second.slot;
-            lru_.erase(it);
-            residents_.erase(res_it);
-            free_(slot.offset, slot.nbytes);
-            evicted = true;
-            break;
-        }
-        if (!evicted) return false;
     }
 }
 
@@ -228,9 +196,14 @@ void VramChunkPool::launch_copy_(
         cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyHostToDevice, stream),
         "cudaMemcpyAsync(H2D)");
     cudaEvent_t ev;
-    check_cuda(
-        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
-        "cudaEventCreate(ready)");
+    if (!event_free_list_.empty()) {
+        ev = (cudaEvent_t)event_free_list_.back();
+        event_free_list_.pop_back();
+    } else {
+        check_cuda(
+            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+            "cudaEventCreate(ready)");
+    }
     check_cuda(cudaEventRecord(ev, stream), "cudaEventRecord(ready)");
     out_event = (EventHandle)ev;
 }
@@ -246,10 +219,7 @@ ChunkHandle VramChunkPool::load(
 
     auto it = residents_.find(key);
     if (it != residents_.end()) {
-        // Already resident — touch LRU, return view.
-        lru_.erase(it->second.lru_it);
-        lru_.push_back(key);
-        it->second.lru_it = std::prev(lru_.end());
+        // Already resident — return view, no LRU touch (pool is policy-free).
         return ChunkHandle{
             (char *)arena_ + it->second.slot.offset,
             it->second.slot.nbytes,
@@ -264,36 +234,12 @@ ChunkHandle VramChunkPool::load(
             std::to_string(capacity_bytes_));
     }
 
-    // Reserve space (evict LRU if needed).
+    // Try to allocate. On failure, return a null handle — the caller
+    // (typically a model-specific scheduler) decides which resident
+    // chunk to evict and retries.
     std::optional<size_t> off_opt = allocate_(nbytes);
-    while (!off_opt.has_value()) {
-        // Evict one LRU entry.
-        bool any = false;
-        for (auto lru_it = lru_.begin(); lru_it != lru_.end(); ++lru_it) {
-            auto pin_it = pinned_.find(*lru_it);
-            if (pin_it != pinned_.end() && pin_it->second) continue;
-            const ChunkKey evict_key = *lru_it;
-            auto res_it = residents_.find(evict_key);
-            if (res_it != residents_.end()) {
-                if (res_it->second.ready_event) {
-                    cudaEventDestroy((cudaEvent_t)res_it->second.ready_event);
-                }
-                Slot slot = res_it->second.slot;
-                lru_.erase(lru_it);
-                residents_.erase(res_it);
-                free_(slot.offset, slot.nbytes);
-            } else {
-                lru_.erase(lru_it);
-            }
-            any = true;
-            break;
-        }
-        if (!any) {
-            throw std::runtime_error(
-                "vram_pool: cannot make room for " + std::to_string(nbytes) +
-                " bytes (all residents pinned)");
-        }
-        off_opt = allocate_(nbytes);
+    if (!off_opt.has_value()) {
+        return ChunkHandle{};
     }
 
     Slot slot{*off_opt, nbytes};
@@ -304,9 +250,7 @@ ChunkHandle VramChunkPool::load(
         ++total_h2d_calls_;
     }
 
-    lru_.push_back(key);
-    Resident r{slot, evt, std::prev(lru_.end())};
-    residents_.emplace(key, r);
+    residents_.emplace(key, Resident{slot, evt});
     if (used_bytes_ > peak_used_bytes_) peak_used_bytes_ = used_bytes_;
 
     return ChunkHandle{
@@ -328,29 +272,17 @@ void VramChunkPool::reset_stats() {
 void VramChunkPool::evict(const std::string & wid, int cid) {
     std::lock_guard<std::mutex> lk(mu_);
     ChunkKey key{wid, cid};
-    auto pin_it = pinned_.find(key);
-    if (pin_it != pinned_.end() && pin_it->second) return;
-
     auto it = residents_.find(key);
     if (it == residents_.end()) return;
 
     if (it->second.ready_event) {
-        cudaEventDestroy((cudaEvent_t)it->second.ready_event);
+        // Recycle rather than destroy — it'll be re-recorded by the next
+        // record_h2d on this pool.
+        event_free_list_.push_back(it->second.ready_event);
     }
     Slot slot = it->second.slot;
-    lru_.erase(it->second.lru_it);
     residents_.erase(it);
     free_(slot.offset, slot.nbytes);
-}
-
-
-void VramChunkPool::pin(const std::string & wid, int cid) {
-    std::lock_guard<std::mutex> lk(mu_);
-    pinned_[{wid, cid}] = true;
-}
-void VramChunkPool::unpin(const std::string & wid, int cid) {
-    std::lock_guard<std::mutex> lk(mu_);
-    pinned_[{wid, cid}] = false;
 }
 
 
@@ -398,12 +330,12 @@ void VramChunkPool::wait_on_stream(
         pending_event_destroys_.push_back((EventHandle)ev);
     } else {
         // Drain any events we deferred during a previous capture window
-        // while we're confirmed out of capture.
+        // back into the recycle pool while we're confirmed out of capture.
         for (auto h : pending_event_destroys_) {
-            cudaEventDestroy((cudaEvent_t)h);
+            event_free_list_.push_back(h);
         }
         pending_event_destroys_.clear();
-        cudaEventDestroy(ev);
+        event_free_list_.push_back((EventHandle)ev);
     }
     it->second.ready_event = nullptr;
 }

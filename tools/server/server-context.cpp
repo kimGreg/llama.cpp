@@ -21,6 +21,45 @@
 #include <memory>
 #include <filesystem>
 #include <utility>
+#include <vector>
+
+// streamllm-ext live precision dial — forward decls so server-context
+// doesn't take a hard include dependency on the streamllm-ext tree.
+// The symbols are linked in via the static lib when STREAMLLM_EXT is
+// enabled at build time.
+extern "C" bool streamllm_set_score_table(
+    const float * thresholds, int n_thresh,
+    const int   * chunks,     int n_chunks);
+namespace streamllm_ext {
+bool streamllm_get_score_table(
+    std::vector<float> & out_thresholds,
+    std::vector<int>   & out_chunks);
+} // namespace streamllm_ext
+using streamllm_ext::streamllm_get_score_table;
+
+// /streamllm/stats accessors. Each is a single atomic read from the
+// streamllm-ext runtime; safe to call at high frequency.
+extern "C" {
+unsigned long long streamllm_stat_pool_used_bytes(void);
+unsigned long long streamllm_stat_pool_peak_bytes(void);
+unsigned long long streamllm_stat_pool_cap_bytes(void);
+unsigned long long streamllm_stat_pool_h2d_bytes(void);
+unsigned long long streamllm_stat_pool_h2d_calls(void);
+unsigned long long streamllm_stat_host_dram_bytes(void);
+unsigned long long streamllm_stat_hook_calls(void);
+unsigned long long streamllm_stat_dispatch_count(void);
+unsigned long long streamllm_stat_prefetch_attempts(void);
+unsigned long long streamllm_stat_prefetch_skipped(void);
+unsigned long long streamllm_stat_prefetch_issued(void);
+unsigned long long streamllm_stat_make_room_calls(void);
+unsigned long long streamllm_stat_mc_calls(void);
+unsigned long long streamllm_stat_mc_pread_ns(void);
+unsigned long long streamllm_stat_tier_attempts(void);
+unsigned long long streamllm_stat_tier_vram_hits(void);
+unsigned long long streamllm_stat_tier_dram_hits(void);
+unsigned long long streamllm_stat_tier_ssd_misses(void);
+int                streamllm_stat_diag_enabled(void);
+}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -4122,6 +4161,102 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    // streamllm-ext: live precision dial. POST a JSON body
+    //   {"thresholds": [0.4, 0.3, 0.1, 0.05], "chunks": [8, 6, 4, 2]}
+    // to swap the active score table. Safe to call mid-generation —
+    // the in-flight forward pass keeps using the snapshot it took on
+    // entry, the next layer's mul_mat_id picks up the new table.
+    this->post_streamllm_score_table = [this](const server_http_req & req) {
+        auto res = create_response(true);  // bypass-sleep: no model needed
+        bool ctx_server; GGML_UNUSED(ctx_server);
+        const json body = json::parse(req.body);
+        if (!body.is_object() ||
+            !body.contains("thresholds") || !body.contains("chunks") ||
+            !body["thresholds"].is_array() || !body["chunks"].is_array()) {
+            res->error(format_error_response(
+                "body must be an object with array fields "
+                "'thresholds' and 'chunks'", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<float> th;
+        std::vector<int>   ch;
+        for (const auto & v : body["thresholds"]) th.push_back(v.get<float>());
+        for (const auto & v : body["chunks"])     ch.push_back(v.get<int>());
+        if (!streamllm_set_score_table(
+                th.data(), (int)th.size(),
+                ch.data(), (int)ch.size())) {
+            res->error(format_error_response(
+                "streamllm: set_score_table rejected the table "
+                "(check sizes match, thresholds descending, chunks in [1, 16])",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok({
+            {"thresholds", th},
+            {"chunks",     ch},
+            {"status",     "applied"},
+        });
+        return res;
+    };
+
+    this->get_streamllm_score_table = [this](const server_http_req &) {
+        auto res = create_response(true);
+        bool ctx_server; GGML_UNUSED(ctx_server);
+        std::vector<float> th;
+        std::vector<int>   ch;
+        streamllm_get_score_table(th, ch);
+        res->ok({{"thresholds", th}, {"chunks", ch}});
+        return res;
+    };
+
+    // /streamllm/stats — realtime cache + prefetch counters. Each
+    // accessor is a single atomic load, so polling at 1 Hz adds
+    // negligible overhead. Tier-hit aggregates are present only when
+    // STREAMLLM_DIAG=ON; otherwise they appear as zeros and the
+    // diag_enabled flag is 0 so the panel can hide that section.
+    this->get_streamllm_stats = [this](const server_http_req &) {
+        auto res = create_response(true);
+        bool ctx_server; GGML_UNUSED(ctx_server);
+        const auto used  = streamllm_stat_pool_used_bytes();
+        const auto peak  = streamllm_stat_pool_peak_bytes();
+        const auto cap   = streamllm_stat_pool_cap_bytes();
+        const auto attempts = streamllm_stat_tier_attempts();
+        const auto vh = streamllm_stat_tier_vram_hits();
+        const auto dh = streamllm_stat_tier_dram_hits();
+        const auto sm = streamllm_stat_tier_ssd_misses();
+        res->ok({
+            {"pool", {
+                {"used_mb",        used / (1024.0 * 1024.0)},
+                {"peak_mb",        peak / (1024.0 * 1024.0)},
+                {"cap_mb",         cap  / (1024.0 * 1024.0)},
+                {"h2d_mb",         streamllm_stat_pool_h2d_bytes() / (1024.0 * 1024.0)},
+                {"h2d_calls",      streamllm_stat_pool_h2d_calls()},
+                {"make_room_calls",streamllm_stat_make_room_calls()},
+                {"host_dram_mb",   streamllm_stat_host_dram_bytes() / (1024.0 * 1024.0)},
+            }},
+            {"hook", {
+                {"calls",             streamllm_stat_hook_calls()},
+                {"dispatches",        streamllm_stat_dispatch_count()},
+                {"prefetch_attempts", streamllm_stat_prefetch_attempts()},
+                {"prefetch_skipped",  streamllm_stat_prefetch_skipped()},
+                {"prefetch_issued",   streamllm_stat_prefetch_issued()},
+                {"mc_calls",          streamllm_stat_mc_calls()},
+                {"mc_pread_ns",       streamllm_stat_mc_pread_ns()},
+            }},
+            {"tier_hits", {
+                {"diag_enabled", streamllm_stat_diag_enabled() != 0},
+                {"attempts",     attempts},
+                {"vram_hits",    vh},
+                {"dram_hits",    dh},
+                {"ssd_misses",   sm},
+                {"vram_pct",  attempts ? 100.0 * (double)vh / (double)attempts : 0.0},
+                {"dram_pct",  attempts ? 100.0 * (double)dh / (double)attempts : 0.0},
+                {"ssd_pct",   attempts ? 100.0 * (double)sm / (double)attempts : 0.0},
+            }},
+        });
         return res;
     };
 }

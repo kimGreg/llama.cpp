@@ -64,6 +64,30 @@ GGML_BACKEND_API void ggml_cuda_set_mul_mat_hook(void * hook_fn);
 // Set to null to unregister. Independent of the mul_mat hook.
 GGML_BACKEND_API void ggml_cuda_set_fusion_skip_hook(void * hook_fn);
 
+// streamllm-ext integration: parallel hook for GGML_OP_MUL_MAT_ID
+// (MoE expert dispatch). Called at the top of ggml_cuda_mul_mat_id;
+// returning true means the hook handled the op, false falls through.
+// Stream is the current CUDA compute stream; src0 is the stacked expert
+// weight tensor [K, M, n_experts]; src1 is the routed activations;
+// ids is the int32 expert-id tensor selected by the router. Set to
+// null to unregister. Independent of the dense mul_mat hook.
+GGML_BACKEND_API void ggml_cuda_set_mul_mat_id_hook(void * hook_fn);
+
+// streamllm-ext integration: notification hook fired just before
+// ggml_cuda_op_topk_moe (the fused softmax+argsort+(optional)norm
+// kernel that some MoE configurations dispatch instead of the
+// separate ops). Lets the streamllm hook capture the (logits,
+// weights, ids) tensor triple so it can later recover the
+// renormalized routing weights at mul_mat_id dispatch time —
+// without that side-channel, the buffer reachable via
+// ids->src[0]->src[0] is stale (the fused kernel never writes a
+// softmax output, so reading it returns whatever last lived in
+// that buffer). Callback signature:
+//   void fn(cudaStream_t, const ggml_tensor * logits,
+//           ggml_tensor * weights, ggml_tensor * ids);
+// Set to null to unregister.
+GGML_BACKEND_API void ggml_cuda_set_topk_moe_hook(void * hook_fn);
+
 #ifdef  __cplusplus
 }
 #endif

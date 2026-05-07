@@ -1,6 +1,6 @@
 // streamllm-ext — raw-pointer launcher for NAVER's LUT-GEMV kernel.
 //
-// M8: takes arrays of per-plane pointers for q_weight and alpha. The
+// Takes arrays of per-plane pointers for q_weight and alpha; the
 // kernel picks ``precision`` of them at runtime.
 
 #include <cuda_runtime.h>

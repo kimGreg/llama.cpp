@@ -192,7 +192,7 @@ int main(int argc, char ** argv) {
 
     size_t off = sizeof(RefHeader);
     // Python reference emits the monolithic [K/32, P, n] /
-    // [K_groups, P, n] ordering. M8's host layout packs each plane's
+    // [K_groups, P, n] ordering. Our host layout packs each plane's
     // signs + α into one chunk; rebuild a monolith view here for the
     // byte-for-byte comparison.
     const int K_over_32 = cxx.padded_m / 32;

@@ -38,7 +38,11 @@ int main(int argc, char ** argv) {
             streamllm_ext::dump(*reader);
             // byte_accounting_ok was validated inside from_gguf; reassert
             // across all managed tensors for an explicit signal here.
-            for (const auto & n : reader->managed_tensor_names()) {
+            // Skip placeholder-only managed names (MoE canonical
+            // stacked tensors) — their disk-skip is handled by the
+            // loader, no chunk metadata to validate here.
+            const auto chunked = reader->chunked_tensor_names();
+            for (const auto & n : chunked) {
                 const auto * L = reader->layout(n);
                 if (!L || !L->byte_accounting_ok()) {
                     std::fprintf(stderr,
@@ -48,8 +52,10 @@ int main(int argc, char ** argv) {
                 }
             }
             if (rc == 0) {
-                std::printf("\nall %zu managed tensors have consistent byte accounting.\n",
-                            reader->managed_tensor_names().size());
+                std::printf("\nall %zu chunked managed tensors have consistent byte accounting "
+                            "(plus %zu placeholder-only canonical names).\n",
+                            chunked.size(),
+                            reader->managed_tensor_names().size() - chunked.size());
             }
         }
     } catch (const std::exception & e) {

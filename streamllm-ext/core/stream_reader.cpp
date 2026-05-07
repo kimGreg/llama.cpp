@@ -119,6 +119,17 @@ std::optional<StreamReader> StreamReader::from_gguf(const gguf_context * ctx,
         layout.name = name;
 
         const std::string prefix = "streamllm.tensor." + name + ".";
+        // MoE canonical stacked tensors (`blk.<N>.ffn_<kind>_exps.weight`)
+        // are listed in managed_tensors so the model-loader skips their
+        // disk-copy and seeds their data pointer, but they don't have
+        // chunk metadata at the canonical level — the chunks are stored
+        // per-expert under synthetic wids `<canonical>:e<X>`. When the
+        // shape key is missing, this is such a placeholder; record it
+        // and skip chunk-layout parsing.
+        if (gguf_find_key(ctx, (prefix + "shape").c_str()) < 0) {
+            r.placeholder_only_.insert(name);
+            continue;
+        }
         auto shape_vec        = get_arr_i64(ctx, (prefix + "shape").c_str());
         auto chunk_bytes_vec  = get_arr_u32(ctx, (prefix + "chunk_bytes").c_str());
         layout.fixed_bytes      = get_u32(ctx, (prefix + "fixed_bytes").c_str());

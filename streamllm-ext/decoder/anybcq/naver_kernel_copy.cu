@@ -11,15 +11,15 @@
 //
 // Modifications vs upstream:
 //
-//   * Per-M accumulator + LUT in ``float`` (M4b-integration.4). Cross-
-//     block reduction is ``atomicAdd<float>`` into an M-sized fp32
-//     scratch the launcher allocates + casts back to fp16.
+//   * Per-M accumulator + LUT in ``float``. Cross-block reduction is
+//     ``atomicAdd<float>`` into an M-sized fp32 scratch the launcher
+//     allocates + casts back to fp16.
 //
 //   * ``q_weight`` and ``alpha`` are arrays of device pointers indexed
-//     by plane id (M8). Each plane is its own contiguous [K/32, M]
-//     (signs) or [K_groups, M] (α) buffer, so the VRAM pool can move
-//     planes independently and the kernel picks ``precision`` of them
-//     at launch time.
+//     by plane id. Each plane is its own contiguous [K/32, M] (signs)
+//     or [K_groups, M] (α) buffer, so the VRAM pool can move planes
+//     independently and the kernel picks ``precision`` of them at
+//     launch time.
 //
 // Why a copy rather than compiling upstream directly? Upstream pulls
 // in libtorch via its helper headers; fatal in a llama.cpp build.

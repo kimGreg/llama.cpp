@@ -55,4 +55,21 @@ UpstreamLayoutHost build_upstream_layout_host(
     const uint8_t * tensor_data,
     uint32_t group_size);
 
+// Transform one plane's disk-format bytes (signs MSB-packed bytes +
+// alpha fp32, both row-major) into kernel-format bytes (signs LSB-packed
+// uint32 transposed to [kt, row] + alpha fp16 transposed to [kg, row]).
+// ``disk_in`` is one plane's bytes as written by the encoder (size =
+// plane_sign_bytes + d1 × 4). ``kernel_out`` must have capacity
+// qw_bytes_per_chunk + alpha_bytes_per_chunk on the device-side layout.
+//
+// Used by both install-time host-buffer construction and the runtime's
+// HOT-promotion SSD-stream path so a chunk fetched at runtime is byte-
+// identical to one pinned at install.
+void plane_disk_to_kernel(
+    const uint8_t * disk_in,
+    uint8_t       * kernel_out,
+    int32_t         n,
+    int32_t         padded_m,
+    int32_t         ng);
+
 } // namespace streamllm_ext
