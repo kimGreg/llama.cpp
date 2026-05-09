@@ -33,14 +33,18 @@ for all tiers; this hides the format transformation done at
 
 | stream | what | typical for Qwen3 chunk |
 |---|---|---|
-| `B_ssd_disk` | bytes pread'd from GGUF — signs + α-as-fp32 + padding | `qw_bytes_per_chunk + K_groups·n·4` |
+| `B_ssd_disk` | bytes pread'd from GGUF — signs + α-as-fp16 (v2 default) | `qw_bytes_per_chunk + K_groups·n·2` |
 | `B_h2d_kernel` | bytes uploaded H2D — signs + α-as-fp16 (kernel layout) | `host.bytes_per_chunk = qw_bytes_per_chunk + K_groups·n·2` |
 | `B_vram_kernel` | bytes the kernel reads from VRAM during chunk_matmul | `B_h2d_kernel` |
 
-The fp32→fp16 α conversion in `plane_disk_to_kernel` shrinks the
-kernel-format chunk by ~15–20 % vs the disk-format chunk. The roofline
-must use **`B_ssd_disk` against `BW_SSD`** and **`B_h2d_kernel`
-against `BW_PCIe`** — not one shared figure.
+**Updated 2026-05-07** — byte-stream v2 narrows α (and β) to fp16 on
+disk. `B_ssd_disk == B_h2d_kernel` now, and `plane_disk_to_kernel`'s α
+conversion is a transpose-only memcpy of half-words instead of an RNE
+narrow. The disk-format chunk is ~18 % smaller than v1 fp32-α; the
+roofline still wants **`B_ssd_disk` against `BW_SSD`** and
+**`B_h2d_kernel` against `BW_PCIe`** as separate budgets, but the two
+sizes are now equal in v2 streams. Legacy v1 streams (fp32 α/β) are
+no longer accepted — re-encode artifacts to v2.
 
 Streamllm streams **only the FFN routed-expert weights**. Attention,
 dense layers, embeddings, router gates stay fp16-resident in VRAM

@@ -1,21 +1,7 @@
-// streamllm-ext / decoder / anybcq — fused MoE LUT-GEMV.
+// streamllm-ext / qwen3 — fused MoE LUT-GEMV impl.
 //
-// Single kernel processes every (token, used_idx) of one MoE op:
-//   blockIdx.x : M-tile  (1024 wide)
-//   blockIdx.y : K-tile  (64 wide)
-//   blockIdx.z : t * n_used + u   (per-block expert lookup)
-//
-// Modeled on ``nqmv_bias_planes`` (decoder/anybcq/naver_kernel_copy.cu):
-// same shared LUT build, same K-tile / M-tile structure, same fp32
-// accumulator. Three differences:
-//   * blockIdx.z drives a per-block expert lookup (qw_planes, alpha,
-//     q_bias) instead of a single per-tensor argument.
-//   * Output is written directly into the per-(t, u) slot of ggml's
-//     mul_mat_id ``dst`` (f32) — the downstream graph applies gate
-//     weights and sums across u. So the kernel does NOT multiply by
-//     gate; it writes raw decoded outputs.
-//   * One launch covers all (t, u) — 32× fewer host launches at the
-//     hook level for n_tokens=1, n_used=8 decode.
+// Architecture-specific kernel-fusion. See moe_fused.h for the layer
+// placement rationale.
 
 #include "moe_fused.h"
 
@@ -29,14 +15,16 @@
 #define M_TILE_SIZE 1024
 #define NUM_THREADS 256
 
-namespace streamllm_ext { namespace anybcq {
+namespace streamllm_ext { namespace qwen3 {
+
+using ::streamllm_ext::MoeExpertTable;
 
 namespace {
 
 inline void check_cuda(cudaError_t e, const char * what) {
     if (e != cudaSuccess) {
         throw std::runtime_error(
-            std::string("moe_fused: CUDA error in ") + what + ": " +
+            std::string("qwen3/moe_fused: CUDA error in ") + what + ": " +
             cudaGetErrorString(e));
     }
 }
@@ -50,26 +38,25 @@ inline void check_cuda(cudaError_t e, const char * what) {
 //                   block reads X_fp16 + tu * K
 __global__ void nqmv_bias_planes_moe_fused(
     const __half * __restrict__ X_fp16,
-    float *        __restrict__ Y_dst_f32,     // [n_tokens, n_used, M] dst
-    const int32_t * __restrict__ ids,          // [n_tokens, n_used]
+    float *        __restrict__ Y_dst_f32,
+    const int32_t * __restrict__ ids,
     const uint32_t * const * const * __restrict__ qw_planes_per_expert,
     const __half   * const * const * __restrict__ alpha_planes_per_expert,
     const __half   *               * __restrict__ q_bias_per_expert,
     const int M,
     const int K,
     const int n_used,
-    const int     uniform_precision,            // used iff prec_per_tu == nullptr
-    const int * __restrict__ prec_per_tu,       // [n_tokens × n_used] or nullptr
+    const int     uniform_precision,
+    const int * __restrict__ prec_per_tu,
     const int group_size,
     const int shared_x)
 {
-    // ----- per-block expert lookup -----
     const int tu  = blockIdx.z;
     const int t   = tu / n_used;
     const int eid = ids[tu];
-    if (eid < 0) return;                        // dropped expert
+    if (eid < 0) return;
     const int precision = prec_per_tu ? prec_per_tu[tu] : uniform_precision;
-    if (precision <= 0) return;                 // dropped by policy
+    if (precision <= 0) return;
 
     const uint32_t * const * qw    = qw_planes_per_expert   [eid];
     const __half   * const * alpha = alpha_planes_per_expert[eid];
@@ -81,7 +68,6 @@ __global__ void nqmv_bias_planes_moe_fused(
         : X_fp16 + (size_t)tu * K;
     float * Y_tu = Y_dst_f32 + (size_t)tu * M;
 
-    // ----- LUT build (identical to nqmv_bias_planes) -----
     __shared__ float lut[K_TILE_SIZE/8][256];
     const int lut_x_size = blockDim.x / (K_TILE_SIZE/8);
 
@@ -133,7 +119,6 @@ __global__ void nqmv_bias_planes_moe_fused(
     }
     __syncthreads();
 
-    // ----- main M-loop -----
     const int m_start = blockIdx.x * M_TILE_SIZE + threadIdx.x * 2;
     const int m_end   = min((blockIdx.x + 1) * M_TILE_SIZE, M);
     const int m_step  = blockDim.x * 2;
@@ -145,7 +130,6 @@ __global__ void nqmv_bias_planes_moe_fused(
         float acc_lo = 0.f;
         float acc_hi = 0.f;
 
-        // q_bias × Σ lut(255) — independent of plane bytes.
         {
             const __half2 qb = ((const __half2 *)&q_bias[group_idx*M + m])[0];
             const float qb_lo = __half2float(qb.x);
@@ -161,12 +145,7 @@ __global__ void nqmv_bias_planes_moe_fused(
             acc_hi = fmaf(qb_hi, t_sum, acc_hi);
         }
 
-        // Per-plane signs × α.
         for (int b = 0; b < precision; ++b) {
-            // Capture-safe: a plane that wasn't prefetched into the
-            // pool has a null pointer in the per-expert table. Skip
-            // it gracefully — the (t, u) output ends up at lower
-            // effective precision instead of dereferencing NULL.
             if (qw[b] == nullptr || alpha[b] == nullptr) continue;
             const uint32_t * __restrict__ bW_p = qw[b] +
                                                  (size_t)K_over_32_offset * M;
@@ -195,17 +174,11 @@ __global__ void nqmv_bias_planes_moe_fused(
             acc_hi = fmaf(__half2float(a.y), t_hi, acc_hi);
         }
 
-        // Output: ggml mul_mat_id dst[t][u][m] is f32 at (tu*M + m).
-        // Multiple k-tile blocks reduce here via atomicAdd<float>.
-        // Gate-weighting + sum over u is applied by downstream graph,
-        // not here.
         atomicAdd(&Y_tu[m],     acc_lo);
         atomicAdd(&Y_tu[m + 1], acc_hi);
     }
 }
 
-
-// ----- launcher -----
 
 void naver_gemv_moe_launch(
     const void *           X_fp16,
@@ -217,7 +190,7 @@ void naver_gemv_moe_launch(
     int                    n_tokens,
     int                    n_used,
     int                    uniform_precision,
-    const int *            prec_per_tu_d,    // device ptr [n_tokens × n_used] or nullptr
+    const int *            prec_per_tu_d,
     int                    group_size,
     int                    shared_x,
     StreamHandle           stream_opaque)
@@ -225,13 +198,13 @@ void naver_gemv_moe_launch(
     if (prec_per_tu_d == nullptr) {
         if (uniform_precision < 1 || uniform_precision > 8) {
             throw std::runtime_error(
-                "moe_fused: uniform_precision out of range [1, 8]: " +
+                "qwen3/moe_fused: uniform_precision out of range [1, 8]: " +
                 std::to_string(uniform_precision));
         }
     }
     if (K % K_TILE_SIZE != 0) {
         throw std::runtime_error(
-            "moe_fused: K must be a multiple of K_TILE_SIZE=64");
+            "qwen3/moe_fused: K must be a multiple of K_TILE_SIZE=64");
     }
     if (n_tokens <= 0 || n_used <= 0) {
         return;
@@ -258,13 +231,13 @@ void naver_gemv_moe_launch(
     cudaError_t last = cudaGetLastError();
     if (last != cudaSuccess) {
         throw std::runtime_error(
-            std::string("moe_fused: kernel launch failed: ") +
+            std::string("qwen3/moe_fused: kernel launch failed: ") +
             cudaGetErrorString(last));
     }
 }
 
 
-// ----- table allocation helpers -----
+// ----- expert-pointer table alloc/free + β refresh -----
 
 void alloc_moe_expert_table(
     MoeExpertTable & out,
@@ -275,7 +248,7 @@ void alloc_moe_expert_table(
 {
     if (n_experts <= 0) {
         throw std::runtime_error(
-            "moe_fused::alloc_moe_expert_table: n_experts must be > 0");
+            "qwen3/moe_fused::alloc_moe_expert_table: n_experts must be > 0");
     }
     out.n_experts = n_experts;
 
@@ -312,8 +285,43 @@ void free_moe_expert_table(MoeExpertTable & t) {
         cudaFree(t.d_q_bias_per_expert);
         t.d_q_bias_per_expert = nullptr;
     }
+    if (t.d_qbias_slot_per_expert) {
+        cudaFree(t.d_qbias_slot_per_expert);
+        t.d_qbias_slot_per_expert = nullptr;
+    }
+    t.needs_qbias_refresh = false;
     t.n_experts = 0;
 }
 
+namespace {
+__global__ void k_refresh_qbias(
+    void **      d_q_bias_per_expert,
+    void * const * d_qbias_slot_per_expert,
+    int          n_experts)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_experts) return;
+    void ** slot = (void **) d_qbias_slot_per_expert[e];
+    d_q_bias_per_expert[e] = slot ? slot[0] : nullptr;
+}
+}  // anon
 
-}}  // namespace streamllm_ext::anybcq
+void refresh_q_bias_for_anyprec_launch(
+    const MoeExpertTable & table,
+    StreamHandle stream)
+{
+    if (!table.needs_qbias_refresh) return;
+    if (table.d_q_bias_per_expert == nullptr) return;
+    if (table.d_qbias_slot_per_expert == nullptr) return;
+    if (table.n_experts <= 0) return;
+    const int n = table.n_experts;
+    const int block = 64;
+    const int grid  = (n + block - 1) / block;
+    auto s = (cudaStream_t) stream;
+    k_refresh_qbias<<<grid, block, 0, s>>>(
+        table.d_q_bias_per_expert,
+        (void * const *) table.d_qbias_slot_per_expert,
+        n);
+}
+
+}}  // namespace streamllm_ext::qwen3

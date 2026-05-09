@@ -1,17 +1,19 @@
-// streamllm-ext / decoder / anybcq — chunked-matmul dispatch impl.
+// streamllm-ext / decoder / shortcut_anybcq — chunked-matmul impl.
+//
+// Shortcut layout: each chunk packs [signs | α-scalar]. β is in a
+// separate kCidQBias chunk pinned at install. Decode = naver_gemv per
+// token; prefill = dequant + cuBLAS GEMM (or fused chunked LUT-GEMM).
+// Kernels themselves are shared with the any-prec decoder (under
+// ``../anybcq/anybcq_gemv.h`` + ``anybcq_gemm.h``); only the per-encoder
+// pointer staging differs.
 
-#include "chunked_matmul_anybcq.h"
+#include "chunked_matmul.h"
 
-// UpstreamLayoutDevice is declared in core/runtime.h. Including it
-// here is a controlled core-from-decoder dependency: the struct's
-// shape (qw_bytes_per_chunk, K_groups, group_size) is intrinsically
-// AnyBCQ-specific and should eventually move to upstream_layout.h,
-// but that's a follow-up refactor.
+// UpstreamLayoutDevice is declared in core/runtime.h.
 #include "runtime.h"
 
-#include "naver_gemv.h"
-#include "dequant_planes.h"
-#include "batched_gemm.h"
+#include "anybcq_gemv.h"
+#include "anybcq_gemm.h"
 
 #include <cuda_runtime.h>
 
@@ -19,7 +21,14 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace streamllm_ext { namespace anybcq {
+namespace streamllm_ext { namespace shortcut_anybcq {
+
+// Reuse the GEMV kernel scratch typedef + entry points from anybcq's
+// shared kernel header.
+using ::streamllm_ext::naver_gemv_launch;
+using ::streamllm_ext::naver_gemm_launch;
+using ::streamllm_ext::launch_dequant_planes_f16;
+using ::streamllm_ext::batched_gemm_f16;
 
 // Build the per-plane (qw, alpha) pointer arrays from the resident
 // chunks. Returns ``precision`` (number of planes the kernel will
@@ -35,6 +44,8 @@ static int build_plane_ptrs(
     const void * (&alpha_ptrs)[kNaverMaxPrecision],
     bool & prefix_plan)
 {
+    // Shortcut layout only — any-prec is rejected upstream by
+    // StreamllmRuntime::chunk_matmul.
     int precision = 0;
     prefix_plan = true;
     for (int p : plane_indices) {
@@ -151,4 +162,94 @@ bool chunk_matmul_batched(
         L.M, L.K, n_tokens, stream);
 }
 
-}}  // namespace streamllm_ext::anybcq
+
+// =====================================================================
+// Higher-level wrappers — what the model layer (qwen3 dispatch) calls.
+// Used to live as ``StreamllmRuntime::chunk_matmul[_batched]`` on core,
+// but those were thin pass-throughs that pulled decoder symbols into
+// core's translation unit; moved here so core stays decoder-blind.
+// =====================================================================
+
+namespace {
+
+// Translate a chunk-cid list to plane indices (shortcut layout: one
+// plane per data chunk). Reject any-prec layouts loudly — that path
+// goes through the qwen3 MoE-fused kernel, not this dispatcher.
+inline std::vector<int> cids_to_planes_or_throw(
+    const UpstreamLayoutHost & host,
+    const std::string & wid,
+    const std::vector<int> & chunks,
+    const char * caller)
+{
+    if (host.any_precision) {
+        throw std::runtime_error(
+            std::string(caller) +
+            ": any-prec layout not supported on this dispatch path; "
+            "use the MoE mul_mat_id hook (wid=" + wid + ")");
+    }
+    std::vector<int> planes;
+    planes.reserve(chunks.size());
+    for (int cid : chunks) {
+        if (cid_is_chunk(cid)) planes.push_back(cid_chunk_index(cid));
+    }
+    return planes;
+}
+
+}  // anonymous
+
+bool chunk_matmul_for_wid(
+    StreamllmRuntime &      rt,
+    const std::string &     wid,
+    const std::vector<int> & chunks,
+    const void * X_fp16, void * Y_fp16,
+    int n_tokens,
+    size_t x_stride_bytes, size_t y_stride_bytes,
+    StreamHandle compute_stream)
+{
+    const UpstreamLayoutDevice * dev = rt.layout(wid);
+    const UpstreamLayoutHost   * host = rt.host_layout(wid);
+    if (dev == nullptr || host == nullptr) return false;
+
+    for (int cid : chunks) {
+        rt.pool().wait_on_stream(wid, cid, compute_stream);
+    }
+
+    auto planes = cids_to_planes_or_throw(
+        *host, wid, chunks, "shortcut_anybcq::chunk_matmul_for_wid");
+
+    return chunk_matmul(
+        *dev,
+        (const void * const *) rt.anybcq_d_qw_ptrs(wid),
+        (const void * const *) rt.anybcq_d_alpha_ptrs(wid),
+        planes, X_fp16, Y_fp16, n_tokens,
+        x_stride_bytes, y_stride_bytes,
+        rt.gemv_scratch(), compute_stream);
+}
+
+bool chunk_matmul_batched_for_wid(
+    StreamllmRuntime &      rt,
+    const std::string &     wid,
+    const std::vector<int> & chunks,
+    const void * X_fp16, void * Y_fp16,
+    int n_tokens,
+    void * w_scratch_f16,
+    StreamHandle compute_stream)
+{
+    const UpstreamLayoutDevice * dev = rt.layout(wid);
+    const UpstreamLayoutHost   * host = rt.host_layout(wid);
+    if (dev == nullptr || host == nullptr) return false;
+
+    for (int cid : chunks) {
+        rt.pool().wait_on_stream(wid, cid, compute_stream);
+    }
+
+    auto planes = cids_to_planes_or_throw(
+        *host, wid, chunks,
+        "shortcut_anybcq::chunk_matmul_batched_for_wid");
+
+    return chunk_matmul_batched(
+        *dev, planes, X_fp16, Y_fp16, n_tokens,
+        w_scratch_f16, compute_stream);
+}
+
+}}  // namespace streamllm_ext::shortcut_anybcq

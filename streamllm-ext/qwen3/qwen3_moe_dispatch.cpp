@@ -14,10 +14,10 @@
 #include "runtime_hook_diag.h"
 #include "stream_reader.h"
 #include "scheduler.h"
-#include "naver_gemv.h"
-#include "cast_f16.h"
-#include "batched_gemm.h"
-#include "moe_fused.h"
+#include "anybcq_gemv.h"
+#include "anybcq_gemm.h"
+#include "moe_fused.h"        // MoeExpertTable + qwen3::naver_gemv_moe_launch
+#include "chunked_matmul.h"   // shortcut_anybcq::chunk_matmul_*for_wid
 #include "streamllm_nvtx.h"
 
 #include <ggml.h>
@@ -486,8 +486,8 @@ bool handle_mul_mat_impl(
         }
         void * y_block_f16 = dst_f16 ? dst->data : sc->yb_f16;
 
-        bool ok = rt->chunk_matmul_batched(
-            wid, plan->chunks,
+        bool ok = shortcut_anybcq::chunk_matmul_batched_for_wid(
+            *rt, wid, plan->chunks,
             x_block_f16, y_block_f16, (int)n_tokens,
             sc->w_f16, stream);
         if (ok) {
@@ -519,11 +519,12 @@ bool handle_mul_mat_impl(
 
             void * y_f16 = dst_f16 ? y_t : scratch_y_f16;
 
-            rt->chunk_matmul(wid, plan->chunks,
-                             x_f16, y_f16,
-                             /*n_tokens=*/1,
-                             /*x_stride=*/0, /*y_stride=*/0,
-                             stream);
+            shortcut_anybcq::chunk_matmul_for_wid(
+                *rt, wid, plan->chunks,
+                x_f16, y_f16,
+                /*n_tokens=*/1,
+                /*x_stride=*/0, /*y_stride=*/0,
+                stream);
 
             if (dst_f32) {
                 launch_f16_to_f32(y_f16, y_t, L->M, stream);
@@ -600,16 +601,26 @@ bool handle_mul_mat_id_impl(
     const struct ggml_tensor * src1,
     const struct ggml_tensor * ids,
     struct ggml_tensor * dst) {
-    if (src0 == nullptr || src0->name[0] == '\0') return false;
-    if (src1 == nullptr || ids == nullptr || dst == nullptr) return false;
+    if (src0 == nullptr || src0->name[0] == '\0') {
+        return false;
+    }
+    if (src1 == nullptr || ids == nullptr || dst == nullptr) {
+        return false;
+    }
 
     std::lock_guard<std::mutex> lk(g_runtime_mu);
-    if (!g_runtime) return false;
+    if (!g_runtime) {
+        return false;
+    }
 
     const std::string canonical(src0->name);
-    if (!g_runtime->is_managed_name(canonical)) return false;
+    if (!g_runtime->is_managed_name(canonical)) {
+        return false;
+    }
     const std::string synth_zero = canonical + ":e0";
-    if (g_runtime->layout(synth_zero) == nullptr) return false;
+    if (g_runtime->layout(synth_zero) == nullptr) {
+        return false;
+    }
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         ids->type != GGML_TYPE_I32) {
@@ -938,10 +949,28 @@ bool handle_mul_mat_id_impl(
 
             // Pass 2 (score policy only): per-expert max precision
             // from per-expert max g; broadcast back to per-(t, u).
+            // For any-prec wids, translate the requested target precision
+            // (in PLANES) to the precision actually served — chunks are
+            // packed in tiers of [base_p planes][+1 plane]×(Pa−1), so
+            // serving target P_t needs n_chunks = max(1, P_t−base_p+1)
+            // clamped to Pa, yielding planes_served = base_p+n_chunks−1.
+            // The kernel's prec_per_tu_d must equal planes_served to
+            // avoid reading past the last-loaded plane pointer.
+            auto translate_planes = [&](int target) -> int {
+                if (any_layout && any_layout->any_precision) {
+                    const int base_p = (int)any_layout->base_precision;
+                    const int Pa     = (int)any_layout->n_chunks;
+                    int n_chunks = target - base_p + 1;
+                    if (n_chunks < 1)  n_chunks = 1;
+                    if (n_chunks > Pa) n_chunks = Pa;
+                    return base_p + n_chunks - 1;
+                }
+                return target;
+            };
             if (score) {
                 for (int eid : unique_experts) {
                     max_prec_by_expert[eid] =
-                        score_lookup(max_gate_by_expert[eid]);
+                        translate_planes(score_lookup(max_gate_by_expert[eid]));
                 }
                 const int layer =
                     std::strncmp(canonical.c_str(), "blk.", 4) == 0
@@ -994,8 +1023,16 @@ bool handle_mul_mat_id_impl(
                 if (plan == nullptr) continue;
                 const int n_chunks_desired =
                     std::max(0, (int)plan->chunks.size() - 1);
-                if (n_chunks_desired > sub_max_precision)
-                    sub_max_precision = n_chunks_desired;
+                // n_chunks_desired counts data chunks emitted by the plan;
+                // for shortcut that equals plane count, but for any-prec
+                // we have planes = base_p + n_chunks − 1.
+                const int planes_for_kernel =
+                    (any_layout && any_layout->any_precision &&
+                     n_chunks_desired > 0)
+                        ? (int)any_layout->base_precision + n_chunks_desired - 1
+                        : n_chunks_desired;
+                if (planes_for_kernel > sub_max_precision)
+                    sub_max_precision = planes_for_kernel;
 
                 for (const auto & mv : plan->moves) {
                     g_moe_profile.prefetch_attempts.fetch_add(
@@ -1057,6 +1094,26 @@ bool handle_mul_mat_id_impl(
             g_moe_profile.ph_wait_barrier_ns.fetch_add(
                 (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
                 std::memory_order_relaxed);
+        }
+
+        // Cross-stream sync: ``wait_prefetch_*`` only drains the host
+        // worker queue — it does NOT order compute_stream after the
+        // copy_stream events that completed the H2D + per-plane
+        // pointer-table updates.  Without an explicit wait_on_stream,
+        // the refresh kernel below (and the GEMV kernel after it) can
+        // start before the per-plane update kernel has run on
+        // copy_stream → reads still-zero ``d_qbias_slot[e][0]`` →
+        // d_q_bias_per_expert[e] = nullptr → kernel illegal-access.
+        //
+        // For shortcut canonicals this race exists too but doesn't
+        // bite because d_q_bias_per_expert was captured at MoE-table
+        // build with a valid pointer (install-time q_bias upload).
+        // For any-prec, q_bias is per-chunk so the pointer is updated
+        // by ``update_anyprec_after_load_async`` on every chunk land —
+        // the compute side MUST wait on those events.
+        for (const auto & r : reservations) {
+            g_runtime->pool().wait_on_stream(r.wid, r.cid,
+                                              (StreamHandle) stream);
         }
         const auto _ph_compute_t0 = std::chrono::steady_clock::now();
 
@@ -1126,7 +1183,14 @@ bool handle_mul_mat_id_impl(
             }
         }
 
-        anybcq::naver_gemv_moe_launch(
+        // Any-prec wids store β per-chunk; the table's d_q_bias_per_expert
+        // entries were captured at install (then null) and need to be
+        // refreshed from each expert's current d_qbias_slot[0] before
+        // the kernel reads them. No-op for shortcut canonicals.
+        qwen3::refresh_q_bias_for_anyprec_launch(*fuse_table,
+                                                   (StreamHandle) stream);
+
+        qwen3::naver_gemv_moe_launch(
             sc->xb_f16, dst_sub, ids_d, *fuse_table,
             M, K, sub_n, n_used_per_tok,
             uniform_precision, prec_per_tu_d,

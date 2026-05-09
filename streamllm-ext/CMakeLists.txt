@@ -22,6 +22,8 @@ set(STREAMLLM_EXT_SOURCES
     core/runtime.cpp
     qwen3/qwen3_moe_scheduler.cpp
     decoder/anybcq/upstream_layout.cpp
+    decoder/anybcq/tensor.cpp
+    decoder/shortcut_anybcq/upstream_layout.cpp
 )
 
 # ggml-cuda hook glue. Requires GGML_CUDA=ON (the hook signature takes
@@ -42,15 +44,10 @@ if (GGML_CUDA)
     enable_language(CUDA)
     list(APPEND STREAMLLM_EXT_SOURCES
         core/vram_pool.cu
-        decoder/anybcq/naver_gemv.cu
-        decoder/anybcq/naver_kernel_copy.cu
-        decoder/anybcq/naver_gemm_batched.cu
-        decoder/anybcq/cast_f16.cu
-        decoder/anybcq/dequant_planes.cu
-        decoder/anybcq/batched_gemm.cu
-        decoder/anybcq/per_plane_layout.cu
-        decoder/anybcq/chunked_matmul_anybcq.cu
-        decoder/anybcq/moe_fused.cu
+        decoder/anybcq/core/chunked_matmul_gemv.cu
+        decoder/anybcq/core/chunked_matmul_gemm.cu
+        decoder/shortcut_anybcq/chunked_matmul.cu
+        qwen3/moe_fused.cu
     )
 endif()
 
@@ -60,6 +57,8 @@ target_include_directories(streamllm_ext PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq
+    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/shortcut_anybcq
     ${CMAKE_CURRENT_SOURCE_DIR}/qwen3
 )
 

@@ -10,7 +10,7 @@
 #include "runtime.h"
 #include "runtime_hook_diag.h"
 #include "stream_reader.h"
-#include "batched_gemm.h"
+#include "anybcq_gemm.h"
 
 #include "../qwen3/qwen3_moe_dispatch.h"
 

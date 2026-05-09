@@ -8,10 +8,12 @@
 
 #include "scheduler.h"
 #include "runtime.h"
-#include "moe_fused.h"
+#include "anybcq_gemv.h"
+#include "moe_fused.h"   // MoeExpertTable + qwen3::alloc/free_moe_expert_table
 #include "qwen3_moe_residency.h"
 #include "qwen3_moe_dispatch.h"
 
+#include <ggml.h>          // ggml_tensor field access for claims_tensor
 #include <cuda_runtime.h>
 
 #include <array>
@@ -288,29 +290,58 @@ public:
         for (const auto & name : reader.chunked_tensor_names()) {
             UpstreamLayoutHost host = read_one(reader, gguf_path, name);
             const int P = host.n_chunks;
+            const bool any_prec = host.any_precision;
             // Snapshot before std::move(host) so the host LRU has a
             // consistent per-tensor byte size for cap accounting.
+            // Shortcut: every chunk shares ``bytes_per_chunk`` (this is
+            // the per-chunk size, no max-vs-min ambiguity).
+            // Any-prec: per-chunk sizes differ (chunk 0 holds base_p
+            // planes, later chunks hold 1) so snapshot the per-chunk
+            // ``kernel_chunk_bytes`` array for accurate LRU accounting.
             const size_t bytes_per_chunk = host.bytes_per_chunk;
+            std::vector<size_t> per_chunk_bytes_anyprec;
+            if (any_prec) {
+                per_chunk_bytes_anyprec.reserve(host.chunk_planes.size());
+                for (const auto & cp : host.chunk_planes) {
+                    per_chunk_bytes_anyprec.push_back(cp.kernel_chunk_bytes);
+                }
+            }
 
             rt.register_layout(name, std::move(host), UpstreamLayoutDevice{});
             // Stash per-chunk file offsets so move_chunk can SSD-stream
             // on demand after release_host_bytes.
             register_chunk_io_from_layout(rt, reader, name);
 
-            // Upload q_bias only — every kernel call needs it. Plane
-            // chunks load on demand under the policy tables.
-            rt.move_chunk(name, kCidQBias, Tier::RAM, Tier::VRAM);
+            if (!any_prec) {
+                // Shortcut layout: upload q_bias once at install (small,
+                // hot — every kernel call reads it). Plane chunks load on
+                // demand. Plan = q_bias only at steady state.
+                rt.move_chunk(name, kCidQBias, Tier::RAM, Tier::VRAM);
+                base_plans_.emplace(name, Plan{
+                    /*chunks=*/{kCidQBias},
+                    /*moves =*/{}
+                });
+                total_pinned += 1;
+            } else {
+                // Any-prec layout: each data chunk carries its own
+                // α^(p)/β^(p). No install-time pin — chunks stream on
+                // demand under the same VRAM/host cache policy the
+                // shortcut path uses, with the precision tier driven by
+                // the score policy at dispatch time.
+                base_plans_.emplace(name, Plan{
+                    /*chunks=*/{},
+                    /*moves =*/{}
+                });
+            }
 
             P_of_[name]     = P;
             bytes_per_chunk_of_[name] = bytes_per_chunk;
-            // Steady-state plan = no planes (q_bias only).
-            // plan_for_expert upgrades per-call when gate_score warrants.
-            base_plans_.emplace(name, Plan{
-                /*chunks=*/{kCidQBias},
-                /*moves =*/{}
-            });
+            if (any_prec) {
+                any_prec_wids_.insert(name);
+                per_chunk_bytes_anyprec_[name] =
+                    std::move(per_chunk_bytes_anyprec);
+            }
 
-            total_pinned    += 1;          // just q_bias
             total_on_demand += (size_t)P;
             n_total         += 1;
 
@@ -405,6 +436,26 @@ public:
                                   StreamHandle /*compute_stream*/) override {
         const std::string synthetic =
             canonical_wid + ":e" + std::to_string(expert_id);
+        if (any_prec_wids_.count(synthetic)) {
+            // Any-prec MoE — pick target precision (planes) from the
+            // gate score using the same ladder the dense path uses, then
+            // translate to a chunk count via base_precision.
+            auto it_pa = P_of_.find(synthetic);
+            const int Pa = it_pa == P_of_.end() ? 0 : it_pa->second;
+            const auto * dev = rt_->layout(synthetic);
+            const int base_p = dev ? (int)dev->base_precision : 1;
+            // Reuse anyprec_desired_from_gate to map gate→planes; the
+            // helper clamps to Pa so for any-prec it can over-budget when
+            // P_target_planes > Pa, which the chunk-count translation
+            // below re-clamps. Pass kMaxChunksPerTensor as the planes
+            // ceiling to avoid double-clamping at the chunk level.
+            int planes = anyprec_desired_from_gate(
+                kMaxChunksPerTensor, gate_score);
+            int n_chunks = planes - base_p + 1;
+            if (n_chunks < 1)  n_chunks = 1;
+            if (n_chunks > Pa) n_chunks = Pa;
+            return build_plan_for_anyprec(synthetic, n_chunks);
+        }
         auto it_p = P_of_.find(synthetic);
         if (it_p == P_of_.end()) return nullptr;
         const int P = it_p->second;
@@ -446,6 +497,22 @@ public:
         StreamHandle /*compute_stream*/) override {
         const std::string synthetic =
             canonical_wid + ":e" + std::to_string(expert_id);
+        if (any_prec_wids_.count(synthetic)) {
+            // Any-prec MoE — score policy supplies ``desired_precision``
+            // in PLANES (bits). For any-prec the planes loaded by the
+            // first n_chunks chunks is base_precision + (n_chunks − 1),
+            // so reaching a target plane count P_t needs
+            //   n_chunks = max(1, P_t − base_precision + 1)
+            // clamped to the encoded chunk count.
+            auto it_pa = P_of_.find(synthetic);
+            const int Pa = it_pa == P_of_.end() ? 0 : it_pa->second;
+            const auto * dev = rt_->layout(synthetic);
+            const int base_p = dev ? (int)dev->base_precision : 1;
+            int n_chunks = desired_precision - base_p + 1;
+            if (n_chunks < 1)  n_chunks = 1;
+            if (n_chunks > Pa) n_chunks = Pa;
+            return build_plan_for_anyprec(synthetic, n_chunks);
+        }
         auto it_p = P_of_.find(synthetic);
         if (it_p == P_of_.end()) return nullptr;
         const int P = it_p->second;
@@ -454,6 +521,112 @@ public:
     }
 
   private:
+    // Mirrors the dense gate-score → desired chunk-count map but applied
+    // to any-prec wids.  Same env semantics as the shortcut path
+    // (gate_thresholds_ table, otherwise linear ladder via gate_step_),
+    // so STREAMLLM_MOE_GATE_THRESHOLDS / STREAMLLM_MOE_SCORE_THRESHOLDS
+    // affect both layouts identically.
+    int anyprec_desired_from_gate(int Pa, float gate_score) const {
+        if (Pa <= 0) return 0;
+        if (!dynamic_policy_) return Pa;
+        int n;
+        if (!gate_thresholds_.empty()) {
+            n = 0;
+            for (int i = (int)gate_thresholds_.size() - 1; i >= 0; --i) {
+                if (gate_score >= gate_thresholds_[i]) { n = i + 1; break; }
+            }
+        } else {
+            n = (int)std::floor(gate_score / gate_step_) + 1;
+        }
+        if (n < 1)  n = 1;
+        if (n > Pa) n = Pa;
+        return n;
+    }
+
+    // Streaming any-prec plan builder.  Emits chunks [0..desired);
+    // chunk 0 holds the base_p jointly-fit planes (so desired=1 means
+    // base precision), each subsequent chunk adds one extension plane
+    // plus its own α^(p) / β^(p).  The runtime's move_chunk path handles
+    // disk pread + kernel-format transform + per-plane pointer activation.
+    const Plan * build_plan_for_anyprec(const std::string & synthetic,
+                                         int desired) {
+        auto it_p = P_of_.find(synthetic);
+        if (it_p == P_of_.end()) return nullptr;
+        const int P = it_p->second;
+        if (desired < 1)  desired = 1;
+        if (desired > P)  desired = P;
+
+        for (int p = 0; p < desired; ++p) {
+            tracker_.touch(synthetic, cid_chunk(p), p);
+        }
+        // Host LRU touch — uses the per-chunk byte sizes captured at
+        // install (per_chunk_bytes_anyprec_) so cap accounting reflects
+        // the actual variable chunk size, not the dense path's
+        // single-bytes-per-chunk assumption.
+        if (host_max_bytes_ > 0) {
+            std::vector<HostKey> to_evict;
+            {
+                std::lock_guard<std::mutex> lk(host_lru_mu_);
+                for (int p = 0; p < desired; ++p) {
+                    HostKey k{synthetic, cid_chunk(p)};
+                    auto pos_it = host_pos_.find(k);
+                    if (pos_it != host_pos_.end()) {
+                        host_lru_.splice(host_lru_.begin(), host_lru_,
+                                         pos_it->second);
+                    } else {
+                        const size_t per_chunk =
+                            bytes_for_chunk(synthetic, cid_chunk(p));
+                        host_lru_.push_front(k);
+                        host_pos_.emplace(k, host_lru_.begin());
+                        host_used_bytes_ += per_chunk;
+                    }
+                }
+                while (host_used_bytes_ > host_max_bytes_ &&
+                       !host_lru_.empty()) {
+                    HostKey victim = host_lru_.back();
+                    host_lru_.pop_back();
+                    host_pos_.erase(victim);
+                    const size_t vb = bytes_for_chunk(victim.wid, victim.cid);
+                    host_used_bytes_ = (vb > host_used_bytes_)
+                                       ? 0 : host_used_bytes_ - vb;
+                    to_evict.push_back(victim);
+                }
+            }
+            for (const auto & v : to_evict) {
+                rt_->release_chunk_host(v.wid, v.cid);
+            }
+        }
+
+        const uint64_t key = ((uint64_t)reinterpret_cast<uintptr_t>(&it_p->second))
+                              ^ 0xA17C0DECu
+                              ^ ((uint64_t)desired << 16);
+        auto it_plan = expert_plan_cache_.find(key);
+        if (it_plan != expert_plan_cache_.end() &&
+            it_plan->second.synthetic_wid == synthetic &&
+            it_plan->second.desired == desired) {
+            return &it_plan->second.plan;
+        }
+
+        // chunks[] follows the same convention as the dense path: a
+        // kCidQBias sentinel up front, then the data chunks. Dispatch
+        // computes precision as ``chunks.size() − 1`` so the sentinel
+        // keeps that math correct without a per-encoder branch. For
+        // any-prec the sentinel is just a placeholder — the runtime's
+        // move_chunk path keeps q_bias pointers alive via per-chunk β.
+        Plan plan;
+        plan.chunks.reserve((size_t)desired + 1);
+        plan.moves.reserve((size_t)desired);
+        plan.chunks.push_back(kCidQBias);
+        for (int p = 0; p < desired; ++p) {
+            plan.chunks.push_back(cid_chunk(p));
+            plan.moves.push_back({synthetic, cid_chunk(p),
+                                   Tier::RAM, Tier::VRAM});
+        }
+        auto [it_new, _] = expert_plan_cache_.emplace(key,
+            CachedExpertPlan{synthetic, desired, std::move(plan)});
+        return &it_new->second.plan;
+    }
+
     const Plan * build_plan_for(const std::string & synthetic,
                                  int desired) {
         auto it_p = P_of_.find(synthetic);
@@ -495,9 +668,10 @@ public:
                     HostKey victim = host_lru_.back();
                     host_lru_.pop_back();
                     host_pos_.erase(victim);
-                    auto vbp = bytes_per_chunk_of_.find(victim.wid);
-                    size_t vb = (vbp == bytes_per_chunk_of_.end())
-                                ? 0 : vbp->second;
+                    // ``bytes_for_chunk`` covers both shortcut and
+                    // any-prec — the shared LRU may contain victims
+                    // from either layout.
+                    const size_t vb = bytes_for_chunk(victim.wid, victim.cid);
                     host_used_bytes_ = (vb > host_used_bytes_)
                                        ? 0 : host_used_bytes_ - vb;
                     to_evict.push_back(victim);
@@ -562,12 +736,16 @@ public:
         if (it != moe_tables_.end()) return &it->second;
 
         std::vector<void *> qw, alpha, qbias;
+        std::vector<void *> qbias_slot_addrs;  // any-prec only
+        bool any_any_prec = false;
         for (int e = 0; ; ++e) {
             std::string synth = canonical_wid + ":e" + std::to_string(e);
             const auto * dev = rt_->layout(synth);
             if (dev == nullptr) break;  // first missing expert — done
             void ** d_qw    = rt_->anybcq_d_qw_ptrs(synth);
             void ** d_alpha = rt_->anybcq_d_alpha_ptrs(synth);
+            void ** d_qbias = rt_->anybcq_d_qbias_slot(synth);
+            const auto * host = rt_->host_layout(synth);
             if (d_qw == nullptr || d_alpha == nullptr) {
                 std::fprintf(stderr,
                     "streamllm-scheduler[moe]: anybcq_d_*_ptrs missing for %s\n",
@@ -577,6 +755,12 @@ public:
             qw.push_back(d_qw);
             alpha.push_back(d_alpha);
             qbias.push_back(const_cast<void *>(dev->q_bias_fp16));
+            // For any-prec experts, the install-time q_bias is null
+            // (β lives per-chunk and is set by move_chunk on demand).
+            // Capture each expert's d_qbias_slot so the dispatch path
+            // can refresh ``d_q_bias_per_expert`` per kernel call.
+            qbias_slot_addrs.push_back(d_qbias);
+            if (host != nullptr && host->any_precision) any_any_prec = true;
         }
         if (qw.empty()) return nullptr;
 
@@ -607,6 +791,23 @@ public:
                    bytes, cudaMemcpyHostToDevice);
         cudaMemcpy(t.d_q_bias_per_expert,       qbias.data(),
                    bytes, cudaMemcpyHostToDevice);
+
+        // For any-prec canonicals, also populate d_qbias_slot_per_expert
+        // so the dispatch can refresh the table per kernel call from
+        // each expert's current β buffer.
+        if (any_any_prec) {
+            t.d_qbias_slot_per_expert = (void ***) rt_->small_alloc(bytes);
+            if (t.d_qbias_slot_per_expert == nullptr) {
+                std::fprintf(stderr,
+                    "streamllm-scheduler[moe]: small_alloc exhausted for "
+                    "qbias_slot table on %s\n", canonical_wid.c_str());
+                return nullptr;
+            }
+            cudaMemcpy(t.d_qbias_slot_per_expert,
+                       qbias_slot_addrs.data(),
+                       bytes, cudaMemcpyHostToDevice);
+            t.needs_qbias_refresh = true;
+        }
 
         auto [it_new, _] = moe_tables_.emplace(canonical_wid, t);
         return &it_new->second;
@@ -657,7 +858,14 @@ public:
     }
     bool set_score_table(const std::vector<float> & th,
                           const std::vector<int>   & ch) override {
-        if (th.empty() || ch.empty() || th.size() != ch.size()) {
+        // Accept the same shapes the env-var path accepts:
+        //   ch.size() == th.size()       (each threshold pairs with a count)
+        //   ch.size() == th.size() + 1   (last entry = tail, below all)
+        // The dispatch lookup walks min(th, ch) descending; if no
+        // threshold is met it falls back to ch.back(), so the +1 tail
+        // form is the natural way to express a default chunk count.
+        if (ch.empty()) return false;
+        if (!(ch.size() == th.size() || ch.size() == th.size() + 1)) {
             return false;
         }
         for (size_t k = 1; k < th.size(); ++k) {
@@ -721,7 +929,34 @@ private:
     std::vector<int>   score_chunks_;
 
     std::unordered_map<std::string, int> P_of_;
+    // Synthetic wids whose host layout flag had any_precision=true.
+    // Used by plan_for_expert / plan_for_expert_with_precision to route
+    // through the any-prec planning path (planes ↔ chunks translation +
+    // build_plan_for_anyprec).
+    std::unordered_set<std::string> any_prec_wids_;
     std::unordered_map<std::string, size_t> bytes_per_chunk_of_;
+    // Any-prec only: per-(synthetic_wid) array of per-chunk byte sizes
+    // (chunk 0 holds base_p planes worth, later chunks hold 1 plane).
+    // Used by the host LRU so the cap reflects actual chunk sizes
+    // instead of bytes_per_chunk_of_'s max-across-chunks figure.
+    std::unordered_map<std::string, std::vector<size_t>>
+        per_chunk_bytes_anyprec_;
+
+    // Unified per-(wid, cid) byte size lookup. Returns 0 if unknown so
+    // the LRU treats it as "weightless" (no eviction trigger from it).
+    size_t bytes_for_chunk(const std::string & wid, int cid) const {
+        if (!cid_is_chunk(cid)) return 0;
+        auto it_any = per_chunk_bytes_anyprec_.find(wid);
+        if (it_any != per_chunk_bytes_anyprec_.end()) {
+            const int p = cid_chunk_index(cid);
+            if (p >= 0 && p < (int)it_any->second.size()) {
+                return it_any->second[p];
+            }
+            return 0;
+        }
+        auto it = bytes_per_chunk_of_.find(wid);
+        return it == bytes_per_chunk_of_.end() ? 0 : it->second;
+    }
     std::unordered_map<std::string, Plan> base_plans_;
 
     // Host (DRAM) tier LRU. host_max_bytes_ = 0 disables the cap and

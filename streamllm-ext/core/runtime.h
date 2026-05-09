@@ -1,17 +1,18 @@
-// streamllm-ext — runtime singleton. Owns a VRAM pool + a Scheduler
-// and exposes two primitives to the mul_mat hook:
+// streamllm-ext — runtime singleton. Owns a VRAM pool + a Scheduler.
+// Core primitive:
 //
 //   move_chunk(wid, cid, src, dst) -> event       // async tier move
-//   chunk_matmul(wid, chunks, X, Y, ...)          // launch nqmv_bias
 //
 // Chunk vocabulary (a "chunk" is the smallest unit the pool moves):
 //
-//   Q_BIAS  = 0           — shared fixed-meta chunk (per tensor)
-//   PLANE_i = kCidChunkBase + i   — plane i's (signs + α) blob
+//   Q_BIAS  = 0                   — shared fixed-meta chunk (per tensor)
+//   PLANE_i = kCidChunkBase + i   — plane i's payload
 //
-// ``chunks`` passed to chunk_matmul is a list of these cids. Precision
-// = number of PLANE cids in the list. Q_BIAS is always consumed when
-// present (the NAVER kernel always adds q_bias × sum_lut_255).
+// Chunk computation (chunk_matmul) lives in the encoder layer, not
+// here — see ``decoder/shortcut_anybcq/chunked_matmul.h`` for the
+// per-tensor path and ``qwen3/moe_fused.h`` for the fused MoE GEMV.
+// Core only exposes the layout + pool primitives the encoder layer
+// reads.
 
 #pragma once
 
@@ -23,6 +24,11 @@
 // Decode hot-path scratch — fwd-declared so this header doesn't pull in
 // the AnyBCQ kernel header. Defined in decoder/anybcq/naver_gemv.h.
 namespace streamllm_ext { struct NaverKernelScratch; }
+// AnyBCQFamilyTensor — concrete ChunkedTensor that owns each managed
+// tensor's host layout + per-plane device pointer tables. Forward-
+// declared so the runtime header doesn't drag the decoder include in;
+// runtime.cpp pulls in decoder/anybcq/tensor.h directly.
+namespace streamllm_ext { namespace anybcq { class AnyBCQFamilyTensor; } }
 
 #include <atomic>
 #include <condition_variable>
@@ -70,6 +76,14 @@ struct UpstreamLayoutDevice {
     int          K_groups    = 0;
     int          group_size  = 0;
     size_t       qw_bytes_per_chunk = 0;  // offset to α inside a chunk
+    // Any-prec: tells the dispatch layer to skip the host-side
+    // ``chunk_ptrs[p]`` walk in ``build_plane_ptrs`` and go directly
+    // through the device-side per-plane pointer table (which carries
+    // the correct plane→signs/α mapping populated by
+    // update_anyprec_after_load_async). For shortcut wids both layouts
+    // coincide so the flag is false.
+    bool         any_precision = false;
+    int          base_precision = 0;  // chunk-0 owns this many planes
 };
 
 
@@ -102,33 +116,10 @@ public:
                            Tier src, Tier dst,
                            StreamHandle compute_stream = nullptr);
 
-    // Run nqmv_bias over the chunks in ``chunks``. Precision =
-    // number of PLANE cids present. Q_BIAS must be resident.
-    bool chunk_matmul(const std::string & wid,
-                      const std::vector<int> & chunks,
-                      const void * X_fp16, void * Y_fp16,
-                      int n_tokens,
-                      size_t x_stride_bytes, size_t y_stride_bytes,
-                      StreamHandle compute_stream);
-
-    // Batched prefill fast path. Reconstructs W_f16[M, K] into the
-    // caller-provided scratch via launch_dequant_planes_f16 using the
-    // planes named in ``chunks`` (precision = count of PLANE cids),
-    // then runs cublas F16 GEMM: Y[M, N] = W @ X[K, N].
-    //
-    // X and Y are tightly packed:
-    //   X: col-major [K, n_tokens], contiguous, fp16
-    //   Y: col-major [M, n_tokens], contiguous, fp16
-    // i.e. the same layout ggml uses when src1/dst have ne = {K, N} / {M, N}.
-    //
-    // ``w_scratch_f16`` must be at least M*K*2 bytes. Caller owns it
-    // (typically a per-stream scratch in runtime_hook.cpp).
-    bool chunk_matmul_batched(const std::string & wid,
-                              const std::vector<int> & chunks,
-                              const void * X_fp16, void * Y_fp16,
-                              int n_tokens,
-                              void * w_scratch_f16,
-                              StreamHandle compute_stream);
+    // (chunk_matmul / chunk_matmul_batched moved out of core. Callers
+    // now invoke the encoder-side helpers in
+    // ``decoder/shortcut_anybcq/chunked_matmul.h`` directly. Core only
+    // exposes the layout + pool primitives those helpers need.)
 
     // --- accessors ------------------------------------------------------
 
@@ -138,6 +129,10 @@ public:
     VramChunkPool & pool() { return *pool_; }
     const Scheduler & scheduler() const { return *scheduler_; }
     Scheduler & scheduler() { return *scheduler_; }
+
+    // Decode-path scratch the encoder-side ``chunk_matmul`` reuses to
+    // avoid per-call cudaMallocAsync. Lifetime tied to the runtime.
+    NaverKernelScratch * gemv_scratch() const { return gemv_scratch_.get(); }
 
     // Lifecycle helpers for schedulers.
     // Drop the host-side chunk byte buffers for a registered tensor.
@@ -161,6 +156,12 @@ public:
     // table indexed by expert id. Returns null if wid is unknown.
     void ** anybcq_d_qw_ptrs(const std::string & wid) const;
     void ** anybcq_d_alpha_ptrs(const std::string & wid) const;
+    // Per-tensor device-side single-pointer slot for the highest-active
+    // chunk's β buffer. Used by any-prec wids only — for shortcut wids
+    // β lives in dev.q_bias_fp16 and this slot is unused (returns null).
+    // The fused MoE kernel needs to refresh from this slot per dispatch
+    // (see ``MoeExpertTable::d_qbias_slot_per_expert``).
+    void ** anybcq_d_qbias_slot(const std::string & wid) const;
 
     // Clear the entry's device-side per-plane pointer slot for cid.
     // Must be called whenever a chunk is evicted from the VRAM pool —
@@ -206,11 +207,15 @@ public:
 
 private:
     struct Entry {
-        UpstreamLayoutHost   host;
+        // Concrete ChunkedTensor (AnyBCQTensor / ShortcutTensor) owning
+        // this tensor's host layout + per-plane device pointer tables.
+        // Allocated by register_layout from the parsed UpstreamLayoutHost
+        // (slab-allocated pointer arrays bound via set_device_state).
+        std::unique_ptr<anybcq::AnyBCQFamilyTensor> tensor;
         UpstreamLayoutDevice dev;
-        // Per-Entry mutex guarding host.chunks reads/writes. Owned via
-        // unique_ptr because std::mutex isn't move-constructible but
-        // unordered_map::emplace requires Entry to be movable. Hot
+        // Per-Entry mutex guarding tensor->host().chunks reads/writes.
+        // Owned via unique_ptr because std::mutex isn't move-constructible
+        // but unordered_map::emplace requires Entry to be movable. Hot
         // path takes only this mutex — concurrent move_chunks on
         // different wids never contend (vs. a global host_data_mu_
         // that bottlenecks at the memcpy bandwidth ceiling at high
@@ -224,14 +229,6 @@ private:
         // and no streaming is required.
         std::vector<int64_t> chunk_file_offsets;
         std::vector<int64_t> chunk_file_sizes;
-        // Device-side cache of the per-plane pointer arrays, in plane-
-        // index order: d_plane_{qw,alpha}_ptrs[p] matches plane p's qw
-        // / alpha base. Kept in sync by move_chunk. When chunk_matmul
-        // receives a prefix-style chunks list (common case across all
-        // current schedulers), it uses these directly and skips the
-        // per-call H2D memcpy of the pointer arrays.
-        void ** d_chunk_qw_ptrs    = nullptr;  // device [kMaxChunksPerTensor × void*]
-        void ** d_chunk_alpha_ptrs = nullptr;
     };
 
     std::unique_ptr<VramChunkPool> pool_;

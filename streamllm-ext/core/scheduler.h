@@ -31,10 +31,13 @@ namespace streamllm_ext {
 
 class StreamllmRuntime;
 
-// Forward-decl (defined in decoder/anybcq/moe_fused.h). Decoder-neutral
-// shape: three device pointer arrays indexed by expert id, so it lives
-// at the streamllm_ext namespace level and core/scheduler.h doesn't
-// have to name a specific decoder family.
+// Decoder-neutral per-MoE-tensor expert pointer table. The fused
+// kernel that consumes it is architecture-specific (see
+// ``qwen3/moe_fused.h``); the *struct* is encoder/architecture-
+// agnostic — three device-pointer arrays indexed by expert id —
+// so a forward decl here keeps core's contract free of architecture
+// types while still letting the Scheduler interface expose a getter
+// for MoE-aware schedulers.
 struct MoeExpertTable;
 
 // Storage tier for a chunk. move_chunk(wid, cid, src, dst) currently
@@ -116,10 +119,11 @@ public:
     virtual void release_from_dispatch(const std::string & /*wid*/,
                                         int /*cid*/) {}
 
-    // Fused MoE kernel: returns a per-canonical-wid expert table built
-    // from each routed expert's d_chunk_qw_ptrs / d_chunk_alpha_ptrs /
-    // dev.q_bias_fp16. Cached after first call. Default returns
-    // nullptr — hook falls back to the per-(t, u) loop.
+    // MoE-aware extension hook. Default returns null — the dispatch
+    // hook then falls back to per-(t, u) GEMV. MoE-aware schedulers
+    // (currently ``qwen3::MoEScheduler``) override this to return a
+    // per-canonical expert table the architecture-specific fused
+    // kernel reads (see ``qwen3/moe_fused.h``).
     virtual const MoeExpertTable * moe_expert_table(
         const std::string & /*canonical_wid*/) {
         return nullptr;

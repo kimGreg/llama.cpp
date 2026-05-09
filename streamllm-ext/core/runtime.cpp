@@ -5,14 +5,18 @@
 #include "runtime_hook_diag.h"
 #include "streamllm_nvtx.h"
 
+// Encoder-agnostic UpstreamLayoutHost struct + dispatcher entry point.
+// Includes the function-pointer typedefs the encoder registers callbacks
+// against (disk_to_kernel_fn / after_load_fn / after_evict_fn). Core's
+// move_chunk invokes them blindly — no decoder includes needed.
 #include "upstream_layout.h"
-// Algorithm-specific helpers — runtime forwards into these for chunk
-// matmul + per-plane device-pointer bookkeeping. Kept behind the
-// ``anybcq::`` namespace so swapping in another decoder is one
-// dispatch table away.
-#include "chunked_matmul_anybcq.h"
-#include "naver_gemv.h"          // NaverKernelScratch + kNaverMaxPrecision
-#include "per_plane_layout.h"
+#include "anybcq_gemv.h"         // NaverKernelScratch (decode-path scratch
+                                  // owned by the runtime; encoder-side
+                                  // helpers reuse it via gemv_scratch()).
+// Concrete ChunkedTensor that Entry holds. The runtime needs the full
+// type to construct + dereference it (.host(), .d_qw_ptrs(), etc.) —
+// the runtime header forward-declares it.
+#include "tensor.h"
 
 namespace streamllm_ext {
 // Keep the framework's chunks-per-tensor cap aligned with the AnyBCQ
@@ -215,7 +219,8 @@ void StreamllmRuntime::install(const StreamReader & reader,
     // cudaMallocs at install; cold launch goes from 4-5 min to ~30 s.
     {
         const size_t per_tensor_bytes =
-            (size_t)kMaxChunksPerTensor * sizeof(void *) * 2;
+            (size_t)kMaxChunksPerTensor * sizeof(void *) * 2 +
+            sizeof(void *);  // +1 slot for any-prec d_qbias_slot
         const size_t n_tensors = reader.managed_tensor_names().size();
         // Headroom for MoeExpertTable: assume ≤ 256 canonicals × 3
         // arrays × ≤ 1024 experts × 8 bytes = ~6 MB. Round to 16 MB
@@ -271,6 +276,8 @@ void StreamllmRuntime::register_layout(const std::string & wid,
                                         UpstreamLayoutHost host,
                                         UpstreamLayoutDevice dev) {
     auto [it, _] = entries_.emplace(wid, Entry{});
+    Entry & e = it->second;
+
     // Account install-time host bytes so the matching release_host_bytes
     // doesn't underflow g_host_dram_bytes.
     {
@@ -279,33 +286,70 @@ void StreamllmRuntime::register_layout(const std::string & wid,
         if (install_bytes) g_host_dram_bytes.fetch_add(
             install_bytes, std::memory_order_relaxed);
     }
-    it->second.host = std::move(host);
-    it->second.dev  = dev;
+
+    // Wrap the parsed layout in the appropriate ChunkedTensor subclass
+    // (any-prec → anybcq::AnyBCQTensor, shortcut → shortcut_anybcq::
+    // ShortcutTensor). The decoder's wrap_host_in_tensor is the one
+    // place encoder typing is materialised — Entry holds the abstract
+    // family base from here on.
+    e.tensor = wrap_host_in_tensor(wid, std::move(host));
+    e.dev    = dev;
+
+    // Populate the dispatch-side layout fields up-front from the host
+    // layout.  These are static metadata (M, K, group_size, etc.) known
+    // at install time — they don't depend on any chunk being resident.
+    // ``move_chunk`` later re-writes them on every call, but the FIRST
+    // hook firing happens BEFORE any move_chunk has run for this wid in
+    // dynamic-streaming mode.  Without this priming the hook reads
+    // group_size=0, bails to false, and upstream's mul_mat_id reads the
+    // empty placeholder → CUDA illegal-access on the next op.  Pointers
+    // (chunk_ptrs[], q_bias_fp16) stay null; the hook paths that need
+    // them check separately.
+    {
+        UpstreamLayoutDevice & d = e.dev;
+        const UpstreamLayoutHost & h = e.tensor->host();
+        d.M                  = h.n;
+        d.K                  = h.padded_m;
+        d.n_chunks           = h.n_chunks;
+        d.K_groups           = h.K_groups;
+        d.group_size         = h.group_size;
+        d.qw_bytes_per_chunk = h.qw_bytes_per_chunk;
+        d.any_precision      = h.any_precision;
+        d.base_precision     = h.base_precision;
+    }
+
     // Slice the per-tensor pointer arrays out of the pre-allocated
     // small_slab_ (one cudaMalloc for the whole runtime, instead of
     // 36k cudaMallocs for 18k experts). The slab was zero-init'd at
     // install — the kernel's prefix-plan fast path distinguishes
     // null vs non-null per slot, so initial zero state is correct.
-    Entry & e = it->second;
+    void ** d_qw     = nullptr;
+    void ** d_alpha  = nullptr;
+    void ** d_qbias  = nullptr;
     {
         std::lock_guard<std::mutex> lk(small_slab_mu_);
         const size_t per_array = (size_t)kMaxChunksPerTensor * sizeof(void *);
+        // 2 × per_array (qw + α tables) + 1 × sizeof(void*) (qbias slot)
+        const size_t slot_bytes = sizeof(void *);
         if (small_slab_ == nullptr ||
-            small_slab_used_ + 2 * per_array > small_slab_bytes_) {
+            small_slab_used_ + 2 * per_array + slot_bytes > small_slab_bytes_) {
             throw std::runtime_error(
                 "StreamllmRuntime::register_layout: small_slab exhausted");
         }
-        e.d_chunk_qw_ptrs    = (void **)((char *)small_slab_ + small_slab_used_);
-        small_slab_used_    += per_array;
-        e.d_chunk_alpha_ptrs = (void **)((char *)small_slab_ + small_slab_used_);
-        small_slab_used_    += per_array;
+        d_qw    = (void **)((char *)small_slab_ + small_slab_used_);
+        small_slab_used_ += per_array;
+        d_alpha = (void **)((char *)small_slab_ + small_slab_used_);
+        small_slab_used_ += per_array;
+        d_qbias = (void **)((char *)small_slab_ + small_slab_used_);
+        small_slab_used_ += slot_bytes;
     }
+    e.tensor->set_device_state(d_qw, d_alpha, d_qbias);
 }
 
 void StreamllmRuntime::release_host_bytes(const std::string & wid) {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return;
-    UpstreamLayoutHost & h = it->second.host;
+    UpstreamLayoutHost & h = it->second.tensor->host();
     // Free the per-chunk byte buffers — these are large (~2 MB/expert)
     // and re-readable from disk via register_chunk_io's offset map.
     // KEEP q_bias: it's small (~96 KB/expert), derived from the FIXED_META
@@ -333,7 +377,7 @@ void StreamllmRuntime::release_chunk_host(const std::string & wid, int cid) {
     int p = cid_chunk_index(cid);
     if (p < 0) return;
     std::lock_guard<std::mutex> lk(*it->second.host_mu);
-    auto & chunks = it->second.host.chunks;
+    auto & chunks = it->second.tensor->host().chunks;
     if (p < (int)chunks.size() && !chunks[p].empty()) {
         const size_t freed = chunks[p].size();
         std::vector<uint8_t>().swap(chunks[p]);
@@ -344,11 +388,12 @@ void StreamllmRuntime::release_chunk_host(const std::string & wid, int cid) {
 bool StreamllmRuntime::host_resident(const std::string & wid, int cid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return false;
-    if (cid == kCidQBias) return !it->second.host.q_bias.empty();
+    const UpstreamLayoutHost & host = it->second.tensor->host();
+    if (cid == kCidQBias) return !host.q_bias.empty();
     if (!cid_is_chunk(cid)) return false;
     int p = cid_chunk_index(cid);
     if (p < 0) return false;
-    const auto & chunks = it->second.host.chunks;
+    const auto & chunks = host.chunks;
     return p < (int)chunks.size() && !chunks[p].empty();
 }
 
@@ -380,19 +425,29 @@ const UpstreamLayoutDevice * StreamllmRuntime::layout(const std::string & wid) c
 const UpstreamLayoutHost * StreamllmRuntime::host_layout(const std::string & wid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return nullptr;
-    return &it->second.host;
+    return &it->second.tensor->host();
 }
 
 void ** StreamllmRuntime::anybcq_d_qw_ptrs(const std::string & wid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return nullptr;
-    return it->second.d_chunk_qw_ptrs;
+    return it->second.tensor->d_qw_ptrs();
 }
 
 void ** StreamllmRuntime::anybcq_d_alpha_ptrs(const std::string & wid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return nullptr;
-    return it->second.d_chunk_alpha_ptrs;
+    return it->second.tensor->d_alpha_ptrs();
+}
+
+void ** StreamllmRuntime::anybcq_d_qbias_slot(const std::string & wid) const {
+    auto it = entries_.find(wid);
+    if (it == entries_.end()) return nullptr;
+    // Only meaningful for any-prec wids; shortcut wids never write to
+    // d_qbias_slot. Returning the pointer regardless lets the MoE table
+    // builder snapshot it uniformly; it will simply be unused (and
+    // remain zero) for shortcut.
+    return it->second.tensor->d_qbias_slot();
 }
 
 void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid) {
@@ -400,10 +455,11 @@ void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid) 
     auto it = entries_.find(wid);
     if (it == entries_.end()) return;
     int p = cid_chunk_index(cid);
-    anybcq::clear_per_plane_after_evict(
-        it->second.d_chunk_qw_ptrs,
-        it->second.d_chunk_alpha_ptrs,
-        p);
+    // ChunkedTensor::after_evict knows the encoder's chunk_idx →
+    // plane_idx mapping (shortcut: identity; any-prec: plane_idx_first
+    // off chunk_planes). Routes to the registered encoder callback
+    // internally.
+    it->second.tensor->after_evict(p);
 }
 
 void * StreamllmRuntime::small_alloc(size_t bytes) {
@@ -436,7 +492,7 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             "StreamllmRuntime::move_chunk: unknown wid " + wid);
     }
     Entry & e = it->second;
-    const UpstreamLayoutHost & host = e.host;
+    UpstreamLayoutHost & host = e.tensor->host();
     UpstreamLayoutDevice & dev = e.dev;
 
     const void * src_ptr = nullptr;
@@ -475,11 +531,11 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
         // pool_->load.
         {
             std::lock_guard<std::mutex> lk(*e.host_mu);
-            if (p >= 0 && p < (int)e.host.chunks.size() &&
-                !e.host.chunks[p].empty()) {
+            if (p >= 0 && p < (int)host.chunks.size() &&
+                !host.chunks[p].empty()) {
                 DiagSpan _t(diag::MoveSite::HostCacheSnapshot);
-                xform_scratch.assign(e.host.chunks[p].begin(),
-                                     e.host.chunks[p].end());
+                xform_scratch.assign(host.chunks[p].begin(),
+                                     host.chunks[p].end());
                 src_ptr = xform_scratch.data();
                 nbytes  = xform_scratch.size();
                 diag::record_move_event(diag::MoveEvent::DramHit);
@@ -557,23 +613,51 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             // device saw disk-format bytes that the kernel reinterpreted
             // as kernel-format → garbage scales and bit-flipped signs →
             // NaN / wrong output. Visible only when HOT > 0.
-            if ((size_t)size != host.qw_bytes_per_chunk + (size_t)host.K_groups * (size_t)host.n * 4u) {
+            // Per-chunk size + transform dispatch.  Shortcut layout has
+            // a uniform per-plane disk size; any-prec has variable
+            // per-chunk sizes (chunk 0 carries base_p planes; later
+            // chunks carry 1).  Both go through codec-aware
+            // plane_disk_to_kernel / any_prec_chunk_disk_to_kernel.
+            size_t expected_disk_bytes;
+            size_t kernel_chunk_bytes;
+            if (host.any_precision) {
+                if (p < 0 || p >= (int)host.chunk_planes.size()) {
+                    throw std::runtime_error(
+                        "StreamllmRuntime::move_chunk: any-prec chunk index "
+                        + std::to_string(p) + " out of range for " + wid);
+                }
+                expected_disk_bytes = host.chunk_planes[p].disk_chunk_bytes;
+                kernel_chunk_bytes  = host.chunk_planes[p].kernel_chunk_bytes;
+            } else {
+                expected_disk_bytes = host.disk_bytes_per_chunk;
+                kernel_chunk_bytes  = host.bytes_per_chunk;
+            }
+            if ((size_t)size != expected_disk_bytes) {
                 throw std::runtime_error(
                     "StreamllmRuntime::move_chunk: SSD-stream plane size "
-                    "doesn't match expected disk layout for " + wid);
+                    "doesn't match expected disk layout for " + wid +
+                    " (cid=" + std::to_string(cid) + ", got " +
+                    std::to_string(size) + " expected " +
+                    std::to_string(expected_disk_bytes) + ")");
             }
             {
                 DiagSpan _a(diag::MoveSite::Alloc);
-                xform_scratch.assign(host.bytes_per_chunk, 0);
+                xform_scratch.assign(kernel_chunk_bytes, 0);
             }
             {
                 DiagSpan _x(diag::MoveSite::Xform);
-                plane_disk_to_kernel(
-                    /*disk_in=*/(const uint8_t *)dst,
-                    /*kernel_out=*/xform_scratch.data(),
-                    /*n=*/host.n,
-                    /*padded_m=*/host.padded_m,
-                    /*ng=*/host.K_groups);
+                // Encoder-registered transform — see UpstreamLayoutHost
+                // ChunkDiskToKernelFn typedef. Throws if not wired
+                // (would mean the encoder install path didn't set it).
+                if (host.disk_to_kernel_fn == nullptr) {
+                    throw std::runtime_error(
+                        "StreamllmRuntime::move_chunk: missing "
+                        "disk_to_kernel_fn for " + wid);
+                }
+                host.disk_to_kernel_fn(
+                    host, p,
+                    (const uint8_t *) dst,
+                    xform_scratch.data());
             }
             // Populate the DRAM cache: copy the kernel-format bytes
             // into host.chunks[p] under the per-Entry mutex so a
@@ -584,12 +668,12 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             {
                 DiagSpan _i(diag::MoveSite::HostCacheInsert);
                 std::lock_guard<std::mutex> lk(*e.host_mu);
-                if (p >= (int)e.host.chunks.size()) {
-                    e.host.chunks.resize(p + 1);
+                if (p >= (int)host.chunks.size()) {
+                    host.chunks.resize(p + 1);
                 }
-                const size_t prev_bytes = e.host.chunks[p].size();
-                e.host.chunks[p] = xform_scratch;
-                const size_t new_bytes  = e.host.chunks[p].size();
+                const size_t prev_bytes = host.chunks[p].size();
+                host.chunks[p] = xform_scratch;
+                const size_t new_bytes  = host.chunks[p].size();
                 if (new_bytes > prev_bytes) {
                     g_host_dram_bytes.fetch_add(new_bytes - prev_bytes,
                                                  std::memory_order_relaxed);
@@ -600,7 +684,12 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
                 diag::record_move_event(diag::MoveEvent::CacheInsert);
             }
             src_ptr = xform_scratch.data();
-            nbytes  = host.bytes_per_chunk;
+            // For any-prec the kernel-chunk byte size is per-chunk, not
+            // a single host-wide constant.  bytes_per_chunk on the host
+            // layout is the MAX across chunks (used by the pool for
+            // scratch sizing); use the actual per-chunk size for the
+            // pool load.
+            nbytes  = kernel_chunk_bytes;
             // Stash for profile attribution after pool_->load below.
             mc_profile_pread_ns = pread_ns;
             mc_profile_active   = prof;
@@ -664,27 +753,27 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
         int p = cid_chunk_index(cid);
         if (p < kMaxChunksPerTensor) {
             dev.chunk_ptrs[p] = h.device_ptr;
-            // Update per-plane device-side pointer arrays so chunk_matmul
-            // can read them directly. The async variant runs on the copy
-            // stream after the H2D bytes; we re-record the ready event
-            // so wait_on_stream covers both the bytes and the pointer
-            // update, avoiding a race where chunk_matmul reads stale
-            // dev.chunk_ptrs[p].
             DiagSpan _u(diag::MoveSite::PtrUpdate);
-            if (h.device_ptr != nullptr && pool_->copy_stream() != nullptr) {
-                anybcq::update_per_plane_after_load_async(
-                    e.d_chunk_qw_ptrs, e.d_chunk_alpha_ptrs,
-                    p, h.device_ptr, host.qw_bytes_per_chunk,
-                    pool_->copy_stream());
-                if (h.ready_event != nullptr) {
+            if (h.device_ptr != nullptr) {
+                // ChunkedTensor::after_load (encoder-registered)
+                // writes per-plane device pointer-table entries the
+                // kernel reads. Async path uses the pool's copy_stream;
+                // sync fallback uses the default stream.
+                e.tensor->after_load(p, h.device_ptr, pool_->copy_stream());
+                if (pool_->copy_stream() != nullptr && h.ready_event != nullptr) {
                     cudaEventRecord((cudaEvent_t)h.ready_event,
                                     (cudaStream_t)pool_->copy_stream());
                 }
-            } else {
-                // Sync fallback when no copy stream is configured.
-                anybcq::update_per_plane_after_load(
-                    e.d_chunk_qw_ptrs, e.d_chunk_alpha_ptrs,
-                    p, h.device_ptr, host.qw_bytes_per_chunk);
+                // Any-prec only: stash β pointer host-side so the kernel
+                // launcher can dereference dev.q_bias_fp16 directly.
+                // Last-landed chunk wins; chunk_matmul re-asserts this
+                // from the highest-cid in the plan before launch.
+                if (host.any_precision &&
+                    p < (int)host.chunk_planes.size()) {
+                    const auto & cp = host.chunk_planes[p];
+                    dev.q_bias_fp16 =
+                        (const uint8_t *) h.device_ptr + cp.ker_off_qbias;
+                }
             }
         }
     }
@@ -695,6 +784,8 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
     dev.K_groups           = host.K_groups;
     dev.group_size         = host.group_size;
     dev.qw_bytes_per_chunk = host.qw_bytes_per_chunk;
+    dev.any_precision      = host.any_precision;
+    dev.base_precision     = host.base_precision;
 
     // The pool itself doesn't track pin state. Schedulers that want
     // "keep resident forever" semantics simply never call pool.evict()
@@ -704,63 +795,11 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
     return h.ready_event;
 }
 
-bool StreamllmRuntime::chunk_matmul(const std::string & wid,
-                                     const std::vector<int> & chunks,
-                                     const void * X_fp16, void * Y_fp16,
-                                     int n_tokens,
-                                     size_t x_stride_bytes,
-                                     size_t y_stride_bytes,
-                                     StreamHandle compute_stream) {
-    auto it = entries_.find(wid);
-    if (it == entries_.end()) return false;
-    const Entry & entry = it->second;
-
-    // Wait on pending H2D for every chunk we're about to read (incl.
-    // q_bias if present in the list; no-op if already synced). The
-    // wait is framework-level (depends on the pool's event tracking),
-    // so it stays here.
-    for (int cid : chunks) {
-        pool_->wait_on_stream(wid, cid, compute_stream);
-    }
-
-    // Translate cid list → plane-index list. The decoder layer is
-    // cid-encoding-blind; it works on plane indices.
-    std::vector<int> planes;
-    planes.reserve(chunks.size());
-    for (int cid : chunks) {
-        if (cid_is_chunk(cid)) planes.push_back(cid_chunk_index(cid));
-    }
-
-    return anybcq::chunk_matmul(
-        entry.dev,
-        (const void * const *) entry.d_chunk_qw_ptrs,
-        (const void * const *) entry.d_chunk_alpha_ptrs,
-        planes, X_fp16, Y_fp16, n_tokens,
-        x_stride_bytes, y_stride_bytes,
-        gemv_scratch_.get(), compute_stream);
-}
-
-bool StreamllmRuntime::chunk_matmul_batched(const std::string & wid,
-                                             const std::vector<int> & chunks,
-                                             const void * X_fp16, void * Y_fp16,
-                                             int n_tokens,
-                                             void * w_scratch_f16,
-                                             StreamHandle compute_stream) {
-    auto it = entries_.find(wid);
-    if (it == entries_.end()) return false;
-
-    for (int cid : chunks) {
-        pool_->wait_on_stream(wid, cid, compute_stream);
-    }
-    std::vector<int> planes;
-    planes.reserve(chunks.size());
-    for (int cid : chunks) {
-        if (cid_is_chunk(cid)) planes.push_back(cid_chunk_index(cid));
-    }
-    return anybcq::chunk_matmul_batched(
-        it->second.dev, planes, X_fp16, Y_fp16, n_tokens,
-        w_scratch_f16, compute_stream);
-}
+// (chunk_matmul / chunk_matmul_batched moved to
+// decoder/shortcut_anybcq/chunked_matmul.{h,cu} as
+// ``shortcut_anybcq::chunk_matmul_for_wid`` / ``..._batched_for_wid``.
+// Core's runtime now exposes only the layout + pool primitives those
+// helpers need — no encoder dispatch lives here.)
 
 // --- async prefetch worker pool -----------------------------------
 
