@@ -14,6 +14,7 @@
 #include "runtime_hook_diag.h"
 #include "stream_reader.h"
 #include "scheduler.h"
+#include "qwen3_moe_scheduler.h"  // qwen3::scheduler_* typed accessors
 #include "anybcq_gemv.h"
 #include "anybcq_gemm.h"
 #include "moe_fused.h"        // MoeExpertTable + qwen3::naver_gemv_moe_launch
@@ -396,7 +397,7 @@ bool handle_mul_mat_impl(
     }
 
     const std::string wid(name);
-    const Plan * plan = rt->scheduler().plan(wid, stream);
+    const Plan * plan = qwen3::scheduler_plan_dense(rt->scheduler(), wid, stream);
     if (plan == nullptr) {
         n_miss_name.fetch_add(1); diag("miss-name"); return false;
     }
@@ -532,7 +533,7 @@ bool handle_mul_mat_impl(
         }
     }
     rt->pool().record_compute_event(stream);
-    rt->scheduler().after_compute(wid, stream);
+    qwen3::scheduler_after_compute(rt->scheduler(), wid, stream);
     if (getenv("STREAMLLM_DEVICE_SYNC")) {
         cudaDeviceSynchronize();
     }
@@ -812,7 +813,7 @@ bool handle_mul_mat_id_impl(
     reservations.reserve(slots.size() * 4);
 
     const MoeExpertTable * fuse_table =
-        sched.moe_expert_table(canonical);
+        qwen3::scheduler_moe_expert_table(sched, canonical);
     if (fuse_table == nullptr) {
         return false;
     }
@@ -1013,12 +1014,12 @@ bool handle_mul_mat_id_impl(
                 const Plan * plan;
                 if (score) {
                     const int desired = max_prec_by_expert[eid];
-                    plan = sched.plan_for_expert_with_precision(
-                        canonical, eid, desired, stream);
+                    plan = qwen3::scheduler_plan_for_expert_with_precision(
+                        sched, canonical, eid, desired, stream);
                 } else {
                     const float gate_score = max_gate_by_expert[eid];
-                    plan = sched.plan_for_expert(
-                        canonical, eid, gate_score, /*rank=*/-1, stream);
+                    plan = qwen3::scheduler_plan_for_expert(
+                        sched, canonical, eid, gate_score, /*rank=*/-1, stream);
                 }
                 if (plan == nullptr) continue;
                 const int n_chunks_desired =
@@ -1043,7 +1044,7 @@ bool handle_mul_mat_id_impl(
                             1, std::memory_order_relaxed);
                         continue;
                     }
-                    sched.reserve_for_dispatch(mv.wid, mv.cid);
+                    qwen3::scheduler_reserve_for_dispatch(sched, mv.wid, mv.cid);
                     reservations.push_back({mv.wid, mv.cid});
 
                     if (g_runtime->pool().is_resident(mv.wid, mv.cid)) {
@@ -1152,7 +1153,7 @@ bool handle_mul_mat_id_impl(
                     "streamllm-ext: ids_d scratch too small for %zu B (have %zu B)\n",
                     sub_ids_bytes, g_scratch_ids_bytes);
                 for (auto & r : reservations) {
-                    sched.release_from_dispatch(r.wid, r.cid);
+                    qwen3::scheduler_release_from_dispatch(sched, r.wid, r.cid);
                 }
                 return false;
             }
@@ -1241,7 +1242,7 @@ bool handle_mul_mat_id_impl(
     }
 
     for (auto & r : reservations) {
-        sched.release_from_dispatch(r.wid, r.cid);
+        qwen3::scheduler_release_from_dispatch(sched, r.wid, r.cid);
     }
     {
         const auto dt = std::chrono::steady_clock::now() - _ph_release_t0;

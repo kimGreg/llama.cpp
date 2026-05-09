@@ -1,19 +1,37 @@
-// streamllm-ext — chunk lifecycle scheduler.
+// streamllm-ext / core — Scheduler ABC.
 //
-// The runtime exposes two primitives:
+// The framework manages chunked tensors via two encoder/architecture-
+// blind ABCs (ChunkedTensor, ChunkedComputation) and one global brain:
+// the Scheduler.  Concrete schedulers live in model/ subtrees (e.g.
+// qwen3::MoEScheduler).
 //
-//   move_chunk(wid, cid, src_tier, dst_tier) -> event
-//   chunk_matmul(wid, chunks, X) -> Y
+// Narrow surface — six virtuals total:
 //
-// A Scheduler is a policy that, for each managed mul_mat, decides:
-//   (1) which chunks (cids) chunk_matmul should consume — the
-//       precision dial.
-//   (2) which moves to issue ahead of / alongside compute.
-// Both come back in a single Plan; the mul_mat hook fires the moves,
-// then calls chunk_matmul with the chunks.
+//   ─ Lifecycle ───────────────────────────────────────────────────
+//     on_install               wid → host bytes / chunk_io / etc.
+//     on_graph_compute_begin   ggml about to walk a cgraph
+//     on_graph_compute_end     ggml finished walking a cgraph
 //
-// Pick at install via STREAMLLM_SCHEDULER. Unrecognised values fall
-// through to "eager" so a misspelled flag doesn't break inference.
+//   ─ Hot path ────────────────────────────────────────────────────
+//     on_marker(MarkerEvent)   custom marker node fired during compute
+//                              (semantic boundaries: layer entry,
+//                              expert dispatch, KV write, ...)
+//     plan_for(...)            answer demand for an upcoming
+//                              ChunkedComputation (which chunks should
+//                              be resident; usually a no-op since
+//                              prefetch already loaded them)
+//     make_room_for(pool, n)   pool-pressure eviction callback
+//
+// Anything above that — model-specific dispatch logic, per-op hooks,
+// score-policy tables, MoE expert tables — is currently bridged by
+// extra virtuals on this base class plus the per-op extern-C shims in
+// runtime_hook.{h,cpp}.  Step 4 of the architecture migration replaces
+// those shims with custom-op nodes wrapping a ChunkedComputation, at
+// which point the bridging virtuals come off the ABC.  See
+// /home/jaeyun/.claude/plans/zesty-questing-hippo.md.
+//
+// Pick at install via STREAMLLM_SCHEDULER.  Currently only "moe" is
+// supported; null defaults to it.
 
 #pragma once
 
@@ -31,16 +49,16 @@ namespace streamllm_ext {
 
 class StreamllmRuntime;
 
-// Decoder-neutral per-MoE-tensor expert pointer table. The fused
+// Decoder-neutral per-MoE-tensor expert pointer table.  The fused
 // kernel that consumes it is architecture-specific (see
 // ``qwen3/moe_fused.h``); the *struct* is encoder/architecture-
 // agnostic — three device-pointer arrays indexed by expert id —
 // so a forward decl here keeps core's contract free of architecture
-// types while still letting the Scheduler interface expose a getter
-// for MoE-aware schedulers.
+// types while letting model-side schedulers expose getters via the
+// free-function accessors in qwen3_moe_scheduler.h.
 struct MoeExpertTable;
 
-// Storage tier for a chunk. move_chunk(wid, cid, src, dst) currently
+// Storage tier for a chunk.  move_chunk(wid, cid, src, dst) currently
 // implements the RAM↔VRAM edge; SSD reads happen inside move_chunk
 // when host.chunks[p] is empty (pread → ring slot → transform → pool).
 enum class Tier : int {
@@ -59,203 +77,126 @@ struct MoveOp {
     Tier        dst  = Tier::VRAM;
 };
 
-// Scheduler's instructions to the hook for one managed mul_mat.
+// Scheduler's instructions to the dispatch site for one upcoming
+// ChunkedComputation.
 struct Plan {
-    // cids chunk_matmul must consume. Must be a subset of the chunks
+    // cids the kernel must consume.  Must be a subset of the chunks
     // guaranteed VRAM-resident after ``moves`` complete (or already
     // resident at entry).
     std::vector<int>    chunks;
-    // Moves to issue before compute. The hook fires these synchronously;
-    // move_chunk records H2D ready events so compute can overlap.
+    // Moves to issue before compute.  The runtime fires these
+    // synchronously; move_chunk records H2D ready events so compute
+    // can overlap.
     std::vector<MoveOp> moves;
+};
+
+// Marker event payload.  Inserted into the ggml cgraph by the model's
+// graph instrumenter (see step 4 of the architecture plan); fires
+// inline as ggml walks the graph.  ``kind`` is the only required
+// field — concrete schedulers downcast the variant payload to their
+// expected type.
+enum class MarkerKind : int {
+    GraphBegin    = 0,   // before cgraph walk starts
+    GraphEnd      = 1,   // after cgraph walk ends
+    LayerBegin    = 2,   // entering a transformer layer
+    LayerEnd      = 3,
+    AttentionIn   = 4,   // about to compute attention
+    KvWrite       = 5,   // K/V chunk just written
+    MoeDispatch   = 6,   // MoE expert routing decided (gate/topk done)
+    Custom        = 7,   // generic sentinel for ad-hoc instrumentation
+};
+
+struct MarkerEvent {
+    MarkerKind   kind = MarkerKind::Custom;
+    int          layer_index = -1;     // valid for Layer*, AttentionIn, MoeDispatch
+    StreamHandle compute_stream = nullptr;
+    void *       payload = nullptr;    // kind-specific opaque blob
 };
 
 class Scheduler {
 public:
     virtual ~Scheduler() = default;
 
-    // One-time setup. ``rt`` is the owning runtime — the scheduler
-    // calls rt.move_chunk() through it to upload chunks.
+    // ─── Lifecycle ─────────────────────────────────────────────────
+
+    // One-time setup called by the runtime after install.  ``rt`` is
+    // the owning runtime — the scheduler calls rt.move_chunk() through
+    // it to upload chunks.
     virtual void on_install(
-        StreamllmRuntime & rt,
-        const StreamReader & reader,
-        const std::string & gguf_path) = 0;
+        StreamllmRuntime &    rt,
+        const StreamReader &  reader,
+        const std::string &   gguf_path) = 0;
 
-    // Hot-path query from the hook. Returns nullptr if ``tensor_name``
-    // isn't managed (caller falls through to stock cuBLAS). Otherwise
-    // returns a Plan the hook applies.
-    //
-    // ``compute_stream`` is ggml-cuda's current stream — schedulers that
-    // overlap H2D and compute use it to record cross-stream events.
-    virtual const Plan * plan(
+    // ggml is about to walk a cgraph.  Default no-op.  Step-4 graph
+    // instrumenter fires this from the GraphBegin marker; concrete
+    // schedulers can use it to prefetch hot tensors / reset per-graph
+    // state.
+    virtual void on_graph_compute_begin(StreamHandle /*compute_stream*/) {}
+
+    // ggml finished walking a cgraph.  Default no-op.  Symmetric with
+    // on_graph_compute_begin.
+    virtual void on_graph_compute_end(StreamHandle /*compute_stream*/) {}
+
+    // ─── Hot path ─────────────────────────────────────────────────
+
+    // Marker custom-op node fired during graph walk.  Default no-op.
+    // Concrete schedulers dispatch on ``ev.kind`` and use the typed
+    // payload.  This is the post-step-4 replacement for the per-op
+    // extern-C shims (handle_mul_mat / on_topk_moe_observed / ...).
+    virtual void on_marker(const MarkerEvent & /*ev*/) {}
+
+    // Plan a single upcoming ChunkedComputation.  ``tensor_name`` is
+    // the canonical wid the runtime passes through; concrete
+    // schedulers may inspect ``compute_stream`` to record cross-stream
+    // events.  Returns nullptr if the tensor is unmanaged → caller
+    // falls through to stock cuBLAS.
+    virtual const Plan * plan_for(
         const std::string & tensor_name,
-        StreamHandle compute_stream) = 0;
+        StreamHandle        compute_stream) = 0;
 
-    // Called by the hook after chunk_matmul has launched and the
-    // pool's compute event has been recorded. Schedulers that want
-    // "flush after use" semantics evict tail chunks here. Default: no-op.
-    //
-    // Safety: pool.evict() only marks a slot free; a future load() that
-    // reuses the slot waits on the recorded compute event before its
-    // cudaMemcpyAsync — no overwrite against a still-reading kernel.
-    virtual void after_compute(
-        const std::string & /*tensor_name*/,
-        StreamHandle /*compute_stream*/) {}
-
-    // Reservation hooks for the load→compute window. The hook calls
-    // ``reserve_for_dispatch`` for every (wid, cid) the in-flight
-    // mul_mat is about to read, ``submit_prefetch``s any non-resident
-    // ones, then runs the compute kernels. While reserved, the
-    // scheduler must guarantee these chunks are NOT picked as
-    // ``make_room_for`` victims — even if a parallel prefetch worker
-    // hits a full pool. The hook calls ``release_from_dispatch`` after
-    // the compute event has been recorded; subsequent dispatches can
-    // then evict these chunks freely.
-    //
-    // Default no-op for non-streaming schedulers — they never call
-    // make_room_for in the first place.
-    virtual void reserve_for_dispatch(const std::string & /*wid*/,
-                                       int /*cid*/) {}
-    virtual void release_from_dispatch(const std::string & /*wid*/,
-                                        int /*cid*/) {}
-
-    // MoE-aware extension hook. Default returns null — the dispatch
-    // hook then falls back to per-(t, u) GEMV. MoE-aware schedulers
-    // (currently ``qwen3::MoEScheduler``) override this to return a
-    // per-canonical expert table the architecture-specific fused
-    // kernel reads (see ``qwen3/moe_fused.h``).
-    virtual const MoeExpertTable * moe_expert_table(
-        const std::string & /*canonical_wid*/) {
-        return nullptr;
-    }
-
-    // Pool-pressure callback. Invoked by the runtime when ``pool.load()``
-    // returns a null handle (arena fragmented or full). The scheduler
-    // should evict one or more resident chunks via ``pool.evict(...)``
-    // — picked by whatever residency policy the scheduler maintains —
-    // and return true if any progress was made. Returning false means
-    // "no eviction candidates left"; the caller will then surface an
-    // out-of-memory error.
-    //
-    // The runtime calls this in a loop until ``pool.load()`` succeeds
-    // or this returns false, so freeing one victim per call is fine.
+    // Pool-pressure callback.  Invoked by the runtime when
+    // ``pool.load()`` returns a null handle (arena fragmented or
+    // full).  The scheduler should evict one or more resident chunks
+    // via ``pool.evict(...)`` — picked by whatever residency policy
+    // the scheduler maintains — and return true if any progress was
+    // made.  Returning false means "no eviction candidates left"; the
+    // caller will then surface an out-of-memory error.
     virtual bool make_room_for(VramChunkPool & /*pool*/,
                                 size_t /*nbytes_needed*/) {
         return false;
     }
 
-    // MoE per-expert plan. Optional — default returns nullptr meaning
-    // "this scheduler is dense-only" so the MoE hook falls through to
-    // upstream's batched dispatch. MoE-aware schedulers (e.g.
-    // MoEScheduler) override this to return per-(canonical_wid,
-    // expert_id) chunk sets driven by the gate-score.
+    // Human-readable identifier for log lines.
+    virtual const char * name() const = 0;
+
+    // ─── Step-4-doomed bridging virtuals ───────────────────────────
     //
-    // ``canonical_wid`` is the stacked-tensor name (e.g.
-    // "blk.5.ffn_up_exps.weight"). ``expert_id`` is the index within
-    // src0_exps->ne[2]. ``gate_score`` is the routing weight (post
-    // softmax) for this token's selection of this expert; pass 0.0f if
-    // not available — schedulers may treat that as "unknown, use
-    // BASE+HOT".
-    virtual const Plan * plan_for_expert(
-        const std::string & /*canonical_wid*/,
-        int /*expert_id*/,
-        float /*gate_score*/,
-        StreamHandle /*compute_stream*/) {
-        return nullptr;
-    }
+    // The methods below are still vtable-dispatched because the
+    // current per-op hook glue (core/runtime_hook.cpp) calls them
+    // from extern-C shims.  Step 4 replaces those shims with custom-
+    // op nodes wrapping a ChunkedComputation; once that lands the
+    // bridging virtuals come off this base class.  See the
+    // architecture plan.
 
-    // Rank-aware variant. ``rank`` is this expert's position in the
-    // current token's top-k routing, sorted by gate score descending
-    // (0 = highest-gate expert; n_used-1 = lowest-gate among routed).
-    // Lets a scheduler express "top-K experts get HIGH planes, the
-    // rest get LOW" without trying to back out a rank from continuous
-    // gate magnitudes (top-k softmax distributions don't always have
-    // a clean magnitude threshold). Default forwards to the rank-less
-    // overload so existing schedulers stay unchanged.
-    virtual const Plan * plan_for_expert(
-        const std::string & canonical_wid,
-        int expert_id,
-        float gate_score,
-        int /*rank*/,
-        StreamHandle compute_stream) {
-        return plan_for_expert(canonical_wid, expert_id, gate_score,
-                                compute_stream);
-    }
-
-    // Direct-precision variant. The hook has already decided the
-    // desired plane count for this expert (e.g. via the score policy
-    // where the per-expert precision is computed from the per-expert
-    // max gate score). Skip the gate-threshold ladder; just build a
-    // Plan for chunks [0, desired_precision). Default returns nullptr —
-    // only `MoEScheduler` overrides.
-    virtual const Plan * plan_for_expert_with_precision(
-        const std::string & /*canonical_wid*/,
-        int /*expert_id*/,
-        int /*desired_precision*/,
-        StreamHandle /*compute_stream*/) {
-        return nullptr;
-    }
-
-    // Score-threshold policy accessors. Default = "off" so the hook's
-    // per-expert max-score precision branch is skipped on schedulers
-    // that don't implement it. MoEScheduler overrides these to expose
-    // its env-parsed tables to the hook.
-    //
-    // ``score_thresholds`` is a descending-order list of cutoffs;
-    // ``score_chunks[k]`` is the precision applied when the gate score
-    // is at-least ``score_thresholds[k]`` (and below all higher entries).
-    // Below the lowest threshold the lookup falls back to ``chunks.back()``.
-    virtual bool is_score_policy() const { return false; }
-    // Snapshot accessors — return by value because the score table can
-    // be swapped at runtime via set_score_table() (live precision dial
-    // for the demo path: each chat-completion request can carry its own
-    // exact threshold + chunks arrays). Hot-path callers take one
-    // snapshot per minibatch and iterate locally without holding a
-    // lock during compute.
-    virtual std::vector<float> score_thresholds_snapshot() const {
-        return {};
-    }
-    virtual std::vector<int>   score_chunks_snapshot()    const {
-        return {};
-    }
-
-    // Atomically replace the score-policy table. ``thresholds`` is a
-    // descending-order list of gate-score cutoffs; ``chunks[k]`` is the
-    // precision applied when the gate score is at-least
-    // ``thresholds[k]`` (and below all higher entries). Below the
-    // smallest threshold the lookup falls back to ``chunks.back()``.
-    // Returns false if the input is malformed (sizes mismatch, empty,
-    // non-descending thresholds, etc.). The next dispatch sees the new
-    // table; an in-flight dispatch keeps using the snapshot it took at
-    // entry, so requests don't tear mid-generation.
-    virtual bool set_score_table(
-        const std::vector<float> & /*thresholds*/,
-        const std::vector<int>   & /*chunks*/) {
+    // Score-policy snapshot accessors (live precision dial).  A score
+    // policy maps each routed expert's max gate score to a precision
+    // tier via a descending-threshold ladder.  Default = "off".
+    virtual bool                   is_score_policy() const { return false; }
+    virtual std::vector<float>     score_thresholds_snapshot() const { return {}; }
+    virtual std::vector<int>       score_chunks_snapshot()    const { return {}; }
+    virtual bool set_score_table(const std::vector<float> & /*thresholds*/,
+                                  const std::vector<int>   & /*chunks*/) {
         return false;
     }
 
-    // ── ggml-cuda hook entry points ────────────────────────────────
-    //
-    // The runtime registers thin extern-C shims with ggml-cuda; those
-    // shims forward straight here so all model-specific dispatch logic
-    // (graph introspection, gate-score reading, per-(t, u) plan,
-    // chunk fan-out, kernel launch) lives in the scheduler subclass
-    // for the active model architecture, not in core/.
-    //
-    // Default implementations return false / are no-ops so a model
-    // that doesn't override them just falls through to stock
-    // ggml-cuda dispatch.
-
-    // Dense managed mul_mat: scheduler may handle the op (return true)
-    // or pass (return false). ``stream`` is ggml-cuda's compute stream.
+    // Per-op dispatch hooks — called from extern-C shims registered
+    // with ggml-cuda.
     virtual bool handle_mul_mat(StreamHandle /*stream*/,
                                  const struct ggml_tensor * /*src0*/,
                                  const struct ggml_tensor * /*src1*/,
                                  struct ggml_tensor *       /*dst*/) {
         return false;
     }
-
-    // MoE mul_mat_id: routed expert dispatch.
     virtual bool handle_mul_mat_id(StreamHandle /*stream*/,
                                     const struct ggml_tensor * /*src0*/,
                                     const struct ggml_tensor * /*src1*/,
@@ -263,29 +204,18 @@ public:
                                     struct ggml_tensor *       /*dst*/) {
         return false;
     }
-
-    // Notification before ggml-cuda's fused softmax+argsort+norm
-    // kernel. Lets a MoE scheduler stash the (ids, weights) pair so
-    // it can later read post-norm routing weights instead of the
-    // bypassed selection-probs buffer.
     virtual void on_topk_moe_observed(StreamHandle /*stream*/,
                                        const struct ggml_tensor * /*logits*/,
                                        struct ggml_tensor *       /*weights*/,
                                        struct ggml_tensor *       /*ids*/) {}
-
-    // Fusion-skip query — ggml-cuda calls this on candidate weight
-    // tensors for fused subgraphs. Returning true disables fusion so
-    // the (managed) tensor reaches the scheduler's mul_mat handler.
     virtual bool claims_tensor(const struct ggml_tensor * /*w*/) {
         return false;
     }
-
-    // Human-readable identifier for log lines.
-    virtual const char * name() const = 0;
 };
 
-// Factory. ``which`` is one of "eager", "lazy" — or nullptr, which
-// maps to "eager". Never returns nullptr.
+// Factory.  ``which`` is currently only "moe" (or nullptr → "moe").
+// Anything else logs and returns null so a misspelled flag fails
+// loudly instead of silently falling back.
 std::unique_ptr<Scheduler> make_scheduler(const char * which);
 
 } // namespace streamllm_ext

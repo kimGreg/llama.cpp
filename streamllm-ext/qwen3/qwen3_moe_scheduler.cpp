@@ -418,8 +418,8 @@ public:
             canonical_seen.size());
     }
 
-    const Plan * plan(const std::string & tensor_name,
-                      StreamHandle /*compute_stream*/) override {
+    const Plan * plan_for(const std::string & tensor_name,
+                          StreamHandle /*compute_stream*/) override {
         // Synthetic wids return their base plan. Canonical MoE names
         // never reach here — they're placeholder-only and excluded from
         // chunked_tensor_names(). The hook calls plan_for_expert
@@ -433,7 +433,7 @@ public:
                                   int expert_id,
                                   float gate_score,
                                   int /*rank*/,
-                                  StreamHandle /*compute_stream*/) override {
+                                  StreamHandle /*compute_stream*/) {
         const std::string synthetic =
             canonical_wid + ":e" + std::to_string(expert_id);
         if (any_prec_wids_.count(synthetic)) {
@@ -494,7 +494,7 @@ public:
         const std::string & canonical_wid,
         int expert_id,
         int desired_precision,
-        StreamHandle /*compute_stream*/) override {
+        StreamHandle /*compute_stream*/) {
         const std::string synthetic =
             canonical_wid + ":e" + std::to_string(expert_id);
         if (any_prec_wids_.count(synthetic)) {
@@ -718,15 +718,15 @@ public:
         return tracker_.make_room(pool, *rt_);
     }
 
-    void reserve_for_dispatch(const std::string & wid, int cid) override {
+    void reserve_for_dispatch(const std::string & wid, int cid) {
         tracker_.reserve(wid, cid);
     }
-    void release_from_dispatch(const std::string & wid, int cid) override {
+    void release_from_dispatch(const std::string & wid, int cid) {
         tracker_.release(wid, cid);
     }
 
     const MoeExpertTable * moe_expert_table(
-        const std::string & canonical_wid) override {
+        const std::string & canonical_wid) {
         // Cached per canonical_wid. The table just stores pointers to
         // each expert's pre-allocated d_chunk_qw_ptrs etc. — those
         // mutate in place when a chunk lands, so the table itself never
@@ -1030,5 +1030,90 @@ std::unique_ptr<Scheduler> make_scheduler(const char * which) {
         which);
     return nullptr;
 }
+
+// ─── Free-function entry points (qwen3_moe_scheduler.h) ───────────
+//
+// Concrete MoEScheduler is anonymously namespaced above; the dispatch
+// glue calls into it via these typed helpers.  Static-cast is safe
+// because make_scheduler currently returns exactly one concrete type;
+// extending to multiple model schedulers would replace the cast with
+// a typed accessor on the runtime + name() check.
+
+namespace qwen3 {
+
+namespace {
+inline MoEScheduler & as_moe(Scheduler & s) {
+    return static_cast<MoEScheduler &>(s);
+}
+}  // anon
+
+const Plan * scheduler_plan_dense(
+    Scheduler &         sched,
+    const std::string & wid,
+    StreamHandle        compute_stream)
+{
+    return as_moe(sched).plan_for(wid, compute_stream);
+}
+
+const Plan * scheduler_plan_for_expert(
+    Scheduler &         sched,
+    const std::string & canonical_wid,
+    int                 expert_id,
+    float               gate_score,
+    int                 rank,
+    StreamHandle        compute_stream)
+{
+    return as_moe(sched).plan_for_expert(
+        canonical_wid, expert_id, gate_score, rank, compute_stream);
+}
+
+const Plan * scheduler_plan_for_expert_with_precision(
+    Scheduler &         sched,
+    const std::string & canonical_wid,
+    int                 expert_id,
+    int                 desired_precision,
+    StreamHandle        compute_stream)
+{
+    return as_moe(sched).plan_for_expert_with_precision(
+        canonical_wid, expert_id, desired_precision, compute_stream);
+}
+
+const MoeExpertTable * scheduler_moe_expert_table(
+    Scheduler &         sched,
+    const std::string & canonical_wid)
+{
+    return as_moe(sched).moe_expert_table(canonical_wid);
+}
+
+void scheduler_reserve_for_dispatch(
+    Scheduler &         sched,
+    const std::string & wid,
+    int                 cid)
+{
+    as_moe(sched).reserve_for_dispatch(wid, cid);
+}
+
+void scheduler_release_from_dispatch(
+    Scheduler &         sched,
+    const std::string & wid,
+    int                 cid)
+{
+    as_moe(sched).release_from_dispatch(wid, cid);
+}
+
+void scheduler_after_compute(
+    Scheduler &         /*sched*/,
+    const std::string & /*wid*/,
+    StreamHandle        /*compute_stream*/)
+{
+    // MoEScheduler has no after_compute behaviour — the residency
+    // tracker handles eviction lazily under pool pressure rather than
+    // synchronously after each dispatch. Kept as a no-op so the
+    // dispatch glue's call site stays untouched while the post-compute
+    // hook is in flux (Step 4 graph instrumenter will fold this into
+    // the marker callback).
+}
+
+}  // namespace qwen3
 
 } // namespace streamllm_ext
