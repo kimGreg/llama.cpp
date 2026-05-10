@@ -49,11 +49,11 @@ struct MoEProfile {
     std::atomic<uint64_t> hook_calls{0};
     std::atomic<uint64_t> compute_dispatches{0};
     std::atomic<uint64_t> compute_chunks_sum{0};
-    std::atomic<uint64_t> prefetch_attempts{0};
-    std::atomic<uint64_t> prefetch_skipped{0};
-    std::atomic<uint64_t> prefetch_issued{0};
+    std::atomic<uint64_t> async_load_attempts{0};
+    std::atomic<uint64_t> async_load_skipped{0};
+    std::atomic<uint64_t> async_load_issued{0};
     std::atomic<uint64_t> compute_ns{0};
-    std::atomic<uint64_t> prefetch_ns{0};
+    std::atomic<uint64_t> async_load_ns{0};
     std::atomic<uint64_t> hook_total_ns{0};
     std::atomic<uint64_t> ph_load_walk_ns{0};
     std::atomic<uint64_t> ph_plan_lookup_ns{0};
@@ -66,8 +66,8 @@ struct MoEProfile {
     std::atomic<uint64_t> compute_matmul_ns{0};
     std::atomic<uint64_t> compute_cast_out_ns{0};
 
-    std::atomic<uint64_t> prefetch_probe_ns{0};
-    std::atomic<uint64_t> prefetch_move_ns{0};
+    std::atomic<uint64_t> async_load_probe_ns{0};
+    std::atomic<uint64_t> async_load_move_ns{0};
 
     std::atomic<uint64_t> mc_pread_ns{0};
     std::atomic<uint64_t> mc_pool_load_ns{0};
@@ -165,14 +165,14 @@ unsigned long long streamllm_stat_hook_calls(void) {
 unsigned long long streamllm_stat_dispatch_count(void) {
     return (unsigned long long) g_moe_profile.compute_dispatches.load(std::memory_order_relaxed);
 }
-unsigned long long streamllm_stat_prefetch_attempts(void) {
-    return (unsigned long long) g_moe_profile.prefetch_attempts.load(std::memory_order_relaxed);
+unsigned long long streamllm_stat_async_load_attempts(void) {
+    return (unsigned long long) g_moe_profile.async_load_attempts.load(std::memory_order_relaxed);
 }
-unsigned long long streamllm_stat_prefetch_skipped(void) {
-    return (unsigned long long) g_moe_profile.prefetch_skipped.load(std::memory_order_relaxed);
+unsigned long long streamllm_stat_async_load_skipped(void) {
+    return (unsigned long long) g_moe_profile.async_load_skipped.load(std::memory_order_relaxed);
 }
-unsigned long long streamllm_stat_prefetch_issued(void) {
-    return (unsigned long long) g_moe_profile.prefetch_issued.load(std::memory_order_relaxed);
+unsigned long long streamllm_stat_async_load_issued(void) {
+    return (unsigned long long) g_moe_profile.async_load_issued.load(std::memory_order_relaxed);
 }
 unsigned long long streamllm_stat_make_room_calls(void) {
     return (unsigned long long) g_moe_profile.pool_make_room_calls.load(std::memory_order_relaxed);
@@ -258,18 +258,18 @@ void print_profile_if_enabled() {
     const uint64_t calls   = m.hook_calls.load();
     const uint64_t disps   = m.compute_dispatches.load();
     const uint64_t chunks  = m.compute_chunks_sum.load();
-    const uint64_t att     = m.prefetch_attempts.load();
-    const uint64_t skip    = m.prefetch_skipped.load();
-    const uint64_t iss     = m.prefetch_issued.load();
+    const uint64_t att     = m.async_load_attempts.load();
+    const uint64_t skip    = m.async_load_skipped.load();
+    const uint64_t iss     = m.async_load_issued.load();
     const uint64_t cn_ns   = m.compute_ns.load();
-    const uint64_t pn_ns   = m.prefetch_ns.load();
+    const uint64_t pn_ns   = m.async_load_ns.load();
     const double pf_hit_pct = att ? 100.0 * (double)skip / (double)att : 0.0;
     const uint64_t crq = m.compute_resident_query_ns.load();
     const uint64_t cci = m.compute_cast_in_ns.load();
     const uint64_t cmm = m.compute_matmul_ns.load();
     const uint64_t cco = m.compute_cast_out_ns.load();
-    const uint64_t pp_probe = m.prefetch_probe_ns.load();
-    const uint64_t pp_move  = m.prefetch_move_ns.load();
+    const uint64_t pp_probe = m.async_load_probe_ns.load();
+    const uint64_t pp_move  = m.async_load_move_ns.load();
     const uint64_t mc_pread = m.mc_pread_ns.load();
     const uint64_t mc_pload = m.mc_pool_load_ns.load();
     const uint64_t mc_n     = m.mc_calls.load();
@@ -282,9 +282,9 @@ void print_profile_if_enabled() {
         "  hook_calls         = %lu  (per mul_mat_id firing)\n"
         "  compute_dispatches = %lu  chunk_matmul calls\n"
         "  compute_avg_chunks = %.2f  (BASE+cached_HOT per call)\n"
-        "  prefetch_attempts  = %lu  plan->moves entries seen\n"
-        "  prefetch_skipped   = %lu  (%.1f%% cache hit)\n"
-        "  prefetch_issued    = %lu  actual move_chunk calls\n"
+        "  async_load_attempts  = %lu  plan->moves entries seen\n"
+        "  async_load_skipped   = %lu  (%.1f%% cache hit)\n"
+        "  async_load_issued    = %lu  actual move_chunk calls\n"
         "  compute_loop_total = %.3f s     (%.2f us/dispatch)\n"
         "    breakdown: resident_query=%.3f s  cast_in=%.3f s  matmul=%.3f s  cast_out=%.3f s\n"
         "  prefetch_loop_total= %.3f s     (%.2f us/issue)\n"
@@ -807,9 +807,7 @@ bool handle_mul_mat_id_impl(
         }
     } _hook_exit{_hook_t0};
 
-    const bool prefetch_on =
-        std::strcmp(getenv("STREAMLLM_MOE_PREFETCH") ?: "1", "0") != 0;
-    const bool async_on = g_runtime->prefetch_worker_count() > 0;
+    const bool async_on = g_runtime->io_worker_count() > 0;
 
     struct PerSlot {
         std::string synth;
@@ -846,20 +844,12 @@ bool handle_mul_mat_id_impl(
     int32_t * ids_d = (int32_t *) sc->ids_d;
     const size_t x_tile_bytes = (size_t)K * sizeof(__half);
 
-    const char * pol_env = getenv("STREAMLLM_MOE_POLICY");
-    const bool dynamic_policy =
-        pol_env != nullptr &&
-        (std::strcmp(pol_env, "dynamic") == 0 ||
-         std::strcmp(pol_env, "DYNAMIC") == 0);
-    int minibatch = n_tokens;
-    if (dynamic_policy && !_hook_in_capture && n_tokens > 1) {
-        minibatch = 64;
-        if (const char * s = getenv("STREAMLLM_MOE_PREFILL_MINIBATCH")) {
-            int v = std::atoi(s);
-            if (v > 0) minibatch = v;
-        }
-        if (minibatch <= 0 || minibatch > n_tokens) minibatch = n_tokens;
-    }
+    // Single-batch over the whole token range. The score policy is
+    // already a per-expert max-aggregation across the minibatch, so
+    // splitting wouldn't change which chunks are needed (it only
+    // affects per-(t,u) precision granularity, which the kernel
+    // already takes per-(t,u) via host_prec_per_tu).
+    const int minibatch = n_tokens;
 
     const auto t_load_start = std::chrono::steady_clock::now();
     STLM_NVTX_RANGE("moe_hook");
@@ -868,35 +858,32 @@ bool handle_mul_mat_id_impl(
         const int sub_n = std::min(minibatch, n_tokens - t_base);
 
         int sub_max_precision = 0;
-        std::vector<int> host_prec_per_tu;
-        const bool score_outer = qwen3::scheduler_is_score_policy(sched);
-        if (score_outer) {
-            host_prec_per_tu.assign((size_t)sub_n * n_used_per_tok, 0);
-        }
+        std::vector<int> host_prec_per_tu(
+            (size_t)sub_n * n_used_per_tok, 0);
         std::shared_ptr<std::atomic<uint32_t>> batch;
-        if (prefetch_on && !_hook_in_capture) {
+        if (!_hook_in_capture) {
             STLM_NVTX_RANGE("LOAD");
 
-            const bool score = score_outer;
-            // Per-expert max gate score across the minibatch. Under
-            // batched prefill, one expert may serve many tokens with
-            // different scores; we load enough chunks for the highest
-            // and re-use them across the lower-scoring tokens (free,
-            // since the chunks are already resident).
+            // Per-expert max gate score across the minibatch.  One
+            // expert may serve many tokens with different scores; we
+            // load enough chunks for the highest and re-use them
+            // across the lower-scoring tokens (free, since the chunks
+            // are already resident).
             std::unordered_map<int, float> max_gate_by_expert;
             std::unordered_map<int, int>   max_prec_by_expert;
             std::vector<int> unique_experts;
             const size_t reserve_n = (size_t)n_used_per_tok * 4;
             max_gate_by_expert.reserve(reserve_n);
-            if (score) max_prec_by_expert.reserve(reserve_n);
+            max_prec_by_expert.reserve(reserve_n);
             unique_experts.reserve(reserve_n);
 
             const auto _ph_load_t0 = std::chrono::steady_clock::now();
 
-            // Snapshot the score table once per minibatch. set_score_table()
-            // can swap the active table at any time (per-request live
-            // dial); the snapshot guarantees an in-flight LOAD walk
-            // doesn't tear if a swap lands mid-iteration.
+            // Snapshot the score table once per minibatch.
+            // set_score_table() can swap the active table at any
+            // time (per-request live dial); the snapshot guarantees
+            // an in-flight LOAD walk doesn't tear if a swap lands
+            // mid-iteration.
             const std::vector<float> sc_thresh =
                 qwen3::scheduler_score_thresholds_snapshot(sched);
             const std::vector<int>   sc_chunks =
@@ -920,16 +907,12 @@ bool handle_mul_mat_id_impl(
                 return desired;
             };
 
-            // Pass 1: collect per-expert max gate score + register every
-            // (t, u)'s eid so unique_experts is dedup'd in encounter order.
-            // Per-(t, u) precision is filled in Pass 2 once we know the
-            // per-expert max — under batched prefill this gives every
-            // (t, u) routed to expert e the SAME precision, derived from
-            // e's highest-scoring token in the minibatch.
-            std::vector<float> g_per_tu;
-            if (score) {
-                g_per_tu.assign((size_t)sub_n * n_used_per_tok, 0.0f);
-            }
+            // Pass 1: collect per-expert max gate score + register
+            // every (t, u)'s eid so unique_experts is dedup'd in
+            // encounter order.  Per-(t, u) precision is filled in
+            // Pass 2 once we know the per-expert max.
+            std::vector<float> g_per_tu(
+                (size_t)sub_n * n_used_per_tok, 0.0f);
             for (int t = t_base; t < t_base + sub_n; ++t) {
                 for (int u = 0; u < n_used_per_tok; ++u) {
                     const int eid =
@@ -953,15 +936,13 @@ bool handle_mul_mat_id_impl(
                     } else if (g > it_g->second) {
                         it_g->second = g;
                     }
-                    if (score) {
-                        g_per_tu[(size_t)(t - t_base) *
-                                  n_used_per_tok + u] = g;
-                    }
+                    g_per_tu[(size_t)(t - t_base) *
+                              n_used_per_tok + u] = g;
                 }
             }
 
-            // Pass 2 (score policy only): per-expert max precision
-            // from per-expert max g; broadcast back to per-(t, u).
+            // Pass 2: per-expert max precision from per-expert max g;
+            // broadcast back to per-(t, u).
             // For any-prec wids, translate the requested target precision
             // (in PLANES) to the precision actually served — chunks are
             // packed in tiers of [base_p planes][+1 plane]×(Pa−1), so
@@ -980,32 +961,30 @@ bool handle_mul_mat_id_impl(
                 }
                 return target;
             };
-            if (score) {
-                for (int eid : unique_experts) {
-                    max_prec_by_expert[eid] =
-                        translate_planes(score_lookup(max_gate_by_expert[eid]));
-                }
-                const int layer =
-                    std::strncmp(canonical.c_str(), "blk.", 4) == 0
-                        ? std::atoi(canonical.c_str() + 4) : -1;
-                for (int t = t_base; t < t_base + sub_n; ++t) {
-                    for (int u = 0; u < n_used_per_tok; ++u) {
-                        const int eid =
-                            ids_host[(size_t)t * n_used_per_tok + u];
-                        const int desired = max_prec_by_expert[eid];
-                        host_prec_per_tu[(size_t)(t - t_base) *
-                                         n_used_per_tok + u] = desired;
-                        const float g = g_per_tu[(size_t)(t - t_base) *
-                                                  n_used_per_tok + u];
-                        diag::record_gate_event(layer, t, u, eid,
-                                                g, /*cum_before=*/0.0f,
-                                                desired);
-                        const std::string synthetic =
-                            canonical + ":e" + std::to_string(eid);
-                        for (int pp = 0; pp < desired; ++pp) {
-                            diag::record_chunk(*g_runtime, synthetic,
-                                               u, pp, cid_chunk(pp));
-                        }
+            for (int eid : unique_experts) {
+                max_prec_by_expert[eid] =
+                    translate_planes(score_lookup(max_gate_by_expert[eid]));
+            }
+            const int layer =
+                std::strncmp(canonical.c_str(), "blk.", 4) == 0
+                    ? std::atoi(canonical.c_str() + 4) : -1;
+            for (int t = t_base; t < t_base + sub_n; ++t) {
+                for (int u = 0; u < n_used_per_tok; ++u) {
+                    const int eid =
+                        ids_host[(size_t)t * n_used_per_tok + u];
+                    const int desired = max_prec_by_expert[eid];
+                    host_prec_per_tu[(size_t)(t - t_base) *
+                                     n_used_per_tok + u] = desired;
+                    const float g = g_per_tu[(size_t)(t - t_base) *
+                                              n_used_per_tok + u];
+                    diag::record_gate_event(layer, t, u, eid,
+                                            g, /*cum_before=*/0.0f,
+                                            desired);
+                    const std::string synthetic =
+                        canonical + ":e" + std::to_string(eid);
+                    for (int pp = 0; pp < desired; ++pp) {
+                        diag::record_chunk(*g_runtime, synthetic,
+                                           u, pp, cid_chunk(pp));
                     }
                 }
             }
@@ -1023,16 +1002,10 @@ bool handle_mul_mat_id_impl(
                 batch = std::make_shared<std::atomic<uint32_t>>(0);
             }
             for (int eid : unique_experts) {
-                const Plan * plan;
-                if (score) {
-                    const int desired = max_prec_by_expert[eid];
-                    plan = qwen3::scheduler_plan_for_expert_with_precision(
+                const int desired = max_prec_by_expert[eid];
+                const Plan * plan =
+                    qwen3::scheduler_plan_for_expert_with_precision(
                         sched, canonical, eid, desired, stream);
-                } else {
-                    const float gate_score = max_gate_by_expert[eid];
-                    plan = qwen3::scheduler_plan_for_expert(
-                        sched, canonical, eid, gate_score, /*rank=*/-1, stream);
-                }
                 if (plan == nullptr) continue;
                 const int n_chunks_desired =
                     std::max(0, (int)plan->chunks.size() - 1);
@@ -1048,11 +1021,11 @@ bool handle_mul_mat_id_impl(
                     sub_max_precision = planes_for_kernel;
 
                 for (const auto & mv : plan->moves) {
-                    g_moe_profile.prefetch_attempts.fetch_add(
+                    g_moe_profile.async_load_attempts.fetch_add(
                         1, std::memory_order_relaxed);
                     std::string key = mv.wid + "#" + std::to_string(mv.cid);
                     if (!issued_keys.insert(std::move(key)).second) {
-                        g_moe_profile.prefetch_skipped.fetch_add(
+                        g_moe_profile.async_load_skipped.fetch_add(
                             1, std::memory_order_relaxed);
                         continue;
                     }
@@ -1060,15 +1033,15 @@ bool handle_mul_mat_id_impl(
                     reservations.push_back({mv.wid, mv.cid});
 
                     if (g_runtime->pool().is_resident(mv.wid, mv.cid)) {
-                        g_moe_profile.prefetch_skipped.fetch_add(
+                        g_moe_profile.async_load_skipped.fetch_add(
                             1, std::memory_order_relaxed);
                         continue;
                     }
-                    g_moe_profile.prefetch_issued.fetch_add(
+                    g_moe_profile.async_load_issued.fetch_add(
                         1, std::memory_order_relaxed);
 
                     if (async_on) {
-                        g_runtime->submit_prefetch(mv.wid, mv.cid, batch);
+                        g_runtime->submit_async_load(mv.wid, mv.cid, batch);
                     } else {
                         g_runtime->move_chunk(mv.wid, mv.cid, mv.src, mv.dst,
                                               /*compute_stream=*/nullptr);
@@ -1086,22 +1059,18 @@ bool handle_mul_mat_id_impl(
 
         int uniform_precision = sub_max_precision;
         if (uniform_precision <= 0) {
-            const int env_base = (getenv("STREAMLLM_MOE_BASE_CHUNKS")
-                                   ? std::atoi(getenv("STREAMLLM_MOE_BASE_CHUNKS"))
-                                   : 0);
-            const int env_hot  = (getenv("STREAMLLM_MOE_HOT_CHUNKS")
-                                   ? std::atoi(getenv("STREAMLLM_MOE_HOT_CHUNKS"))
-                                   : 0);
-            uniform_precision = env_base + env_hot;
-            if (uniform_precision <= 0)
-                uniform_precision = kMaxChunksPerTensor;
+            // Score table didn't yield any positive precision (empty
+            // table or every expert routed below all thresholds with
+            // empty chunks list).  Default to full precision so the
+            // kernel doesn't run with prec=0.
+            uniform_precision = kMaxChunksPerTensor;
         }
         if (!_hook_in_capture) {
             const auto _ph_wait_t0 = std::chrono::steady_clock::now();
             if (batch) {
-                g_runtime->wait_prefetch_batch(batch);
+                g_runtime->wait_async_load_batch(batch);
             } else {
-                g_runtime->wait_prefetch_idle();
+                g_runtime->wait_async_load_idle();
             }
             const auto dt = std::chrono::steady_clock::now() - _ph_wait_t0;
             g_moe_profile.ph_wait_barrier_ns.fetch_add(
@@ -1109,7 +1078,7 @@ bool handle_mul_mat_id_impl(
                 std::memory_order_relaxed);
         }
 
-        // Cross-stream sync: ``wait_prefetch_*`` only drains the host
+        // Cross-stream sync: ``wait_async_load_*`` only drains the host
         // worker queue — it does NOT order compute_stream after the
         // copy_stream events that completed the H2D + per-plane
         // pointer-table updates.  Without an explicit wait_on_stream,
@@ -1185,7 +1154,7 @@ bool handle_mul_mat_id_impl(
         cudaMemsetAsync(dst_sub, 0, dst_sub_bytes, stream);
 
         const int * prec_per_tu_d = nullptr;
-        if (score_outer && !host_prec_per_tu.empty()) {
+        if (!host_prec_per_tu.empty()) {
             const size_t bytes =
                 host_prec_per_tu.size() * sizeof(int);
             if (bytes <= g_scratch_ids_bytes && sc->prec_per_tu_d) {

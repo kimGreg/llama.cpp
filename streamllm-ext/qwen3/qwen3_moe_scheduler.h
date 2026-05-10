@@ -32,19 +32,9 @@ const Plan * scheduler_plan_dense(
     const std::string & wid,
     StreamHandle        compute_stream);
 
-// MoE per-expert plan, gate-threshold form.  ``rank`` is the expert's
-// position in the current token's top-k routing (0 = highest gate).
-const Plan * scheduler_plan_for_expert(
-    Scheduler &         sched,
-    const std::string & canonical_wid,
-    int                 expert_id,
-    float               gate_score,
-    int                 rank,
-    StreamHandle        compute_stream);
-
-// MoE per-expert plan, direct-precision form.  Bypasses the gate-
-// threshold ladder; the dispatch already decided ``desired_precision``
-// (e.g. by looking up the expert's max gate score in the score table).
+// MoE per-expert plan.  Dispatch has already looked up the per-expert
+// max-gate score in the score table and resolved that to a precision
+// (in planes); we just emit a Plan whose chunks list matches.
 const Plan * scheduler_plan_for_expert_with_precision(
     Scheduler &         sched,
     const std::string & canonical_wid,
@@ -119,10 +109,9 @@ bool scheduler_claims_tensor(
     const struct ggml_tensor * w);
 
 // ─── Live precision dial accessors ─────────────────────────────────
-// Score-policy snapshot accessors used by qwen3/qwen3_runtime_glue.cpp's
+// Score-table snapshot + replace, used by qwen3/qwen3_runtime_glue.cpp's
 // streamllm_set_score_table / streamllm_get_score_table extern-C
 // entry points. Concrete impl on MoEScheduler.
-bool                scheduler_is_score_policy(const Scheduler & sched);
 std::vector<float>  scheduler_score_thresholds_snapshot(const Scheduler & sched);
 std::vector<int>    scheduler_score_chunks_snapshot   (const Scheduler & sched);
 bool                scheduler_set_score_table(

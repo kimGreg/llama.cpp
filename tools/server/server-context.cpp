@@ -48,9 +48,9 @@ unsigned long long streamllm_stat_pool_h2d_calls(void);
 unsigned long long streamllm_stat_host_dram_bytes(void);
 unsigned long long streamllm_stat_hook_calls(void);
 unsigned long long streamllm_stat_dispatch_count(void);
-unsigned long long streamllm_stat_prefetch_attempts(void);
-unsigned long long streamllm_stat_prefetch_skipped(void);
-unsigned long long streamllm_stat_prefetch_issued(void);
+unsigned long long streamllm_stat_async_load_attempts(void);
+unsigned long long streamllm_stat_async_load_skipped(void);
+unsigned long long streamllm_stat_async_load_issued(void);
 unsigned long long streamllm_stat_make_room_calls(void);
 unsigned long long streamllm_stat_mc_calls(void);
 unsigned long long streamllm_stat_mc_pread_ns(void);
@@ -4240,9 +4240,9 @@ void server_routes::init_routes() {
             {"hook", {
                 {"calls",             streamllm_stat_hook_calls()},
                 {"dispatches",        streamllm_stat_dispatch_count()},
-                {"prefetch_attempts", streamllm_stat_prefetch_attempts()},
-                {"prefetch_skipped",  streamllm_stat_prefetch_skipped()},
-                {"prefetch_issued",   streamllm_stat_prefetch_issued()},
+                {"async_load_attempts", streamllm_stat_async_load_attempts()},
+                {"async_load_skipped",  streamllm_stat_async_load_skipped()},
+                {"async_load_issued",   streamllm_stat_async_load_issued()},
                 {"mc_calls",          streamllm_stat_mc_calls()},
                 {"mc_pread_ns",       streamllm_stat_mc_pread_ns()},
             }},

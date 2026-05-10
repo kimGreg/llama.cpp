@@ -106,16 +106,16 @@ StreamllmRuntime::StreamllmRuntime(size_t capacity_bytes, int device,
 StreamllmRuntime::~StreamllmRuntime() {
     // Stop the prefetch worker pool first — workers may still be
     // dereferencing entries_ or pool_ when this dtor runs.
-    if (!prefetch_workers_.empty()) {
+    if (!io_workers_.empty()) {
         {
-            std::lock_guard<std::mutex> lk(prefetch_mu_);
-            prefetch_stop_.store(true, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(io_mu_);
+            io_stop_.store(true, std::memory_order_relaxed);
         }
-        prefetch_cv_work_.notify_all();
-        for (auto & t : prefetch_workers_) {
+        io_cv_work_.notify_all();
+        for (auto & t : io_workers_) {
             if (t.joinable()) t.join();
         }
-        prefetch_workers_.clear();
+        io_workers_.clear();
     }
     // Per-tensor pointer arrays were carved out of small_slab_; one
     // cudaFree handles them all. Per-entry pointers become invalid.
@@ -248,20 +248,20 @@ void StreamllmRuntime::install(const StreamReader & reader,
     // limits. On the dev box (8-core Ryzen, single Gen4 NVMe) N=8
     // gave +47% tg32 vs sync; N=16 only +53%, with double the CPU
     // pressure. Pick N=8 as the default sweet spot. Override via
-    // STREAMLLM_PREFETCH_WORKERS=N (0 disables and falls back to
+    // STREAMLLM_IO_WORKERS=N (0 disables and falls back to
     // inline pread on the hook thread).
     {
         int n_workers = 8;
-        if (const char * w = getenv("STREAMLLM_PREFETCH_WORKERS")) {
+        if (const char * w = getenv("STREAMLLM_IO_WORKERS")) {
             n_workers = std::atoi(w);
             if (n_workers < 0) n_workers = 0;
             if (n_workers > 32) n_workers = 32;
         }
-        prefetch_stop_.store(false, std::memory_order_relaxed);
-        prefetch_workers_.reserve(n_workers);
+        io_stop_.store(false, std::memory_order_relaxed);
+        io_workers_.reserve(n_workers);
         for (int i = 0; i < n_workers; ++i) {
-            prefetch_workers_.emplace_back(
-                &StreamllmRuntime::prefetch_worker_loop_, this);
+            io_workers_.emplace_back(
+                &StreamllmRuntime::io_worker_loop_, this);
         }
     }
 
@@ -785,75 +785,75 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
 
 // --- async prefetch worker pool -----------------------------------
 
-bool StreamllmRuntime::submit_prefetch(const std::string & wid, int cid) {
-    if (prefetch_workers_.empty()) return false;
+bool StreamllmRuntime::submit_async_load(const std::string & wid, int cid) {
+    if (io_workers_.empty()) return false;
     {
-        std::lock_guard<std::mutex> lk(prefetch_mu_);
-        prefetch_queue_.push_back(PrefetchRequest{wid, cid, nullptr});
-        prefetch_in_flight_.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(io_mu_);
+        io_queue_.push_back(AsyncLoadRequest{wid, cid, nullptr});
+        io_in_flight_.fetch_add(1, std::memory_order_relaxed);
     }
-    prefetch_cv_work_.notify_one();
+    io_cv_work_.notify_one();
     return true;
 }
 
-bool StreamllmRuntime::submit_prefetch(
+bool StreamllmRuntime::submit_async_load(
     const std::string & wid, int cid,
     std::shared_ptr<std::atomic<uint32_t>> batch_remaining)
 {
-    if (prefetch_workers_.empty()) return false;
+    if (io_workers_.empty()) return false;
     if (batch_remaining) {
         batch_remaining->fetch_add(1, std::memory_order_relaxed);
     }
     {
-        std::lock_guard<std::mutex> lk(prefetch_mu_);
-        prefetch_queue_.push_back(
-            PrefetchRequest{wid, cid, std::move(batch_remaining)});
-        prefetch_in_flight_.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(io_mu_);
+        io_queue_.push_back(
+            AsyncLoadRequest{wid, cid, std::move(batch_remaining)});
+        io_in_flight_.fetch_add(1, std::memory_order_relaxed);
     }
-    prefetch_cv_work_.notify_one();
+    io_cv_work_.notify_one();
     return true;
 }
 
-void StreamllmRuntime::wait_prefetch_idle() {
-    if (prefetch_workers_.empty()) return;
-    std::unique_lock<std::mutex> lk(prefetch_mu_);
-    prefetch_cv_done_.wait(lk, [this] {
-        return prefetch_queue_.empty() &&
-               prefetch_in_flight_.load(std::memory_order_relaxed) == 0;
+void StreamllmRuntime::wait_async_load_idle() {
+    if (io_workers_.empty()) return;
+    std::unique_lock<std::mutex> lk(io_mu_);
+    io_cv_done_.wait(lk, [this] {
+        return io_queue_.empty() &&
+               io_in_flight_.load(std::memory_order_relaxed) == 0;
     });
 }
 
-void StreamllmRuntime::wait_prefetch_batch(
+void StreamllmRuntime::wait_async_load_batch(
     const std::shared_ptr<std::atomic<uint32_t>> & remaining)
 {
     if (!remaining) return;
-    if (prefetch_workers_.empty()) return;
+    if (io_workers_.empty()) return;
     // Spin briefly, then fall back to cv-wake. The 100 ns spin avoids
     // a syscall when chunks are already loaded by the time we wait.
     for (int i = 0; i < 64; ++i) {
         if (remaining->load(std::memory_order_acquire) == 0) return;
     }
-    std::unique_lock<std::mutex> lk(prefetch_mu_);
-    prefetch_cv_done_.wait(lk, [&] {
+    std::unique_lock<std::mutex> lk(io_mu_);
+    io_cv_done_.wait(lk, [&] {
         return remaining->load(std::memory_order_acquire) == 0;
     });
 }
 
-void StreamllmRuntime::prefetch_worker_loop_() {
+void StreamllmRuntime::io_worker_loop_() {
     for (;;) {
-        PrefetchRequest req;
+        AsyncLoadRequest req;
         {
-            std::unique_lock<std::mutex> lk(prefetch_mu_);
-            prefetch_cv_work_.wait(lk, [this] {
-                return prefetch_stop_.load(std::memory_order_relaxed) ||
-                       !prefetch_queue_.empty();
+            std::unique_lock<std::mutex> lk(io_mu_);
+            io_cv_work_.wait(lk, [this] {
+                return io_stop_.load(std::memory_order_relaxed) ||
+                       !io_queue_.empty();
             });
-            if (prefetch_queue_.empty()) {
-                if (prefetch_stop_.load(std::memory_order_relaxed)) return;
+            if (io_queue_.empty()) {
+                if (io_stop_.load(std::memory_order_relaxed)) return;
                 continue;
             }
-            req = std::move(prefetch_queue_.front());
-            prefetch_queue_.pop_front();
+            req = std::move(io_queue_.front());
+            io_queue_.pop_front();
         }
 
         try {
@@ -876,13 +876,13 @@ void StreamllmRuntime::prefetch_worker_loop_() {
         }
 
         const bool last_global =
-            prefetch_in_flight_.fetch_sub(1, std::memory_order_acq_rel) == 1;
+            io_in_flight_.fetch_sub(1, std::memory_order_acq_rel) == 1;
         const bool last_batch = req.batch_remaining
             ? req.batch_remaining->fetch_sub(1, std::memory_order_acq_rel) == 1
             : false;
         if (last_global || last_batch) {
-            std::lock_guard<std::mutex> lk(prefetch_mu_);
-            prefetch_cv_done_.notify_all();
+            std::lock_guard<std::mutex> lk(io_mu_);
+            io_cv_done_.notify_all();
         }
     }
 }

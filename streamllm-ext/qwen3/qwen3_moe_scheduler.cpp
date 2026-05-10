@@ -217,29 +217,15 @@ public:
                     const std::string & gguf_path) override {
         rt_ = &rt;
         // No install-time plane pinning: every chunk loads on demand.
-        // Precision per (token, rank) is set entirely by the policy
-        // tables (score_chunks / gate_thresholds). Only the q_bias
-        // chunks are uploaded at install (always needed by the kernel;
-        // ~3 % of total chunk bytes).
-
-        // Policy: "static" (default), "dynamic" (gate-threshold
-        // ladder), or "score" (per-expert max gate score → threshold
-        // ladder; the hook computes precision and calls
-        // plan_for_expert_with_precision directly).
-        policy_ = "static";
-        if (const char * pol = getenv("STREAMLLM_MOE_POLICY")) {
-            if (std::strcmp(pol, "dynamic") == 0 ||
-                std::strcmp(pol, "DYNAMIC") == 0) {
-                policy_ = "dynamic";
-            } else if (std::strcmp(pol, "score") == 0 ||
-                       std::strcmp(pol, "SCORE") == 0) {
-                policy_ = "score";
-            }
-        }
-        dynamic_policy_ = (policy_ == "dynamic");
-
-        gate_step_ = read_float_env("STREAMLLM_MOE_GATE_STEP", 0.1f);
-        if (gate_step_ <= 0.0f) gate_step_ = 0.1f;
+        // Precision per (token, rank) is decided at dispatch time
+        // by the score-threshold table:
+        //   precision = score_chunks_[k] where k = first index with
+        //               max_gate_score >= score_thresholds_[k]
+        // Below the smallest threshold the lookup falls back to
+        // score_chunks_.back(). This is the only policy — older
+        // BASE/HOT (static) and gate-step (dynamic) variants were
+        // removed in favor of a single threshold-driven knob the
+        // demo's UI dial drives via streamllm_set_score_table.
 
         auto parse_csv = [](const char * csv,
                              std::vector<float> & out) {
@@ -254,11 +240,6 @@ public:
             }
         };
 
-        // Optional CSV threshold table for "dynamic" policy:
-        // t_{MIN+1},t_{MIN+2},...,t_MAX. Empty = linear ladder.
-        if (const char * csv = getenv("STREAMLLM_MOE_GATE_THRESHOLDS")) {
-            parse_csv(csv, gate_thresholds_);
-        }
         // Score policy tables. Hook reads these to decide precision
         // per expert via lookup(max_g_for_expert).
         if (const char * csv = getenv("STREAMLLM_MOE_SCORE_THRESHOLDS")) {
@@ -274,6 +255,12 @@ public:
         // Default chunks list to "8,6,4,2" if user only set thresholds.
         if (!score_thresholds_.empty() && score_chunks_.empty()) {
             score_chunks_ = {8, 6, 4, 2};
+        }
+        // No threshold table set -> default to "always full precision"
+        // so the dispatch never bails on an empty table at first hit.
+        if (score_thresholds_.empty()) {
+            score_thresholds_ = {0.0f};
+            score_chunks_     = {kMaxChunksPerTensor};
         }
 
         size_t n_total = 0;
@@ -370,23 +357,11 @@ public:
             }
         }
         std::fprintf(stderr,
-            "streamllm-scheduler[moe]: %zu experts | policy=%s",
-            n_total, policy_.c_str());
-        if (policy_ == "dynamic") {
-            if (gate_thresholds_.empty()) {
-                std::fprintf(stderr, " | gate_step=%.3f", gate_step_);
-            } else {
-                std::fprintf(stderr, " | thresholds=[");
-                for (size_t i = 0; i < gate_thresholds_.size(); ++i) {
-                    std::fprintf(stderr, "%s%.3f",
-                        i == 0 ? "" : ",", gate_thresholds_[i]);
-                }
-                std::fprintf(stderr, "]");
-            }
-        } else if (policy_ == "score") {
+            "streamllm-scheduler[moe]: %zu experts", n_total);
+        {
             // No swap can race here — set_score_table is only callable
-            // post-install via the runtime hook. Still, take the lock
-            // to be uniformly safe.
+            // post-install via the runtime hook.  Still take the lock
+            // to be uniformly safe with the snapshot accessors.
             std::lock_guard<std::mutex> lk(score_table_mu_);
             std::fprintf(stderr, " | score_thresholds=[");
             for (size_t i = 0; i < score_thresholds_.size(); ++i) {
@@ -433,65 +408,6 @@ public:
         return &it->second;
     }
 
-    const Plan * plan_for_expert(const std::string & canonical_wid,
-                                  int expert_id,
-                                  float gate_score,
-                                  int /*rank*/,
-                                  StreamHandle /*compute_stream*/) {
-        const std::string synthetic =
-            canonical_wid + ":e" + std::to_string(expert_id);
-        if (any_prec_wids_.count(synthetic)) {
-            // Any-prec MoE — pick target precision (planes) from the
-            // gate score using the same ladder the dense path uses, then
-            // translate to a chunk count via base_precision.
-            auto it_pa = P_of_.find(synthetic);
-            const int Pa = it_pa == P_of_.end() ? 0 : it_pa->second;
-            const auto * dev = rt_->layout(synthetic);
-            const int base_p = dev ? (int)dev->base_precision : 1;
-            // Reuse anyprec_desired_from_gate to map gate→planes; the
-            // helper clamps to Pa so for any-prec it can over-budget when
-            // P_target_planes > Pa, which the chunk-count translation
-            // below re-clamps. Pass kMaxChunksPerTensor as the planes
-            // ceiling to avoid double-clamping at the chunk level.
-            int planes = anyprec_desired_from_gate(
-                kMaxChunksPerTensor, gate_score);
-            int n_chunks = planes - base_p + 1;
-            if (n_chunks < 1)  n_chunks = 1;
-            if (n_chunks > Pa) n_chunks = Pa;
-            return build_plan_for_anyprec(synthetic, n_chunks);
-        }
-        auto it_p = P_of_.find(synthetic);
-        if (it_p == P_of_.end()) return nullptr;
-        const int P = it_p->second;
-
-        // Gate-score → desired chunk count.
-        //
-        //   static  : every routed expert pulls all P planes.
-        //   dynamic : (a) linear ladder  precision = floor(gate/step)+1
-        //             (b) threshold table (if STREAMLLM_MOE_GATE_THRESHOLDS
-        //                 set):  precision = max{k : gate >= t_k}.
-        int desired;
-        if (dynamic_policy_) {
-            int n;
-            if (!gate_thresholds_.empty()) {
-                // Scan from highest threshold down; first hit yields k.
-                n = 0;
-                for (int i = (int)gate_thresholds_.size() - 1; i >= 0; --i) {
-                    if (gate_score >= gate_thresholds_[i]) {
-                        n = i + 1;
-                        break;
-                    }
-                }
-            } else {
-                n = (int)std::floor(gate_score / gate_step_) + 1;
-            }
-            desired = std::max(1, std::min(n, P));
-        } else {
-            desired = P;
-        }
-        return build_plan_for(synthetic, desired);
-    }
-
     // Direct-precision entry point used by the score policy: hook
     // already decided desired_precision for this (canonical, expert).
     const Plan * plan_for_expert_with_precision(
@@ -525,28 +441,6 @@ public:
     }
 
   private:
-    // Mirrors the dense gate-score → desired chunk-count map but applied
-    // to any-prec wids.  Same env semantics as the shortcut path
-    // (gate_thresholds_ table, otherwise linear ladder via gate_step_),
-    // so STREAMLLM_MOE_GATE_THRESHOLDS / STREAMLLM_MOE_SCORE_THRESHOLDS
-    // affect both layouts identically.
-    int anyprec_desired_from_gate(int Pa, float gate_score) const {
-        if (Pa <= 0) return 0;
-        if (!dynamic_policy_) return Pa;
-        int n;
-        if (!gate_thresholds_.empty()) {
-            n = 0;
-            for (int i = (int)gate_thresholds_.size() - 1; i >= 0; --i) {
-                if (gate_score >= gate_thresholds_[i]) { n = i + 1; break; }
-            }
-        } else {
-            n = (int)std::floor(gate_score / gate_step_) + 1;
-        }
-        if (n < 1)  n = 1;
-        if (n > Pa) n = Pa;
-        return n;
-    }
-
     // Streaming any-prec plan builder.  Emits chunks [0..desired);
     // chunk 0 holds the base_p jointly-fit planes (so desired=1 means
     // base precision), each subsequent chunk adds one extension plane
@@ -942,12 +836,9 @@ public:
 
     GraphInstrumenter & instrumenter() { return instr_; }
 
-    // Accessors the dispatch reads to look up the score-policy tables.
-    // Hook computes per-expert precision = lookup(max_g_for_expert) and
+    // Score-table snapshot accessors.  The dispatch reads these to
+    // compute per-expert precision = lookup(max_g_for_expert) and
     // sets every (t, u) routed to that expert to the same value.
-    bool is_score_policy() const {
-        return policy_ == "score";
-    }
     std::vector<float> score_thresholds_snapshot() const {
         std::lock_guard<std::mutex> lk(score_table_mu_);
         return score_thresholds_;
@@ -977,10 +868,6 @@ public:
         std::lock_guard<std::mutex> lk(score_table_mu_);
         score_thresholds_ = th;
         score_chunks_     = ch;
-        // Promote the policy in case the user booted in static mode and
-        // is now driving a score table over the wire — the dispatch
-        // gates on policy_=="score".
-        policy_ = "score";
         return true;
     }
 
@@ -1004,16 +891,6 @@ private:
     }
 
     StreamllmRuntime * rt_ = nullptr;
-
-    // Static (uniform) vs dynamic (gate-threshold ladder) precision
-    // policy. Selected at install via STREAMLLM_MOE_POLICY.
-    bool  dynamic_policy_ = false;
-    float gate_step_      = 0.1f;
-    std::vector<float> gate_thresholds_;
-
-    // Policy mode: "static" | "dynamic" | "score".
-    // dynamic_policy_ caches policy_ == "dynamic" for the hot path.
-    std::string policy_ = "static";
 
     // Score policy tables. score_thresholds_ is descending; for a given
     // gate score g, precision = score_chunks_[k] where k is the first
@@ -1161,18 +1038,6 @@ const Plan * scheduler_plan_dense(
     return as_moe(sched).plan_for(wid, compute_stream);
 }
 
-const Plan * scheduler_plan_for_expert(
-    Scheduler &         sched,
-    const std::string & canonical_wid,
-    int                 expert_id,
-    float               gate_score,
-    int                 rank,
-    StreamHandle        compute_stream)
-{
-    return as_moe(sched).plan_for_expert(
-        canonical_wid, expert_id, gate_score, rank, compute_stream);
-}
-
 const Plan * scheduler_plan_for_expert_with_precision(
     Scheduler &         sched,
     const std::string & canonical_wid,
@@ -1266,10 +1131,6 @@ bool scheduler_claims_tensor(
     const struct ggml_tensor * w)
 {
     return as_moe(sched).claims_tensor(w);
-}
-
-bool scheduler_is_score_policy(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).is_score_policy();
 }
 
 std::vector<float> scheduler_score_thresholds_snapshot(const Scheduler & sched) {

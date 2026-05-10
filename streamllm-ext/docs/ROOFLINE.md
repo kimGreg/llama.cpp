@@ -182,7 +182,7 @@ their wall time blocked, not running CPU.
 ```
 
 **futex aggregate = 57 s** dominates pread (25 s). With 8 workers
-plus the demand-path hook contending on `prefetch_mu_` + the
+plus the demand-path hook contending on `io_mu_` + the
 condition variables, the synchronization cost is **2.3 × the SSD
 read cost**. This is invisible to chrono-based instrumentation
 because workers wait on futex (not CPU-busy) — the chrono span
@@ -201,7 +201,7 @@ time on the locked thread.
 
 8.9 K context-switches/sec means the kernel is preempting workers
 ~once every 113 µs on average. Combined with the futex traffic, this
-is consistent with workers all racing for the same prefetch_mu_,
+is consistent with workers all racing for the same io_mu_,
 acquiring it for ~50 µs of work, getting preempted, releasing.
 
 ## 6.5 Ablation at full workload (458 prompt + 128 decode)

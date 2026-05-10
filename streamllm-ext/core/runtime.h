@@ -270,52 +270,56 @@ private:
     // wraparound-induced contention is rare under typical hook traffic.
     std::atomic<uint32_t>          host_ring_next_{0};
 
-    // Async pread worker pool. The MoE prefetch path can fan out
-    // hundreds of pread+H2D calls per hook invocation; serialising
-    // them on the hook thread caps wall-clock at QD1 NVMe latency
-    // (~200 us/call). Workers consume from a bounded queue and call
-    // move_chunk in parallel; the hook fans out then joins via
-    // wait_prefetch_idle() before returning.
-    struct PrefetchRequest {
+    // Async chunk-load worker pool. The MoE dispatch path can fan
+    // out hundreds of pread+H2D calls per hook invocation;
+    // serialising them on the hook thread caps wall-clock at QD1
+    // NVMe latency (~200 us/call). Workers consume from a bounded
+    // queue and call move_chunk in parallel; the hook fans out then
+    // joins via wait_async_load_idle() before returning.
+    //
+    // (Despite occasional "prefetch" naming in older code, this is
+    // demand-loading — chunks load when needed, not ahead of need.
+    // Real graph-prewalk-driven prefetch is a separate future task.)
+    struct AsyncLoadRequest {
         std::string  wid;
         int          cid;
         // Optional per-batch counter for fine-grained (per-expert)
         // host-side waits. nullptr means the request is only counted
-        // by the global ``prefetch_in_flight_`` counter that
-        // ``wait_prefetch_idle`` polls.
+        // by the global ``io_in_flight_`` counter that
+        // ``wait_async_load_idle`` polls.
         std::shared_ptr<std::atomic<uint32_t>> batch_remaining;
     };
-    std::vector<std::thread>           prefetch_workers_;
-    std::mutex                         prefetch_mu_;
-    std::condition_variable            prefetch_cv_work_;
-    std::condition_variable            prefetch_cv_done_;
-    std::deque<PrefetchRequest>        prefetch_queue_;
-    std::atomic<uint32_t>              prefetch_in_flight_{0};
-    std::atomic<bool>                  prefetch_stop_{false};
+    std::vector<std::thread>           io_workers_;
+    std::mutex                         io_mu_;
+    std::condition_variable            io_cv_work_;
+    std::condition_variable            io_cv_done_;
+    std::deque<AsyncLoadRequest>       io_queue_;
+    std::atomic<uint32_t>              io_in_flight_{0};
+    std::atomic<bool>                  io_stop_{false};
 
-    void prefetch_worker_loop_();
+    void io_worker_loop_();
 
 public:
-    // Submit a chunk for async prefetch. Fire-and-forget within a hook
-    // call; pair with wait_prefetch_idle() (or wait_prefetch_batch on
-    // the per-expert handle) before reading the chunk's slot. Returns
-    // false if no worker pool is active.
-    bool submit_prefetch(const std::string & wid, int cid);
+    // Submit a chunk for async load. Fire-and-forget within a hook
+    // call; pair with wait_async_load_idle() (or wait_async_load_batch
+    // on the per-expert handle) before reading the chunk's slot.
+    // Returns false if no worker pool is active.
+    bool submit_async_load(const std::string & wid, int cid);
     // Variant that increments a caller-owned counter; the worker
     // decrements it after move_chunk returns. Pair with
-    // wait_prefetch_batch to wait on just this batch (= one expert's
-    // chunks) instead of the whole hook fire.
-    bool submit_prefetch(const std::string & wid, int cid,
-                         std::shared_ptr<std::atomic<uint32_t>> batch_remaining);
-    // Block until every submitted prefetch has finished.
-    void wait_prefetch_idle();
-    // Block until ``remaining`` reaches zero — the caller increments it
-    // once per submit_prefetch and the worker decrements after each
-    // move_chunk completes.
-    void wait_prefetch_batch(
+    // wait_async_load_batch to wait on just this batch (= one
+    // expert's chunks) instead of the whole hook fire.
+    bool submit_async_load(const std::string & wid, int cid,
+                           std::shared_ptr<std::atomic<uint32_t>> batch_remaining);
+    // Block until every submitted async-load has finished.
+    void wait_async_load_idle();
+    // Block until ``remaining`` reaches zero — the caller increments
+    // it once per submit_async_load and the worker decrements after
+    // each move_chunk completes.
+    void wait_async_load_batch(
         const std::shared_ptr<std::atomic<uint32_t>> & remaining);
-    // Number of async-prefetch worker threads (0 = disabled).
-    int  prefetch_worker_count() const { return (int)prefetch_workers_.size(); }
+    // Number of async-load worker threads (0 = disabled).
+    int  io_worker_count() const { return (int)io_workers_.size(); }
 
 private:
     bool installed_ = false;

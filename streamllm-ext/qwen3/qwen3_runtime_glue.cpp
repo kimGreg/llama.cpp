@@ -203,7 +203,6 @@ bool streamllm_get_score_table(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    if (!qwen3::scheduler_is_score_policy(rt->scheduler())) return false;
     out_thresholds = qwen3::scheduler_score_thresholds_snapshot(rt->scheduler());
     out_chunks     = qwen3::scheduler_score_chunks_snapshot   (rt->scheduler());
     return true;
