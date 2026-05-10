@@ -912,11 +912,13 @@ bool handle_mul_mat_id_impl(
                 }
                 if (k < 0) {
                     // Below every threshold — happens when the gate
-                    // tensor we read is raw logits (negative) instead
-                    // of post-softmax probs.  Fall back to MAX planes
-                    // (preserves quality at the cost of doing more
-                    // work; matches the old chunks.back() default
-                    // when the user's table didn't cover negatives).
+                    // tensor we're reading is raw logits (negative)
+                    // instead of post-softmax probs (Qwen3 case).
+                    // Fall back to MAX planes for quality; the dial
+                    // doesn't differentiate in this regime, but the
+                    // alternative (returning base_p) drops every
+                    // expert to 2-plane precision and the model
+                    // hallucinates / output goes garbled.
                     if (!sc_thresh.empty()) {
                         int planes = base_p + (int)sc_thresh.size() - 1;
                         if (planes > sc_max) planes = sc_max;
