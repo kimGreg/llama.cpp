@@ -88,6 +88,19 @@ GGML_BACKEND_API void ggml_cuda_set_mul_mat_id_hook(void * hook_fn);
 // Set to null to unregister.
 GGML_BACKEND_API void ggml_cuda_set_topk_moe_hook(void * hook_fn);
 
+// streamllm-ext integration: graph-walk pre/post hooks. Fire at the
+// top and bottom of ggml_backend_cuda_graph_compute, giving the
+// streamllm scheduler a chance to walk the cgraph (prefetch managed
+// chunks ahead of time, mark per-graph state, etc.). Callback
+// signatures:
+//   void begin(cudaStream_t, const struct ggml_cgraph *);
+//   void end  (cudaStream_t, const struct ggml_cgraph *);
+// Either may be null. The cgraph pointer is read-only — modifying
+// nodes from inside these hooks is unsupported (the cgraph is the
+// scheduler's snapshot of work-to-do).
+GGML_BACKEND_API void ggml_cuda_set_graph_compute_begin_hook(void * hook_fn);
+GGML_BACKEND_API void ggml_cuda_set_graph_compute_end_hook  (void * hook_fn);
+
 #ifdef  __cplusplus
 }
 #endif

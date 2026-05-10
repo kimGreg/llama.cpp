@@ -29,6 +29,7 @@
 #include <vector>
 
 struct ggml_tensor;
+struct ggml_cgraph;
 
 namespace streamllm_ext {
 
@@ -114,5 +115,19 @@ extern "C" void streamllm_topk_moe_observed(
     const struct ggml_tensor * logits,
     struct ggml_tensor * weights,
     struct ggml_tensor * ids);
+
+// Graph-walk pre/post hooks. Registered with
+// ``ggml_cuda_set_graph_compute_{begin,end}_hook``; fire at the top
+// and bottom of ggml_backend_cuda_graph_compute. Forward to the
+// active scheduler's on_graph_compute_begin / on_graph_compute_end
+// virtuals so concrete schedulers can prewalk the cgraph (managed-
+// tensor identification, prefetch, marker scan) before any node-
+// level dispatch starts.
+extern "C" void streamllm_graph_compute_begin(
+    cudaStream_t                stream,
+    const struct ggml_cgraph *  cgraph);
+extern "C" void streamllm_graph_compute_end(
+    cudaStream_t                stream,
+    const struct ggml_cgraph *  cgraph);
 
 } // namespace streamllm_ext

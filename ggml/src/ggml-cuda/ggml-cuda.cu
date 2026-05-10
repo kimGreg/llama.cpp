@@ -2473,6 +2473,22 @@ extern "C" void ggml_cuda_set_topk_moe_hook(void * hook_fn) {
     g_cuda_topk_moe_hook = (ggml_cuda_topk_moe_hook_t) hook_fn;
 }
 
+// streamllm-ext: graph-compute pre/post hooks. Fire at the top and
+// bottom of ggml_backend_cuda_graph_compute. See header.
+typedef void (*ggml_cuda_graph_compute_hook_t)(
+    cudaStream_t                stream,
+    const struct ggml_cgraph *  cgraph);
+
+static ggml_cuda_graph_compute_hook_t g_cuda_graph_compute_begin_hook = nullptr;
+static ggml_cuda_graph_compute_hook_t g_cuda_graph_compute_end_hook   = nullptr;
+
+extern "C" void ggml_cuda_set_graph_compute_begin_hook(void * hook_fn) {
+    g_cuda_graph_compute_begin_hook = (ggml_cuda_graph_compute_hook_t) hook_fn;
+}
+extern "C" void ggml_cuda_set_graph_compute_end_hook(void * hook_fn) {
+    g_cuda_graph_compute_end_hook = (ggml_cuda_graph_compute_hook_t) hook_fn;
+}
+
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // streamllm-ext override path. Runs first so the extension can claim
@@ -4336,6 +4352,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // streamllm-ext: graph-compute begin hook. Fires before any
+    // node-level dispatch so the scheduler can prewalk the cgraph
+    // (managed-tensor identification, prefetch, marker scan).
+    if (g_cuda_graph_compute_begin_hook != nullptr) {
+        g_cuda_graph_compute_begin_hook(cuda_ctx->stream(), cgraph);
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4386,6 +4409,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    // streamllm-ext: graph-compute end hook. Symmetric with the begin
+    // hook above; the scheduler can release per-graph resources here.
+    if (g_cuda_graph_compute_end_hook != nullptr) {
+        g_cuda_graph_compute_end_hook(cuda_ctx->stream(), cgraph);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

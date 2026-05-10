@@ -117,6 +117,10 @@ bool install_for_gguf(const char * gguf_path) {
     ggml_cuda_set_fusion_skip_hook((void *) &streamllm_claims_tensor);
     ggml_cuda_set_mul_mat_id_hook((void *) &streamllm_try_cuda_mul_mat_id);
     ggml_cuda_set_topk_moe_hook((void *) &streamllm_topk_moe_observed);
+    ggml_cuda_set_graph_compute_begin_hook(
+        (void *) &streamllm_graph_compute_begin);
+    ggml_cuda_set_graph_compute_end_hook(
+        (void *) &streamllm_graph_compute_end);
     return true;
 }
 
@@ -222,6 +226,8 @@ void clear() {
 
     ggml_cuda_set_mul_mat_hook(nullptr);
     ggml_cuda_set_fusion_skip_hook(nullptr);
+    ggml_cuda_set_graph_compute_begin_hook(nullptr);
+    ggml_cuda_set_graph_compute_end_hook(nullptr);
     ggml_cuda_set_mul_mat_id_hook(nullptr);
     ggml_cuda_set_topk_moe_hook(nullptr);
     moe_dispatch::clear_topk_weights();
@@ -285,6 +291,37 @@ extern "C" bool streamllm_try_cuda_mul_mat_id(
     if (rt == nullptr) return false;
     return rt->scheduler().handle_mul_mat_id(
         (StreamHandle) stream, src0, src1, ids, dst);
+}
+
+// Graph-compute pre/post hooks. Fire at the top and bottom of
+// ggml_backend_cuda_graph_compute (see ggml/include/ggml-cuda.h).
+// Forward to the active scheduler so it can prewalk the cgraph
+// (managed-tensor identification, prefetch, marker scan) before any
+// node-level dispatch starts.
+extern "C" void streamllm_graph_compute_begin(
+    cudaStream_t                stream,
+    const struct ggml_cgraph *  cgraph)
+{
+    StreamllmRuntime * rt = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_runtime_mu);
+        rt = g_runtime.get();
+    }
+    if (rt == nullptr) return;
+    rt->scheduler().on_graph_compute_begin((StreamHandle) stream, cgraph);
+}
+
+extern "C" void streamllm_graph_compute_end(
+    cudaStream_t                stream,
+    const struct ggml_cgraph *  cgraph)
+{
+    StreamllmRuntime * rt = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_runtime_mu);
+        rt = g_runtime.get();
+    }
+    if (rt == nullptr) return;
+    rt->scheduler().on_graph_compute_end((StreamHandle) stream, cgraph);
 }
 
 } // namespace streamllm_ext

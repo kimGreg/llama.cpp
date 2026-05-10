@@ -842,6 +842,49 @@ public:
             (cudaStream_t)stream, logits, weights, ids);
     }
 
+    // ── Graph-compute prewalk ────────────────────────────────────
+    // Fired by the ggml-cuda graph_compute_begin hook (added in
+    // step 4 of the architecture migration). Gives the scheduler a
+    // chance to peek at the cgraph before any node-level dispatch
+    // starts. Currently used as a diagnostic seam — set
+    // STREAMLLM_DEBUG_GRAPH_WALK=1 to log the per-graph managed-op
+    // count. Future work (step-4 instrumenter) will use this to
+    // queue prefetch ahead of compute, decoupling H2D from per-op
+    // hook firing.
+    void on_graph_compute_begin(StreamHandle /*compute_stream*/,
+                                 const struct ggml_cgraph * cgraph) override {
+        if (rt_ == nullptr || cgraph == nullptr) return;
+        const char * dbg = getenv("STREAMLLM_DEBUG_GRAPH_WALK");
+        if (dbg == nullptr || dbg[0] == '0' || dbg[0] == '\0') return;
+
+        const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+        int n_mul_mat = 0, n_mul_mat_id = 0;
+        int n_managed_mm = 0, n_managed_mmid = 0;
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(
+                const_cast<ggml_cgraph *>(cgraph), i);
+            if (node == nullptr) continue;
+            if (node->op == GGML_OP_MUL_MAT) {
+                ++n_mul_mat;
+                const ggml_tensor * w = node->src[0];
+                if (w && w->name[0] && rt_->is_managed_name(w->name)) {
+                    ++n_managed_mm;
+                }
+            } else if (node->op == GGML_OP_MUL_MAT_ID) {
+                ++n_mul_mat_id;
+                const ggml_tensor * w = node->src[0];
+                if (w && w->name[0] && rt_->is_managed_name(w->name)) {
+                    ++n_managed_mmid;
+                }
+            }
+        }
+        std::fprintf(stderr,
+            "streamllm-graph-walk: nodes=%d mul_mat=%d (managed=%d) "
+            "mul_mat_id=%d (managed=%d)\n",
+            n_nodes, n_mul_mat, n_managed_mm,
+            n_mul_mat_id, n_managed_mmid);
+    }
+
     // Accessors the dispatch reads to look up the score-policy tables.
     // Hook computes per-expert precision = lookup(max_g_for_expert) and
     // sets every (t, u) routed to that expert to the same value.

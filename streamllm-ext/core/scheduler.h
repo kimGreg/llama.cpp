@@ -44,6 +44,7 @@
 #include <vector>
 
 struct ggml_tensor;
+struct ggml_cgraph;
 
 namespace streamllm_ext {
 
@@ -127,15 +128,19 @@ public:
         const StreamReader &  reader,
         const std::string &   gguf_path) = 0;
 
-    // ggml is about to walk a cgraph.  Default no-op.  Step-4 graph
-    // instrumenter fires this from the GraphBegin marker; concrete
-    // schedulers can use it to prefetch hot tensors / reset per-graph
-    // state.
-    virtual void on_graph_compute_begin(StreamHandle /*compute_stream*/) {}
+    // ggml is about to walk a cgraph.  Default no-op.  Wired through
+    // a ggml-cuda hook (ggml_cuda_set_graph_compute_begin_hook) so
+    // concrete schedulers can prewalk the cgraph — identify managed
+    // mul_mat / mul_mat_id nodes, prefetch their chunks, mark per-
+    // graph state.  ``cgraph`` is read-only; structural mutation is
+    // unsupported here.
+    virtual void on_graph_compute_begin(StreamHandle /*compute_stream*/,
+                                         const struct ggml_cgraph * /*cgraph*/) {}
 
     // ggml finished walking a cgraph.  Default no-op.  Symmetric with
-    // on_graph_compute_begin.
-    virtual void on_graph_compute_end(StreamHandle /*compute_stream*/) {}
+    // on_graph_compute_begin; release per-graph resources here.
+    virtual void on_graph_compute_end(StreamHandle /*compute_stream*/,
+                                       const struct ggml_cgraph * /*cgraph*/) {}
 
     // ─── Hot path ─────────────────────────────────────────────────
 
