@@ -35,7 +35,7 @@ namespace streamllm_ext {
 
 class StreamllmRuntime;
 
-// Internal — owned by core/runtime_hook.cpp (install_for_gguf / clear).
+// Internal — owned by qwen3/qwen3_runtime_glue.cpp (install_for_gguf / clear).
 // Read by qwen3/qwen3_moe_dispatch.cpp under g_runtime_mu so the active
 // runtime is reachable from the scheduler-side dispatch bodies. Not part
 // of the extension's public API.

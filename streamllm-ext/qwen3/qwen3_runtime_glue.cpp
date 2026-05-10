@@ -7,7 +7,7 @@
 
 #include "qwen3_runtime_glue.h"
 #include "runtime.h"
-#include "runtime_hook_diag.h"
+#include "runtime_diag.h"
 #include "stream_reader.h"
 #include "anybcq_gemm.h"
 
@@ -165,7 +165,7 @@ unsigned long long streamllm_stat_pool_h2d_calls(void) {
 }
 
 // DIAG-off weak fallbacks: the real implementations live in
-// runtime_hook_diag.cpp and only get linked when STREAMLLM_DIAG=ON.
+// core/runtime_diag.cpp and only get linked when STREAMLLM_DIAG=ON.
 // When the diag TU isn't in the build, these zeros become the answer.
 __attribute__((weak)) unsigned long long streamllm_stat_tier_attempts(void)   { return 0ull; }
 __attribute__((weak)) unsigned long long streamllm_stat_tier_vram_hits(void)  { return 0ull; }

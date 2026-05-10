@@ -4,7 +4,7 @@
 #include "upstream_layout.h"
 #include "anybcq_format.h"
 // Per-plane pointer-table updates the any-prec after-load callback
-// drives. Lives in decoder/anybcq/core/.
+// drives. Lives in decoder/anybcq/kernels/.
 #include "anybcq_gemv.h"
 // Concrete ChunkedTensor wrappers (any-prec + shortcut share the
 // AnyBCQFamilyTensor base; the typed subclasses are the public face).

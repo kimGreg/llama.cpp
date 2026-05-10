@@ -45,10 +45,10 @@ if (GGML_CUDA)
     enable_language(CUDA)
     list(APPEND STREAMLLM_EXT_SOURCES
         core/vram_pool.cu
-        decoder/anybcq/core/chunked_matmul_gemv.cu
-        decoder/anybcq/core/chunked_matmul_gemm.cu
+        decoder/anybcq/kernels/chunked_matmul_gemv.cu
+        decoder/anybcq/kernels/chunked_matmul_gemm.cu
         decoder/shortcut_anybcq/chunked_matmul.cu
-        qwen3/moe_fused.cu
+        qwen3/qwen3_moe_fused.cu
     )
 endif()
 
@@ -58,7 +58,7 @@ target_include_directories(streamllm_ext PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq
-    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq/kernels
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/shortcut_anybcq
     ${CMAKE_CURRENT_SOURCE_DIR}/qwen3
 )
@@ -67,7 +67,7 @@ target_include_directories(streamllm_ext PUBLIC
 # needed by M2–M3; M4 pulls it in for model loading + backend scheduling.
 target_link_libraries(streamllm_ext PUBLIC ggml)
 
-# M4b-integration: runtime_hook.cpp (plain C++) needs <cuda_runtime.h>
+# M4b-integration: qwen3_runtime_glue.cpp (plain C++) needs <cuda_runtime.h>
 # and links against cudart for cudaDeviceSynchronize; also calls the
 # ggml-cuda set-hook symbol, so link ggml-cuda too.
 if (GGML_CUDA)
@@ -105,7 +105,7 @@ endif()
 option(STREAMLLM_DIAG "Compile with cache-stack diagnostic counters" OFF)
 if (STREAMLLM_DIAG)
     target_compile_definitions(streamllm_ext PUBLIC STREAMLLM_DIAG)
-    target_sources(streamllm_ext PRIVATE core/runtime_hook_diag.cpp)
+    target_sources(streamllm_ext PRIVATE core/runtime_diag.cpp)
     message(STATUS "streamllm-ext: diagnostics ON")
 endif()
 

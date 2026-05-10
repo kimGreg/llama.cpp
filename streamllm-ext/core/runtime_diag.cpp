@@ -1,9 +1,9 @@
 // streamllm-ext — cache-stack diagnostics implementation.
 //
 // Compiled into the static lib only when -DSTREAMLLM_DIAG=ON. The
-// header's stubs provide the OFF path. See runtime_hook_diag.h.
+// header's stubs provide the OFF path. See runtime_diag.h.
 
-#include "runtime_hook_diag.h"
+#include "runtime_diag.h"
 
 #include "runtime.h"
 #include "vram_pool.h"

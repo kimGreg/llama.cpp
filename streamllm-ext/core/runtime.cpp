@@ -2,7 +2,7 @@
 // VramChunkPool + Scheduler, exposing the two primitives.
 
 #include "runtime.h"
-#include "runtime_hook_diag.h"
+#include "runtime_diag.h"
 #include "streamllm_nvtx.h"
 
 // Encoder-agnostic UpstreamLayoutHost struct + dispatcher entry point.
@@ -40,7 +40,7 @@ static_assert(kMaxChunksPerTensor == kNaverMaxPrecision,
 #include <unistd.h>
 
 namespace streamllm_ext {
-// Provided by runtime_hook.cpp; called when STREAMLLM_PROFILE=1 is set
+// Provided by qwen3_runtime_glue.cpp; called when STREAMLLM_PROFILE=1 is set
 // to attribute SSD-stream H2D wall time between pread and pool->load.
 void profile_record_move_chunk_ssd(uint64_t pread_ns, uint64_t pool_load_ns);
 // Bumped each time pool.load returned null and we're about to ask the

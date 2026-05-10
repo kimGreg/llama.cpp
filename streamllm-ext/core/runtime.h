@@ -10,7 +10,7 @@
 //
 // Chunk computation (chunk_matmul) lives in the encoder layer, not
 // here — see ``decoder/shortcut_anybcq/chunked_matmul.h`` for the
-// per-tensor path and ``qwen3/moe_fused.h`` for the fused MoE GEMV.
+// per-tensor path and ``qwen3/qwen3_moe_fused.h`` for the fused MoE GEMV.
 // Core only exposes the layout + pool primitives the encoder layer
 // reads.
 

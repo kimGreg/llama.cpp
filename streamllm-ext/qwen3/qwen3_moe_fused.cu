@@ -3,7 +3,7 @@
 // Architecture-specific kernel-fusion. See moe_fused.h for the layer
 // placement rationale.
 
-#include "moe_fused.h"
+#include "qwen3_moe_fused.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -24,7 +24,7 @@ namespace {
 inline void check_cuda(cudaError_t e, const char * what) {
     if (e != cudaSuccess) {
         throw std::runtime_error(
-            std::string("qwen3/moe_fused: CUDA error in ") + what + ": " +
+            std::string("qwen3_moe_fused: CUDA error in ") + what + ": " +
             cudaGetErrorString(e));
     }
 }
@@ -198,13 +198,13 @@ void naver_gemv_moe_launch(
     if (prec_per_tu_d == nullptr) {
         if (uniform_precision < 1 || uniform_precision > 8) {
             throw std::runtime_error(
-                "qwen3/moe_fused: uniform_precision out of range [1, 8]: " +
+                "qwen3_moe_fused: uniform_precision out of range [1, 8]: " +
                 std::to_string(uniform_precision));
         }
     }
     if (K % K_TILE_SIZE != 0) {
         throw std::runtime_error(
-            "qwen3/moe_fused: K must be a multiple of K_TILE_SIZE=64");
+            "qwen3_moe_fused: K must be a multiple of K_TILE_SIZE=64");
     }
     if (n_tokens <= 0 || n_used <= 0) {
         return;
@@ -231,7 +231,7 @@ void naver_gemv_moe_launch(
     cudaError_t last = cudaGetLastError();
     if (last != cudaSuccess) {
         throw std::runtime_error(
-            std::string("qwen3/moe_fused: kernel launch failed: ") +
+            std::string("qwen3_moe_fused: kernel launch failed: ") +
             cudaGetErrorString(last));
     }
 }
@@ -248,7 +248,7 @@ void alloc_moe_expert_table(
 {
     if (n_experts <= 0) {
         throw std::runtime_error(
-            "qwen3/moe_fused::alloc_moe_expert_table: n_experts must be > 0");
+            "qwen3_moe_fused::alloc_moe_expert_table: n_experts must be > 0");
     }
     out.n_experts = n_experts;
 

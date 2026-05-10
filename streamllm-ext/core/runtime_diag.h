@@ -5,9 +5,9 @@
 // bearing for runtime correctness or hot-path TPS.
 //
 // Gated by the STREAMLLM_DIAG cmake option. When OFF (default), the
-// header below provides inline empty stubs and runtime_hook_diag.cpp
+// header below provides inline empty stubs and runtime_diag.cpp
 // is excluded from the build; callers compile down to no-ops.
-// When ON, runtime_hook_diag.cpp provides the real bodies, the
+// When ON, runtime_diag.cpp provides the real bodies, the
 // counter struct lives there, and the LOAD walk's classify/record
 // site forwards each chunk request to ``record_chunk``.
 

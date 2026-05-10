@@ -92,7 +92,7 @@ void scheduler_on_managed_node_visit(
     StreamHandle               compute_stream);
 
 // ─── ggml-cuda extern-C shim forwarders ────────────────────────────
-// The shims in core/runtime_hook.cpp dispatch to these to keep core
+// The shims in qwen3/qwen3_runtime_glue.cpp dispatch to these to keep core
 // from having to know about MoEScheduler's vtable. Each is a thin
 // downcast wrapper.
 bool scheduler_handle_mul_mat(
@@ -119,7 +119,7 @@ bool scheduler_claims_tensor(
     const struct ggml_tensor * w);
 
 // ─── Live precision dial accessors ─────────────────────────────────
-// Score-policy snapshot accessors used by core/runtime_hook.cpp's
+// Score-policy snapshot accessors used by qwen3/qwen3_runtime_glue.cpp's
 // streamllm_set_score_table / streamllm_get_score_table extern-C
 // entry points. Concrete impl on MoEScheduler.
 bool                scheduler_is_score_policy(const Scheduler & sched);

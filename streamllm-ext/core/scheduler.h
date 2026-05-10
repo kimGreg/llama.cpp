@@ -50,7 +50,7 @@ class StreamllmRuntime;
 
 // Decoder-neutral per-MoE-tensor expert pointer table.  The fused
 // kernel that consumes it is architecture-specific (see
-// ``qwen3/moe_fused.h``); the *struct* is encoder/architecture-
+// ``qwen3/qwen3_moe_fused.h``); the *struct* is encoder/architecture-
 // agnostic — three device-pointer arrays indexed by expert id —
 // so a forward decl here keeps core's contract free of architecture
 // types while letting model-side schedulers expose getters via the

@@ -9,7 +9,7 @@
 #include "scheduler.h"
 #include "runtime.h"
 #include "anybcq_gemv.h"
-#include "moe_fused.h"   // MoeExpertTable + qwen3::alloc/free_moe_expert_table
+#include "qwen3_moe_fused.h"   // MoeExpertTable + qwen3::alloc/free_moe_expert_table
 #include "qwen3_moe_residency.h"
 #include "qwen3_moe_dispatch.h"
 #include "qwen3_graph_instrumenter.h"

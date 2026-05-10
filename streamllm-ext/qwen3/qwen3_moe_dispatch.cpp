@@ -2,7 +2,7 @@
 //
 // Architecturally these belong with the scheduler: dispatch logic
 // (graph introspection, gate-score reading, per-(t, u) plan, chunk
-// fan-out, kernel launch) is model-specific. core/runtime_hook.cpp
+// fan-out, kernel launch) is model-specific. qwen3/qwen3_runtime_glue.cpp
 // keeps lifecycle (install_for_gguf / clear) and the extern-C shims
 // that ggml-cuda calls; those shims forward through
 // Scheduler::handle_*, which lands here.
@@ -11,13 +11,13 @@
 
 #include "qwen3_runtime_glue.h"   // g_runtime + g_runtime_mu (internal externs)
 #include "runtime.h"
-#include "runtime_hook_diag.h"
+#include "runtime_diag.h"
 #include "stream_reader.h"
 #include "scheduler.h"
 #include "qwen3_moe_scheduler.h"  // qwen3::scheduler_* typed accessors
 #include "anybcq_gemv.h"
 #include "anybcq_gemm.h"
-#include "moe_fused.h"        // MoeExpertTable + qwen3::naver_gemv_moe_launch
+#include "qwen3_moe_fused.h"        // MoeExpertTable + qwen3::naver_gemv_moe_launch
 #include "chunked_matmul.h"   // shortcut_anybcq::chunk_matmul_*for_wid
 #include "streamllm_nvtx.h"
 

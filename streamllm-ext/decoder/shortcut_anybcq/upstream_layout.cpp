@@ -3,7 +3,7 @@
 #include "upstream_layout.h"
 #include "anybcq_format.h"
 // Per-plane pointer-table updates the shortcut after-load callback
-// drives. Lives in decoder/anybcq/core/ (encoder-neutral kernel layer).
+// drives. Lives in decoder/anybcq/kernels/ (encoder-neutral kernel layer).
 #include "anybcq_gemv.h"
 
 #include <cstdint>

@@ -2,12 +2,12 @@
 //
 // Owned by the scheduler architecturally: MoEScheduler::handle_mul_mat,
 // handle_mul_mat_id and on_topk_moe_observed forward to the *_impl
-// functions declared here. core/runtime_hook.cpp's extern-C shims also
+// functions declared here. qwen3/qwen3_runtime_glue.cpp's extern-C shims also
 // reach the scheduler via Scheduler::handle_*; the scheduler then calls
 // these impls.
 //
 // Lifecycle helpers (size_scratch, free_scratch, print_profile,
-// clear_topk_weights) are called by core/runtime_hook.cpp at install
+// clear_topk_weights) are called by qwen3/qwen3_runtime_glue.cpp at install
 // and clear time.
 
 #pragma once
