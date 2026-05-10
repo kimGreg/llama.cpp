@@ -717,7 +717,12 @@ bool handle_mul_mat_id_impl(
                                     stream) == cudaSuccess) {
                     have_renorm_weights = true;
                 }
-                g_topk_weights.erase(it);
+                // Don't erase the entry — under cuda-graph decode the
+                // captured topk_moe op replays each token but the
+                // host-side on_topk_moe_observed hook only fires at
+                // CAPTURE time.  weights->data is a stable device
+                // buffer that gets rewritten by each kernel replay,
+                // so we re-read fresh values via the same map entry.
             }
         }
 
@@ -772,12 +777,14 @@ bool handle_mul_mat_id_impl(
             std::fprintf(stderr,
                 "streamllm-ext: gate scores %s — tensor='%s' "
                 "n_expert=%lld  token0_sum=%.4f min=%.4f max=%.4f "
-                "n_negative=%d/%d\n",
+                "n_negative=%d/%d  renorm_weights=%s\n",
                 have_real_scores ? "captured"
                                   : "FALLBACK (rank-based)",
                 pname,
                 (long long)n_expert_in_probs,
-                sum0, min0, max0, n_neg, n_view);
+                sum0, min0, max0, n_neg, n_view,
+                have_renorm_weights ? "captured (preferred)"
+                                    : "not captured");
         }
     }
 
