@@ -210,17 +210,16 @@ bool chunk_matmul_for_wid(
     StreamHandle compute_stream)
 {
     const UpstreamLayoutDevice * dev = rt.layout(wid);
-    const UpstreamLayoutHost   * host = rt.host_layout(wid);
-    if (dev == nullptr || host == nullptr) return false;
     anybcq::AnyBCQFamilyTensor * tens = rt.tensor_anybcq(wid);
-    if (tens == nullptr) return false;
+    if (dev == nullptr || tens == nullptr) return false;
 
     for (int cid : chunks) {
         rt.pool().wait_on_stream(wid, cid, compute_stream);
     }
 
     auto planes = cids_to_planes_or_throw(
-        *host, wid, chunks, "shortcut_anybcq::chunk_matmul_for_wid");
+        tens->host(), wid, chunks,
+        "shortcut_anybcq::chunk_matmul_for_wid");
 
     return chunk_matmul(
         *dev,
@@ -241,15 +240,15 @@ bool chunk_matmul_batched_for_wid(
     StreamHandle compute_stream)
 {
     const UpstreamLayoutDevice * dev = rt.layout(wid);
-    const UpstreamLayoutHost   * host = rt.host_layout(wid);
-    if (dev == nullptr || host == nullptr) return false;
+    anybcq::AnyBCQFamilyTensor * tens = rt.tensor_anybcq(wid);
+    if (dev == nullptr || tens == nullptr) return false;
 
     for (int cid : chunks) {
         rt.pool().wait_on_stream(wid, cid, compute_stream);
     }
 
     auto planes = cids_to_planes_or_throw(
-        *host, wid, chunks,
+        tens->host(), wid, chunks,
         "shortcut_anybcq::chunk_matmul_batched_for_wid");
 
     return chunk_matmul_batched(

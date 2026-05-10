@@ -149,8 +149,6 @@ public:
     void register_layout(const std::string & wid,
                          UpstreamLayoutHost host,
                          UpstreamLayoutDevice dev);
-    UpstreamLayoutDevice * mutable_layout(const std::string & wid);
-    const UpstreamLayoutHost * host_layout(const std::string & wid) const;
 
     // Per-tensor managed-tensor accessor.  Returns the abstract
     // ChunkedTensor base — encoder/architecture-agnostic.  Decoder-

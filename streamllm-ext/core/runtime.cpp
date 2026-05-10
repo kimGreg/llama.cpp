@@ -410,22 +410,10 @@ void StreamllmRuntime::register_chunk_io(
     it->second.chunk_file_sizes   = std::move(chunk_file_sizes);
 }
 
-UpstreamLayoutDevice * StreamllmRuntime::mutable_layout(const std::string & wid) {
-    auto it = entries_.find(wid);
-    if (it == entries_.end()) return nullptr;
-    return &it->second.dev;
-}
-
 const UpstreamLayoutDevice * StreamllmRuntime::layout(const std::string & wid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return nullptr;
     return &it->second.dev;
-}
-
-const UpstreamLayoutHost * StreamllmRuntime::host_layout(const std::string & wid) const {
-    auto it = entries_.find(wid);
-    if (it == entries_.end()) return nullptr;
-    return &it->second.tensor->host();
 }
 
 ChunkedTensor * StreamllmRuntime::tensor(const std::string & wid) const {

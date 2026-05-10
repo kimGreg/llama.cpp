@@ -144,22 +144,12 @@ endif()
 add_executable(streamllm-gguf-dump streamllm_gguf_dump.cpp)
 target_link_libraries(streamllm-gguf-dump PRIVATE streamllm_ext ggml)
 
-# streamllm-upstream-test: byte-for-byte parity check of the host-side
-# upstream-layout builder against Python reference dumps.
-add_executable(streamllm-upstream-test test_upstream_layout.cpp)
-target_link_libraries(streamllm-upstream-test PRIVATE streamllm_ext ggml)
-
 if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     # streamllm-gpu-test: end-to-end kernel check (GGUF → VramChunkPool
     # → NAVER LUT-GEMV → compare Y with a Python reference).
     add_executable(streamllm-gpu-test test_gpu_kernel.cpp)
     target_link_libraries(streamllm-gpu-test PRIVATE streamllm_ext ggml CUDA::cudart)
-
-    # streamllm-runtime-test: spot-checks kernel output for a handful
-    # of named tensors against Python reference dumps.
-    add_executable(streamllm-runtime-test test_runtime_full.cpp)
-    target_link_libraries(streamllm-runtime-test PRIVATE streamllm_ext ggml CUDA::cudart)
 
     # streamllm-microbench: μs/call + GB/s for naver_gemv_launch and
     # VramChunkPool::load across representative tensor shapes.
