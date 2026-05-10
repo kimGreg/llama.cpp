@@ -858,11 +858,17 @@ bool handle_mul_mat_id_impl(
         const int sub_n = std::min(minibatch, n_tokens - t_base);
 
         int sub_max_precision = 0;
-        std::vector<int> host_prec_per_tu(
-            (size_t)sub_n * n_used_per_tok, 0);
+        // Only populate host_prec_per_tu inside the LOAD walk below
+        // (gated by !_hook_in_capture).  When capture is active the
+        // LOAD walk is skipped — we leave host_prec_per_tu empty so
+        // prec_per_tu_d stays null and the kernel falls back to
+        // uniform_precision.  Filling it with zeros + uploading
+        // would make the kernel read 0 planes per (t, u) → garbage.
+        std::vector<int> host_prec_per_tu;
         std::shared_ptr<std::atomic<uint32_t>> batch;
         if (!_hook_in_capture) {
             STLM_NVTX_RANGE("LOAD");
+            host_prec_per_tu.assign((size_t)sub_n * n_used_per_tok, 0);
 
             // Per-expert max gate score across the minibatch.  One
             // expert may serve many tokens with different scores; we
@@ -905,11 +911,18 @@ bool handle_mul_mat_id_impl(
                     if (g >= sc_thresh[i]) { k = i; break; }
                 }
                 if (k < 0) {
-                    // Below every threshold (shouldn't happen since
-                    // thresholds[0] is typically 0 — but degenerate
-                    // tables can leave gates below thresholds[0]).
-                    // Fall back to base precision: planes = base_p.
-                    return base_p;
+                    // Below every threshold — happens when the gate
+                    // tensor we read is raw logits (negative) instead
+                    // of post-softmax probs.  Fall back to MAX planes
+                    // (preserves quality at the cost of doing more
+                    // work; matches the old chunks.back() default
+                    // when the user's table didn't cover negatives).
+                    if (!sc_thresh.empty()) {
+                        int planes = base_p + (int)sc_thresh.size() - 1;
+                        if (planes > sc_max) planes = sc_max;
+                        return planes;
+                    }
+                    return sc_max;
                 }
                 int planes = base_p + k;
                 if (planes < 1)      planes = 1;
@@ -1069,11 +1082,22 @@ bool handle_mul_mat_id_impl(
 
         int uniform_precision = sub_max_precision;
         if (uniform_precision <= 0) {
-            // Score table didn't yield any positive precision (empty
-            // table or every expert routed below all thresholds with
-            // empty chunks list).  Default to full precision so the
-            // kernel doesn't run with prec=0.
-            uniform_precision = kMaxChunksPerTensor;
+            // LOAD walk skipped (cuda graph capture) or score table
+            // didn't yield any positive precision.  Default to the
+            // model's actual full precision (base_p + n_chunks − 1
+            // for any-prec; n_chunks for shortcut).  Falling back to
+            // kMaxChunksPerTensor (16) made the kernel read past the
+            // last loaded plane → out-of-bounds reads → garbage
+            // output during decode (cuda graph captures the dispatch).
+            if (any_layout && any_layout->any_precision) {
+                uniform_precision =
+                    (int)any_layout->base_precision +
+                    (int)any_layout->n_chunks - 1;
+            } else if (any_layout) {
+                uniform_precision = (int)any_layout->n_chunks;
+            } else {
+                uniform_precision = kMaxChunksPerTensor;
+            }
         }
         if (!_hook_in_capture) {
             const auto _ph_wait_t0 = std::chrono::steady_clock::now();
