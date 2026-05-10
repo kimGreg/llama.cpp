@@ -305,6 +305,13 @@ extern "C" void streamllm_graph_compute_begin(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return;
+    // Snapshot the score table once per replay so every managed
+    // dispatch in this token sees the same dial value (the host-fn
+    // reads ``rt->current_replay_score_table()`` from inside its
+    // plan()). Set/get on the scheduler is mutex-guarded so this
+    // grabs a consistent view at this instant.
+    rt->set_replay_score_table(
+        qwen3::scheduler_score_thresholds_snapshot(rt->scheduler()));
     rt->scheduler().on_graph_compute_begin((StreamHandle) stream, cgraph);
 }
 
@@ -319,6 +326,10 @@ extern "C" void streamllm_graph_compute_end(
     }
     if (rt == nullptr) return;
     rt->scheduler().on_graph_compute_end((StreamHandle) stream, cgraph);
+    // Drop replay-scoped chunk reservations now that the captured
+    // graph for this token has finished executing. The next replay's
+    // host-fn callbacks rebuild them from scratch.
+    rt->clear_replay_reservations();
 }
 
 } // namespace streamllm_ext

@@ -140,6 +140,17 @@ StreamllmRuntime::~StreamllmRuntime() {
         ::close(gguf_fd_);
         gguf_fd_ = -1;
     }
+    // Destroy per-comp ready_events. Allocated lazily by ensure_state().
+    {
+        std::lock_guard<std::mutex> lk(comp_state_mu_);
+        for (auto & kv : comp_state_) {
+            if (kv.second.ready_event) {
+                cudaEventDestroy(kv.second.ready_event);
+                kv.second.ready_event = nullptr;
+            }
+        }
+        comp_state_.clear();
+    }
 }
 
 void StreamllmRuntime::install(const StreamReader & reader,
@@ -857,19 +868,30 @@ void StreamllmRuntime::io_worker_loop_() {
         }
 
         try {
-            // Each worker handles one chunk per loop iteration.
-            // Concurrency comes from running multiple workers in parallel;
-            // in-flight SSD reads = n_workers.
-            (void)move_chunk(req.wid, req.cid,
-                              Tier::RAM, Tier::VRAM,
-                              /*compute_stream=*/nullptr);
+            if (req.is_evict) {
+                // Eviction must run on a worker thread because
+                // pool.evict drives the encoder's after_evict
+                // callback, which issues a CUDA kernel
+                // (clear_per_plane_after_evict) that the host-fn
+                // invoking us cannot call directly.
+                pool_->evict(req.wid, req.cid);
+                clear_chunk_device_ptr(req.wid, req.cid);
+            } else {
+                // Each worker handles one chunk per loop iteration.
+                // Concurrency comes from running multiple workers in
+                // parallel; in-flight SSD reads = n_workers.
+                (void)move_chunk(req.wid, req.cid,
+                                  Tier::RAM, Tier::VRAM,
+                                  /*compute_stream=*/nullptr);
+            }
         } catch (const std::exception & e) {
             static std::atomic<uint64_t> err_count{0};
             uint64_t v = err_count.fetch_add(1, std::memory_order_relaxed);
             if (v < 8 || (v % 100000 == 0)) {
                 std::fprintf(stderr,
-                    "streamllm-ext: prefetch worker move_chunk failed for "
+                    "streamllm-ext: %s worker failed for "
                     "(%s, %d): %s [err#%lu]\n",
+                    req.is_evict ? "evict" : "load",
                     req.wid.c_str(), req.cid, e.what(),
                     (unsigned long)(v + 1));
             }
@@ -880,11 +902,226 @@ void StreamllmRuntime::io_worker_loop_() {
         const bool last_batch = req.batch_remaining
             ? req.batch_remaining->fetch_sub(1, std::memory_order_acq_rel) == 1
             : false;
+        // If this request was the last in its batch AND a trailing
+        // event was attached, record it now on the pool's copy_stream.
+        // This is the synchronization the host-fn (which cannot call
+        // CUDA APIs) and the captured stream's wait-event use to
+        // hand off ownership of the just-loaded chunks.
+        if (last_batch && req.batch_ready_event != nullptr) {
+            cudaStream_t cs = (cudaStream_t) pool_->copy_stream();
+            // copy_stream is non-null whenever the pool was built
+            // with copy_stream=true (the cuda-graphs setup).  When
+            // copy_stream is null (synchronous-loads mode) we still
+            // record on the default stream so the host-side wait
+            // doesn't deadlock — the captured wait-event will
+            // simply have a no-op delay.
+            cudaEventRecord(req.batch_ready_event, cs);
+        }
         if (last_global || last_batch) {
             std::lock_guard<std::mutex> lk(io_mu_);
             io_cv_done_.notify_all();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Universal chunked-load + compute lifecycle
+// ---------------------------------------------------------------------------
+
+StreamllmRuntime::ChunkedCompState &
+StreamllmRuntime::ensure_state(ChunkedComputation & comp) {
+    const std::string key = comp.state_key();
+    std::lock_guard<std::mutex> lk(comp_state_mu_);
+    auto it = comp_state_.find(key);
+    if (it != comp_state_.end()) {
+        // Refresh back-pointers (harmless when stable).
+        it->second.runtime = this;
+        it->second.comp    = &comp;
+        return it->second;
+    }
+    ChunkedCompState st;
+    st.runtime = this;
+    st.comp    = &comp;
+    cudaEventCreateWithFlags(&st.ready_event, cudaEventDisableTiming);
+    auto [ins, _] = comp_state_.emplace(key, std::move(st));
+    return ins->second;
+}
+
+void StreamllmRuntime::run(
+    ChunkedComputation & comp,
+    const ComputationInput & in,
+    ComputationOutput & out,
+    StreamHandle stream)
+{
+    auto & st = ensure_state(comp);
+    st.cached_input = &in;
+
+    // [1] Captured D2H copies into the comp's pinned input buffers.
+    auto inputs = comp.pre_inputs(in);
+    for (const auto & m : inputs) {
+        if (m.bytes == 0) continue;
+        cudaError_t err;
+        if (m.is_2d) {
+            err = cudaMemcpy2DAsync(
+                m.host_dst,    m.dst_pitch,
+                m.device_src,  m.src_pitch,
+                m.bytes,       m.height,
+                cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+        } else {
+            err = cudaMemcpyAsync(
+                m.host_dst, m.device_src, m.bytes,
+                cudaMemcpyDeviceToHost, (cudaStream_t) stream);
+        }
+        if (err != cudaSuccess) {
+            std::fprintf(stderr,
+                "streamllm-ext: Runtime::run pre_input D2H failed for %s: %s\n",
+                comp.state_key().c_str(), cudaGetErrorString(err));
+        }
+    }
+
+    // [2] Captured host-fn — runs every replay (under capture) or
+    //     when the stream reaches it (eager). Plans loads, submits to
+    //     the IoWorkerPool with a trailing event-record on copy_stream.
+    cudaLaunchHostFunc((cudaStream_t) stream,
+                       &runtime_chunked_load_cb,
+                       &st);
+
+    // [3] Captured wait on the loader's ready event. Records a wait
+    //     node into the captured graph; on replay it waits for the
+    //     LATEST recording of ready_event on copy_stream — i.e. the
+    //     event the worker thread records inside step [2]'s host call.
+    cudaStreamWaitEvent((cudaStream_t) stream, st.ready_event, 0);
+
+    // [4] Captured kernel(s).
+    comp.execute(in, out, stream);
+}
+
+bool StreamllmRuntime::submit_load_batch_with_event(
+    const std::vector<ChunkKey> &                  evict_set,
+    const std::vector<ChunkKey> &                  load_set,
+    std::shared_ptr<std::atomic<uint32_t>>         batch,
+    cudaEvent_t                                    ready_event)
+{
+    if (io_workers_.empty()) {
+        // No async pool — record the event immediately so the captured
+        // wait-event doesn't deadlock. The pool may have been built
+        // without a copy_stream in tests; degrade gracefully.
+        if (ready_event && pool_->copy_stream()) {
+            cudaEventRecord(ready_event, (cudaStream_t) pool_->copy_stream());
+        }
+        return false;
+    }
+    if (!batch) return false;
+
+    const size_t total = evict_set.size() + load_set.size();
+    if (total == 0) {
+        // Empty batch: still need to record the event so the captured
+        // stream doesn't wait forever.
+        if (ready_event && pool_->copy_stream()) {
+            cudaEventRecord(ready_event, (cudaStream_t) pool_->copy_stream());
+        }
+        return true;
+    }
+
+    // Bump batch counter once per request before enqueue, so the
+    // worker can decrement-to-zero without races.
+    batch->fetch_add(static_cast<uint32_t>(total), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(io_mu_);
+        // Evictions first (best-effort): the captured kernel will read
+        // planes that the load_set re-installs, so we want to free
+        // slots before the new chunks land. Worker order across the
+        // queue is unspecified, so this is a hint only.
+        for (const auto & k : evict_set) {
+            AsyncLoadRequest req;
+            req.wid                = k.wid;
+            req.cid                = k.cid;
+            req.batch_remaining    = batch;
+            req.is_evict           = true;
+            req.batch_ready_event  = ready_event;
+            io_queue_.push_back(std::move(req));
+            io_in_flight_.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (const auto & k : load_set) {
+            AsyncLoadRequest req;
+            req.wid                = k.wid;
+            req.cid                = k.cid;
+            req.batch_remaining    = batch;
+            req.is_evict           = false;
+            req.batch_ready_event  = ready_event;
+            io_queue_.push_back(std::move(req));
+            io_in_flight_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    io_cv_work_.notify_all();
+    return true;
+}
+
+void StreamllmRuntime::add_replay_reservations(const std::vector<ChunkKey> & v) {
+    if (v.empty()) return;
+    std::lock_guard<std::mutex> lk(replay_reservations_mu_);
+    replay_reservations_.reserve(replay_reservations_.size() + v.size());
+    for (const auto & k : v) {
+        replay_reservations_.emplace(k.wid + "#" + std::to_string(k.cid));
+    }
+}
+
+bool StreamllmRuntime::is_replay_reserved(const std::string & wid, int cid) const {
+    std::lock_guard<std::mutex> lk(replay_reservations_mu_);
+    return replay_reservations_.count(wid + "#" + std::to_string(cid)) != 0;
+}
+
+void StreamllmRuntime::clear_replay_reservations() {
+    std::lock_guard<std::mutex> lk(replay_reservations_mu_);
+    replay_reservations_.clear();
+}
+
+void StreamllmRuntime::set_replay_score_table(std::vector<float> snap) {
+    std::lock_guard<std::mutex> lk(replay_score_table_mu_);
+    replay_score_table_ = std::move(snap);
+}
+
+const std::vector<float> & StreamllmRuntime::current_replay_score_table() const {
+    // Returning a reference under a mutex is unusual; the contract is
+    // "read once per dispatch from inside the host-fn", and all writes
+    // happen from graph_compute_begin which is sequenced before any
+    // host-fn fires this replay. The mutex is belt-and-braces.
+    return replay_score_table_;
+}
+
+// ---------------------------------------------------------------------------
+// runtime_chunked_load_cb — host function fired by Runtime::run via
+// cudaLaunchHostFunc. NO CUDA API CALLS allowed in this body (per the
+// CUDA Programming Guide).
+// ---------------------------------------------------------------------------
+
+void runtime_chunked_load_cb(void * userdata) noexcept {
+    auto * st = static_cast<StreamllmRuntime::ChunkedCompState *>(userdata);
+    if (!st || !st->comp || !st->runtime || !st->cached_input) return;
+
+    // 1. The captured pre_inputs D2H copies already populated the
+    //    comp's pinned input buffers by the time this fires. plan()
+    //    reads them and fills the comp's pinned output buffers.
+    ChunkPlan p = st->comp->plan(*st->cached_input);
+
+    // 2. Fresh batch counter per dispatch; reuse the slot in state.
+    if (!st->batch) st->batch = std::make_shared<std::atomic<uint32_t>>(0);
+    else            st->batch->store(0, std::memory_order_relaxed);
+
+    // 3. Submit loads + evictions. The worker that decrements the
+    //    batch counter to zero records ``st->ready_event`` on the
+    //    pool's copy_stream — that's the synchronization the captured
+    //    cudaStreamWaitEvent (next op) sees.
+    st->runtime->submit_load_batch_with_event(
+        p.evict_set, p.load_set, st->batch, st->ready_event);
+
+    // 4. Block until the worker has recorded the event. Pure host
+    //    (atomic + condvar); no CUDA calls.
+    st->runtime->wait_async_load_batch(st->batch);
+
+    // 5. Reserve this dispatch's load_set against later layers'
+    //    evictions within the same replay.
+    st->runtime->add_replay_reservations(p.load_set);
 }
 
 } // namespace streamllm_ext
