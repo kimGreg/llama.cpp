@@ -13,6 +13,7 @@
 #include "qwen3_moe_residency.h"
 #include "qwen3_moe_dispatch.h"
 #include "qwen3_graph_instrumenter.h"
+#include "tensor.h"   // anybcq::AnyBCQFamilyTensor (per-tensor pointer-table accessors)
 
 namespace streamllm_ext { using qwen3::GraphInstrumenter; }
 
@@ -745,13 +746,16 @@ public:
             std::string synth = canonical_wid + ":e" + std::to_string(e);
             const auto * dev = rt_->layout(synth);
             if (dev == nullptr) break;  // first missing expert — done
-            void ** d_qw    = rt_->anybcq_d_qw_ptrs(synth);
-            void ** d_alpha = rt_->anybcq_d_alpha_ptrs(synth);
-            void ** d_qbias = rt_->anybcq_d_qbias_slot(synth);
-            const auto * host = rt_->host_layout(synth);
+            anybcq::AnyBCQFamilyTensor * tens = rt_->tensor_anybcq(synth);
+            if (tens == nullptr) break;
+            void ** d_qw    = tens->d_qw_ptrs();
+            void ** d_alpha = tens->d_alpha_ptrs();
+            void ** d_qbias = tens->d_qbias_slot();
+            const UpstreamLayoutHost & host = tens->host();
             if (d_qw == nullptr || d_alpha == nullptr) {
                 std::fprintf(stderr,
-                    "streamllm-scheduler[moe]: anybcq_d_*_ptrs missing for %s\n",
+                    "streamllm-scheduler[moe]: per-plane device pointer "
+                    "tables missing for %s\n",
                     synth.c_str());
                 return nullptr;
             }
@@ -763,7 +767,7 @@ public:
             // Capture each expert's d_qbias_slot so the dispatch path
             // can refresh ``d_q_bias_per_expert`` per kernel call.
             qbias_slot_addrs.push_back(d_qbias);
-            if (host != nullptr && host->any_precision) any_any_prec = true;
+            if (host.any_precision) any_any_prec = true;
         }
         if (qw.empty()) return nullptr;
 

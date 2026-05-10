@@ -28,7 +28,10 @@ namespace streamllm_ext { struct NaverKernelScratch; }
 // tensor's host layout + per-plane device pointer tables. Forward-
 // declared so the runtime header doesn't drag the decoder include in;
 // runtime.cpp pulls in decoder/anybcq/tensor.h directly.
-namespace streamllm_ext { namespace anybcq { class AnyBCQFamilyTensor; } }
+namespace streamllm_ext {
+class ChunkedTensor;
+namespace anybcq { class AnyBCQFamilyTensor; }
+}  // namespace streamllm_ext
 
 #include <atomic>
 #include <condition_variable>
@@ -149,19 +152,22 @@ public:
     UpstreamLayoutDevice * mutable_layout(const std::string & wid);
     const UpstreamLayoutHost * host_layout(const std::string & wid) const;
 
-    // Per-tensor device-side per-plane pointer arrays (AnyBCQ
-    // bookkeeping; allocated at install, mutated by
-    // anybcq::update_per_plane_after_load_async on every chunk move).
-    // The fused MoE kernel uses these to build a per-canonical-tensor
-    // table indexed by expert id. Returns null if wid is unknown.
-    void ** anybcq_d_qw_ptrs(const std::string & wid) const;
-    void ** anybcq_d_alpha_ptrs(const std::string & wid) const;
-    // Per-tensor device-side single-pointer slot for the highest-active
-    // chunk's β buffer. Used by any-prec wids only — for shortcut wids
-    // β lives in dev.q_bias_fp16 and this slot is unused (returns null).
-    // The fused MoE kernel needs to refresh from this slot per dispatch
-    // (see ``MoeExpertTable::d_qbias_slot_per_expert``).
-    void ** anybcq_d_qbias_slot(const std::string & wid) const;
+    // Per-tensor managed-tensor accessor.  Returns the abstract
+    // ChunkedTensor base — encoder/architecture-agnostic.  Decoder-
+    // private state (per-plane device pointer tables, host layout,
+    // β buffer, etc.) is reachable only via downcast in the decoder
+    // layer (see decoder/anybcq/tensor.h). Returns null if the wid
+    // is unknown.  Replaces the previous encoder-named accessors
+    // (anybcq_d_qw_ptrs / _alpha_ptrs / _qbias_slot) that mixed
+    // AnyBCQ specifics into core's surface.
+    ChunkedTensor * tensor(const std::string & wid) const;
+    // Typed convenience accessor for the AnyBCQ family. Returns the
+    // concrete subclass pointer when the managed tensor was parsed
+    // by the AnyBCQ / Shortcut-AnyBCQ encoder; null otherwise.
+    // Decoder-side callers (qwen3 dispatch glue, shortcut chunked-
+    // matmul wrappers) use this to reach d_qw_ptrs() / d_alpha_ptrs()
+    // / d_qbias_slot() without dragging encoder names into core.
+    anybcq::AnyBCQFamilyTensor * tensor_anybcq(const std::string & wid) const;
 
     // Clear the entry's device-side per-plane pointer slot for cid.
     // Must be called whenever a chunk is evicted from the VRAM pool —

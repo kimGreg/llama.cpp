@@ -14,6 +14,9 @@
 
 #include "anybcq_gemv.h"
 #include "anybcq_gemm.h"
+// Per-tensor pointer-table accessors — replaces the deleted runtime
+// anybcq_d_*_ptrs() shims.
+#include "../anybcq/tensor.h"
 
 #include <cuda_runtime.h>
 
@@ -209,6 +212,8 @@ bool chunk_matmul_for_wid(
     const UpstreamLayoutDevice * dev = rt.layout(wid);
     const UpstreamLayoutHost   * host = rt.host_layout(wid);
     if (dev == nullptr || host == nullptr) return false;
+    anybcq::AnyBCQFamilyTensor * tens = rt.tensor_anybcq(wid);
+    if (tens == nullptr) return false;
 
     for (int cid : chunks) {
         rt.pool().wait_on_stream(wid, cid, compute_stream);
@@ -219,8 +224,8 @@ bool chunk_matmul_for_wid(
 
     return chunk_matmul(
         *dev,
-        (const void * const *) rt.anybcq_d_qw_ptrs(wid),
-        (const void * const *) rt.anybcq_d_alpha_ptrs(wid),
+        (const void * const *) tens->d_qw_ptrs(),
+        (const void * const *) tens->d_alpha_ptrs(),
         planes, X_fp16, Y_fp16, n_tokens,
         x_stride_bytes, y_stride_bytes,
         rt.gemv_scratch(), compute_stream);

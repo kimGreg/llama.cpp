@@ -428,26 +428,20 @@ const UpstreamLayoutHost * StreamllmRuntime::host_layout(const std::string & wid
     return &it->second.tensor->host();
 }
 
-void ** StreamllmRuntime::anybcq_d_qw_ptrs(const std::string & wid) const {
+ChunkedTensor * StreamllmRuntime::tensor(const std::string & wid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return nullptr;
-    return it->second.tensor->d_qw_ptrs();
+    return it->second.tensor.get();
 }
 
-void ** StreamllmRuntime::anybcq_d_alpha_ptrs(const std::string & wid) const {
+anybcq::AnyBCQFamilyTensor *
+StreamllmRuntime::tensor_anybcq(const std::string & wid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return nullptr;
-    return it->second.tensor->d_alpha_ptrs();
-}
-
-void ** StreamllmRuntime::anybcq_d_qbias_slot(const std::string & wid) const {
-    auto it = entries_.find(wid);
-    if (it == entries_.end()) return nullptr;
-    // Only meaningful for any-prec wids; shortcut wids never write to
-    // d_qbias_slot. Returning the pointer regardless lets the MoE table
-    // builder snapshot it uniformly; it will simply be unused (and
-    // remain zero) for shortcut.
-    return it->second.tensor->d_qbias_slot();
+    // Entry::tensor is currently always an AnyBCQFamilyTensor — Step
+    // 7 (KV cache) will introduce non-AnyBCQ tensors at which point
+    // a dynamic_cast becomes mandatory here.
+    return it->second.tensor.get();
 }
 
 void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid) {
