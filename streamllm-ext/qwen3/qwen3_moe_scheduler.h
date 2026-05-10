@@ -19,6 +19,8 @@
 
 #include <string>
 
+struct ggml_tensor;
+
 namespace streamllm_ext { namespace qwen3 {
 
 // Dense managed mul_mat plan (per-tensor).  Returns nullptr if the
@@ -75,5 +77,17 @@ void scheduler_after_compute(
     Scheduler &         sched,
     const std::string & wid,
     StreamHandle        compute_stream);
+
+// Graph-instrumenter pre-dispatch visit. Called from the per-op
+// dispatch glue (qwen3_moe_dispatch.cpp) before any compute for a
+// managed node. The instrumenter uses the prewalk-built node→layer
+// map to detect layer transitions and fires
+// Scheduler::on_marker(LayerBegin/LayerEnd). No-op if the
+// instrumenter hasn't been seeded (graph_compute_begin not called
+// yet, or non-MoE scheduler active).
+void scheduler_on_managed_node_visit(
+    Scheduler &                sched,
+    const struct ggml_tensor * dst,
+    StreamHandle               compute_stream);
 
 }}  // namespace streamllm_ext::qwen3

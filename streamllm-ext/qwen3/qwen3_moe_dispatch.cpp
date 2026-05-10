@@ -401,6 +401,11 @@ bool handle_mul_mat_impl(
     if (plan == nullptr) {
         n_miss_name.fetch_add(1); diag("miss-name"); return false;
     }
+    // Step-4b instrumenter: fire LayerBegin/LayerEnd markers when
+    // crossing a layer boundary. dst is the unique node identity in
+    // the prewalk-built node→layer map.
+    qwen3::scheduler_on_managed_node_visit(
+        rt->scheduler(), dst, (StreamHandle) stream);
     cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
     const bool in_capture =
         cudaStreamIsCapturing(stream, &cap_status) == cudaSuccess &&
@@ -622,6 +627,11 @@ bool handle_mul_mat_id_impl(
     if (g_runtime->layout(synth_zero) == nullptr) {
         return false;
     }
+    // Step-4b instrumenter: fire LayerBegin/LayerEnd markers when
+    // crossing a layer boundary. dst is the unique node identity in
+    // the prewalk-built node→layer map.
+    qwen3::scheduler_on_managed_node_visit(
+        g_runtime->scheduler(), dst, (StreamHandle) stream);
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
         ids->type != GGML_TYPE_I32) {

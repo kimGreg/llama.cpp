@@ -12,6 +12,9 @@
 #include "moe_fused.h"   // MoeExpertTable + qwen3::alloc/free_moe_expert_table
 #include "qwen3_moe_residency.h"
 #include "qwen3_moe_dispatch.h"
+#include "qwen3_graph_instrumenter.h"
+
+namespace streamllm_ext { using qwen3::GraphInstrumenter; }
 
 #include <ggml.h>          // ggml_tensor field access for claims_tensor
 #include <cuda_runtime.h>
@@ -844,46 +847,93 @@ public:
 
     // ── Graph-compute prewalk ────────────────────────────────────
     // Fired by the ggml-cuda graph_compute_begin hook (added in
-    // step 4 of the architecture migration). Gives the scheduler a
-    // chance to peek at the cgraph before any node-level dispatch
-    // starts. Currently used as a diagnostic seam — set
-    // STREAMLLM_DEBUG_GRAPH_WALK=1 to log the per-graph managed-op
-    // count. Future work (step-4 instrumenter) will use this to
-    // queue prefetch ahead of compute, decoupling H2D from per-op
-    // hook firing.
-    void on_graph_compute_begin(StreamHandle /*compute_stream*/,
+    // step 4a). Walks the cgraph, primes the layer-instrumenter's
+    // node→layer map, and fires a GraphBegin marker. The dispatch
+    // glue subsequently calls scheduler_on_managed_node_visit per
+    // managed node; the instrumenter detects layer transitions and
+    // fires LayerBegin/LayerEnd markers.
+    //
+    // Optional diagnostic: set STREAMLLM_DEBUG_GRAPH_WALK=1 to log
+    // managed-op counts on each prewalk.
+    void on_graph_compute_begin(StreamHandle compute_stream,
                                  const struct ggml_cgraph * cgraph) override {
         if (rt_ == nullptr || cgraph == nullptr) return;
-        const char * dbg = getenv("STREAMLLM_DEBUG_GRAPH_WALK");
-        if (dbg == nullptr || dbg[0] == '0' || dbg[0] == '\0') return;
 
-        const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
-        int n_mul_mat = 0, n_mul_mat_id = 0;
-        int n_managed_mm = 0, n_managed_mmid = 0;
-        for (int i = 0; i < n_nodes; ++i) {
-            const ggml_tensor * node = ggml_graph_node(
-                const_cast<ggml_cgraph *>(cgraph), i);
-            if (node == nullptr) continue;
-            if (node->op == GGML_OP_MUL_MAT) {
-                ++n_mul_mat;
-                const ggml_tensor * w = node->src[0];
-                if (w && w->name[0] && rt_->is_managed_name(w->name)) {
-                    ++n_managed_mm;
+        instr_.on_graph_begin(cgraph);
+
+        if (const char * dbg = getenv("STREAMLLM_DEBUG_GRAPH_WALK")) {
+            if (dbg[0] && dbg[0] != '0') {
+                const int n_nodes = ggml_graph_n_nodes(
+                    const_cast<ggml_cgraph *>(cgraph));
+                int n_mul_mat = 0, n_mul_mat_id = 0;
+                int n_managed_mm = 0, n_managed_mmid = 0;
+                for (int i = 0; i < n_nodes; ++i) {
+                    const ggml_tensor * node = ggml_graph_node(
+                        const_cast<ggml_cgraph *>(cgraph), i);
+                    if (node == nullptr) continue;
+                    if (node->op == GGML_OP_MUL_MAT) {
+                        ++n_mul_mat;
+                        const ggml_tensor * w = node->src[0];
+                        if (w && w->name[0] && rt_->is_managed_name(w->name)) {
+                            ++n_managed_mm;
+                        }
+                    } else if (node->op == GGML_OP_MUL_MAT_ID) {
+                        ++n_mul_mat_id;
+                        const ggml_tensor * w = node->src[0];
+                        if (w && w->name[0] && rt_->is_managed_name(w->name)) {
+                            ++n_managed_mmid;
+                        }
+                    }
                 }
-            } else if (node->op == GGML_OP_MUL_MAT_ID) {
-                ++n_mul_mat_id;
-                const ggml_tensor * w = node->src[0];
-                if (w && w->name[0] && rt_->is_managed_name(w->name)) {
-                    ++n_managed_mmid;
-                }
+                std::fprintf(stderr,
+                    "streamllm-graph-walk: nodes=%d mul_mat=%d (managed=%d) "
+                    "mul_mat_id=%d (managed=%d) layers=%d\n",
+                    n_nodes, n_mul_mat, n_managed_mm,
+                    n_mul_mat_id, n_managed_mmid, instr_.total_layers());
             }
         }
-        std::fprintf(stderr,
-            "streamllm-graph-walk: nodes=%d mul_mat=%d (managed=%d) "
-            "mul_mat_id=%d (managed=%d)\n",
-            n_nodes, n_mul_mat, n_managed_mm,
-            n_mul_mat_id, n_managed_mmid);
+
+        MarkerEvent ev;
+        ev.kind           = MarkerKind::GraphBegin;
+        ev.compute_stream = compute_stream;
+        on_marker(ev);
     }
+
+    // Symmetric end-of-graph callback. Flushes the final LayerEnd
+    // marker (if a layer was active) and fires GraphEnd.
+    void on_graph_compute_end(StreamHandle compute_stream,
+                               const struct ggml_cgraph * /*cgraph*/) override {
+        instr_.on_graph_end(*this, (void *) compute_stream);
+        MarkerEvent ev;
+        ev.kind           = MarkerKind::GraphEnd;
+        ev.compute_stream = compute_stream;
+        on_marker(ev);
+    }
+
+    // Marker callback. Currently used only for diagnostics (gated by
+    // STREAMLLM_DEBUG_MARKERS=1). Future work folds prefetch /
+    // residency policy decisions in here once the instrumenter
+    // scope expands.
+    void on_marker(const MarkerEvent & ev) override {
+        const char * dbg = getenv("STREAMLLM_DEBUG_MARKERS");
+        if (dbg == nullptr || dbg[0] == '\0' || dbg[0] == '0') return;
+        const char * kind_name = "?";
+        switch (ev.kind) {
+            case MarkerKind::GraphBegin:  kind_name = "GraphBegin";  break;
+            case MarkerKind::GraphEnd:    kind_name = "GraphEnd";    break;
+            case MarkerKind::LayerBegin:  kind_name = "LayerBegin";  break;
+            case MarkerKind::LayerEnd:    kind_name = "LayerEnd";    break;
+            case MarkerKind::AttentionIn: kind_name = "AttentionIn"; break;
+            case MarkerKind::KvWrite:     kind_name = "KvWrite";     break;
+            case MarkerKind::MoeDispatch: kind_name = "MoeDispatch"; break;
+            case MarkerKind::Custom:      kind_name = "Custom";      break;
+        }
+        std::fprintf(stderr,
+            "streamllm-marker: kind=%s layer=%d\n",
+            kind_name, ev.layer_index);
+    }
+
+    GraphInstrumenter & instrumenter() { return instr_; }
 
     // Accessors the dispatch reads to look up the score-policy tables.
     // Hook computes per-expert precision = lookup(max_g_for_expert) and
@@ -1054,6 +1104,12 @@ private:
     // lazily on first moe_expert_table() call; cached thereafter.
     std::unordered_map<std::string, MoeExpertTable> moe_tables_;
     std::mutex moe_tables_mu_;
+
+    // Step-4b graph instrumenter. Built per-cgraph-compute by
+    // on_graph_compute_begin (node→layer map); read by
+    // on_managed_node_visit on each per-op hook firing to detect
+    // layer transitions and fire LayerBegin/LayerEnd markers.
+    GraphInstrumenter instr_;
 };
 
 } // anonymous
@@ -1155,6 +1211,16 @@ void scheduler_after_compute(
     // dispatch glue's call site stays untouched while the post-compute
     // hook is in flux (Step 4 graph instrumenter will fold this into
     // the marker callback).
+}
+
+void scheduler_on_managed_node_visit(
+    Scheduler &                sched,
+    const struct ggml_tensor * dst,
+    StreamHandle               compute_stream)
+{
+    auto & m = as_moe(sched);
+    if (!m.instrumenter().is_ready()) return;
+    m.instrumenter().on_managed_node_visit(dst, sched, (void *) compute_stream);
 }
 
 }  // namespace qwen3
