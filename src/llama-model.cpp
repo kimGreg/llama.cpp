@@ -20,7 +20,7 @@
 #include "ggml-cpp.h"
 
 #if defined(STREAMLLM_EXT_ENABLED)
-#include "runtime_hook.h"
+#include "qwen3_runtime_glue.h"
 #include <cuda_runtime.h>
 #endif
 

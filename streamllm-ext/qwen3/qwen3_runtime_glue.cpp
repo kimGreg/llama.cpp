@@ -1,18 +1,18 @@
-// streamllm-ext — runtime-hook lifecycle.
-//
-// Owns the global runtime instance + the four extern-C shims registered
-// with ggml-cuda. The shims are deliberately thin: they look up the
-// active runtime under the runtime mutex, then forward to
-// Scheduler::handle_*. Model-specific dispatch logic lives in the
-// scheduler subclass (qwen3/qwen3_moe_dispatch.cpp for Qwen3-MoE).
+// streamllm-ext / qwen3 — runtime glue between llama.cpp's model-load
+// path, ggml-cuda's hooks, and the Qwen3-MoE scheduler.  Owns the
+// process-wide ``g_runtime`` singleton.  Lives in qwen3/ because every
+// non-trivial responsibility — install-time MoE scratch sizing,
+// ggml-cuda hook registration, score-policy live-dial entry points,
+// per-op extern-C shims — funnels into model-specific behavior.
 
-#include "runtime_hook.h"
+#include "qwen3_runtime_glue.h"
 #include "runtime.h"
 #include "runtime_hook_diag.h"
 #include "stream_reader.h"
 #include "anybcq_gemm.h"
 
-#include "../qwen3/qwen3_moe_dispatch.h"
+#include "qwen3_moe_dispatch.h"
+#include "qwen3_moe_scheduler.h"  // qwen3::scheduler_* free-fn shims
 
 #include <ggml.h>
 #include <gguf.h>
@@ -128,6 +128,10 @@ extern "C" bool streamllm_claims_tensor(const struct ggml_tensor * w) {
     if (w == nullptr || w->name[0] == '\0') return false;
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return false;
+    // The default rule — managed-by-name — opts every managed tensor
+    // out of upstream's fused-subgraph paths so the streamllm hook
+    // can claim the underlying mul_mat. Concrete schedulers don't
+    // currently override this beyond the name set.
     return g_runtime->is_managed_name(w->name);
 }
 
@@ -184,7 +188,7 @@ extern "C" bool streamllm_set_score_table(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return rt->scheduler().set_score_table(th, ch);
+    return qwen3::scheduler_set_score_table(rt->scheduler(), th, ch);
 }
 
 bool streamllm_get_score_table(
@@ -199,9 +203,9 @@ bool streamllm_get_score_table(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    if (!rt->scheduler().is_score_policy()) return false;
-    out_thresholds = rt->scheduler().score_thresholds_snapshot();
-    out_chunks     = rt->scheduler().score_chunks_snapshot();
+    if (!qwen3::scheduler_is_score_policy(rt->scheduler())) return false;
+    out_thresholds = qwen3::scheduler_score_thresholds_snapshot(rt->scheduler());
+    out_chunks     = qwen3::scheduler_score_chunks_snapshot   (rt->scheduler());
     return true;
 }
 
@@ -256,8 +260,8 @@ extern "C" bool streamllm_try_cuda_mul_mat(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return rt->scheduler().handle_mul_mat(
-        (StreamHandle) stream, src0, src1, dst);
+    return qwen3::scheduler_handle_mul_mat(
+        rt->scheduler(), (StreamHandle) stream, src0, src1, dst);
 }
 
 extern "C" void streamllm_topk_moe_observed(
@@ -272,8 +276,8 @@ extern "C" void streamllm_topk_moe_observed(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return;
-    rt->scheduler().on_topk_moe_observed(
-        (StreamHandle) stream, logits, weights, ids);
+    qwen3::scheduler_on_topk_moe_observed(
+        rt->scheduler(), (StreamHandle) stream, logits, weights, ids);
 }
 
 extern "C" bool streamllm_try_cuda_mul_mat_id(
@@ -289,8 +293,8 @@ extern "C" bool streamllm_try_cuda_mul_mat_id(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return rt->scheduler().handle_mul_mat_id(
-        (StreamHandle) stream, src0, src1, ids, dst);
+    return qwen3::scheduler_handle_mul_mat_id(
+        rt->scheduler(), (StreamHandle) stream, src0, src1, ids, dst);
 }
 
 // Graph-compute pre/post hooks. Fire at the top and bottom of

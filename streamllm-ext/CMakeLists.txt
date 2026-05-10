@@ -33,7 +33,7 @@ set(STREAMLLM_EXT_SOURCES
 # scheduler) and likewise needs the CUDA driver headers.
 if (GGML_CUDA)
     list(APPEND STREAMLLM_EXT_SOURCES
-        core/runtime_hook.cpp
+        qwen3/qwen3_runtime_glue.cpp
         qwen3/qwen3_moe_dispatch.cpp
     )
 endif()

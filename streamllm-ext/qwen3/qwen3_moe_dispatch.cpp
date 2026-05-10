@@ -9,7 +9,7 @@
 
 #include "qwen3_moe_dispatch.h"
 
-#include "runtime_hook.h"   // g_runtime + g_runtime_mu (internal externs)
+#include "qwen3_runtime_glue.h"   // g_runtime + g_runtime_mu (internal externs)
 #include "runtime.h"
 #include "runtime_hook_diag.h"
 #include "stream_reader.h"
@@ -869,7 +869,7 @@ bool handle_mul_mat_id_impl(
 
         int sub_max_precision = 0;
         std::vector<int> host_prec_per_tu;
-        const bool score_outer = sched.is_score_policy();
+        const bool score_outer = qwen3::scheduler_is_score_policy(sched);
         if (score_outer) {
             host_prec_per_tu.assign((size_t)sub_n * n_used_per_tok, 0);
         }
@@ -897,8 +897,10 @@ bool handle_mul_mat_id_impl(
             // can swap the active table at any time (per-request live
             // dial); the snapshot guarantees an in-flight LOAD walk
             // doesn't tear if a swap lands mid-iteration.
-            const std::vector<float> sc_thresh = sched.score_thresholds_snapshot();
-            const std::vector<int>   sc_chunks = sched.score_chunks_snapshot();
+            const std::vector<float> sc_thresh =
+                qwen3::scheduler_score_thresholds_snapshot(sched);
+            const std::vector<int>   sc_chunks =
+                qwen3::scheduler_score_chunks_snapshot(sched);
             const int                sc_max    = kMaxChunksPerTensor;
 
             // Walk descending thresholds; first match wins. Below the

@@ -18,6 +18,7 @@
 #include "scheduler.h"
 
 #include <string>
+#include <vector>
 
 struct ggml_tensor;
 
@@ -89,5 +90,44 @@ void scheduler_on_managed_node_visit(
     Scheduler &                sched,
     const struct ggml_tensor * dst,
     StreamHandle               compute_stream);
+
+// ─── ggml-cuda extern-C shim forwarders ────────────────────────────
+// The shims in core/runtime_hook.cpp dispatch to these to keep core
+// from having to know about MoEScheduler's vtable. Each is a thin
+// downcast wrapper.
+bool scheduler_handle_mul_mat(
+    Scheduler &                sched,
+    StreamHandle               stream,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    struct ggml_tensor *       dst);
+bool scheduler_handle_mul_mat_id(
+    Scheduler &                sched,
+    StreamHandle               stream,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    struct ggml_tensor *       dst);
+void scheduler_on_topk_moe_observed(
+    Scheduler &                sched,
+    StreamHandle               stream,
+    const struct ggml_tensor * logits,
+    struct ggml_tensor *       weights,
+    struct ggml_tensor *       ids);
+bool scheduler_claims_tensor(
+    Scheduler &                sched,
+    const struct ggml_tensor * w);
+
+// ─── Live precision dial accessors ─────────────────────────────────
+// Score-policy snapshot accessors used by core/runtime_hook.cpp's
+// streamllm_set_score_table / streamllm_get_score_table extern-C
+// entry points. Concrete impl on MoEScheduler.
+bool                scheduler_is_score_policy(const Scheduler & sched);
+std::vector<float>  scheduler_score_thresholds_snapshot(const Scheduler & sched);
+std::vector<int>    scheduler_score_chunks_snapshot   (const Scheduler & sched);
+bool                scheduler_set_score_table(
+    Scheduler &                sched,
+    const std::vector<float> & thresholds,
+    const std::vector<int>   & chunks);
 
 }}  // namespace streamllm_ext::qwen3

@@ -2,8 +2,8 @@
 //
 // The framework manages chunked tensors via two encoder/architecture-
 // blind ABCs (ChunkedTensor, ChunkedComputation) and one global brain:
-// the Scheduler.  Concrete schedulers live in model/ subtrees (e.g.
-// qwen3::MoEScheduler).
+// the Scheduler.  Concrete schedulers live in model subtrees (e.g.
+// qwen3::MoEScheduler in qwen3/qwen3_moe_scheduler.cpp).
 //
 // Narrow surface — six virtuals total:
 //
@@ -13,7 +13,7 @@
 //     on_graph_compute_end     ggml finished walking a cgraph
 //
 //   ─ Hot path ────────────────────────────────────────────────────
-//     on_marker(MarkerEvent)   custom marker node fired during compute
+//     on_marker(MarkerEvent)   custom marker fires during compute
 //                              (semantic boundaries: layer entry,
 //                              expert dispatch, KV write, ...)
 //     plan_for(...)            answer demand for an upcoming
@@ -22,13 +22,11 @@
 //                              prefetch already loaded them)
 //     make_room_for(pool, n)   pool-pressure eviction callback
 //
-// Anything above that — model-specific dispatch logic, per-op hooks,
-// score-policy tables, MoE expert tables — is currently bridged by
-// extra virtuals on this base class plus the per-op extern-C shims in
-// runtime_hook.{h,cpp}.  Step 4 of the architecture migration replaces
-// those shims with custom-op nodes wrapping a ChunkedComputation, at
-// which point the bridging virtuals come off the ABC.  See
-// /home/jaeyun/.claude/plans/zesty-questing-hippo.md.
+// Model-specific entry points (per-op dispatch, MoE expert tables,
+// score-policy snapshot/replace) are exposed as free-function
+// accessors in the model layer's header (qwen3/qwen3_moe_scheduler.h's
+// scheduler_handle_mul_mat / scheduler_set_score_table / etc.). Each
+// downcasts internally; core stays free of model vtable contracts.
 //
 // Pick at install via STREAMLLM_SCHEDULER.  Currently only "moe" is
 // supported; null defaults to it.
@@ -173,49 +171,6 @@ public:
 
     // Human-readable identifier for log lines.
     virtual const char * name() const = 0;
-
-    // ─── Step-4-doomed bridging virtuals ───────────────────────────
-    //
-    // The methods below are still vtable-dispatched because the
-    // current per-op hook glue (core/runtime_hook.cpp) calls them
-    // from extern-C shims.  Step 4 replaces those shims with custom-
-    // op nodes wrapping a ChunkedComputation; once that lands the
-    // bridging virtuals come off this base class.  See the
-    // architecture plan.
-
-    // Score-policy snapshot accessors (live precision dial).  A score
-    // policy maps each routed expert's max gate score to a precision
-    // tier via a descending-threshold ladder.  Default = "off".
-    virtual bool                   is_score_policy() const { return false; }
-    virtual std::vector<float>     score_thresholds_snapshot() const { return {}; }
-    virtual std::vector<int>       score_chunks_snapshot()    const { return {}; }
-    virtual bool set_score_table(const std::vector<float> & /*thresholds*/,
-                                  const std::vector<int>   & /*chunks*/) {
-        return false;
-    }
-
-    // Per-op dispatch hooks — called from extern-C shims registered
-    // with ggml-cuda.
-    virtual bool handle_mul_mat(StreamHandle /*stream*/,
-                                 const struct ggml_tensor * /*src0*/,
-                                 const struct ggml_tensor * /*src1*/,
-                                 struct ggml_tensor *       /*dst*/) {
-        return false;
-    }
-    virtual bool handle_mul_mat_id(StreamHandle /*stream*/,
-                                    const struct ggml_tensor * /*src0*/,
-                                    const struct ggml_tensor * /*src1*/,
-                                    const struct ggml_tensor * /*ids*/,
-                                    struct ggml_tensor *       /*dst*/) {
-        return false;
-    }
-    virtual void on_topk_moe_observed(StreamHandle /*stream*/,
-                                       const struct ggml_tensor * /*logits*/,
-                                       struct ggml_tensor *       /*weights*/,
-                                       struct ggml_tensor *       /*ids*/) {}
-    virtual bool claims_tensor(const struct ggml_tensor * /*w*/) {
-        return false;
-    }
 };
 
 // Factory.  ``which`` is currently only "moe" (or nullptr → "moe").

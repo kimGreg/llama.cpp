@@ -822,14 +822,14 @@ public:
 
     const char * name() const override { return "moe"; }
 
-    // ── ggml-cuda hook overrides ─────────────────────────────────
-    // The runtime registers thin extern-C shims with ggml-cuda; those
-    // shims call ``g_runtime->scheduler().handle_*()``. Dispatch bodies
-    // live in qwen3/qwen3_moe_dispatch.cpp.
+    // ── ggml-cuda hook handlers ──────────────────────────────────
+    // Reached via the qwen3::scheduler_handle_* free-function shims
+    // (qwen3_moe_scheduler.h). Dispatch bodies live in
+    // qwen3/qwen3_moe_dispatch.cpp.
     bool handle_mul_mat(StreamHandle stream,
                          const struct ggml_tensor * src0,
                          const struct ggml_tensor * src1,
-                         struct ggml_tensor *       dst) override {
+                         struct ggml_tensor *       dst) {
         return moe_dispatch::handle_mul_mat_impl(
             (cudaStream_t)stream, src0, src1, dst);
     }
@@ -837,16 +837,19 @@ public:
                             const struct ggml_tensor * src0,
                             const struct ggml_tensor * src1,
                             const struct ggml_tensor * ids,
-                            struct ggml_tensor *       dst) override {
+                            struct ggml_tensor *       dst) {
         return moe_dispatch::handle_mul_mat_id_impl(
             (cudaStream_t)stream, src0, src1, ids, dst);
     }
     void on_topk_moe_observed(StreamHandle stream,
                                const struct ggml_tensor * logits,
                                struct ggml_tensor *       weights,
-                               struct ggml_tensor *       ids) override {
+                               struct ggml_tensor *       ids) {
         moe_dispatch::on_topk_moe_observed_impl(
             (cudaStream_t)stream, logits, weights, ids);
+    }
+    bool claims_tensor(const struct ggml_tensor * /*w*/) {
+        return false;
     }
 
     // ── Graph-compute prewalk ────────────────────────────────────
@@ -942,19 +945,19 @@ public:
     // Accessors the dispatch reads to look up the score-policy tables.
     // Hook computes per-expert precision = lookup(max_g_for_expert) and
     // sets every (t, u) routed to that expert to the same value.
-    bool is_score_policy() const override {
+    bool is_score_policy() const {
         return policy_ == "score";
     }
-    std::vector<float> score_thresholds_snapshot() const override {
+    std::vector<float> score_thresholds_snapshot() const {
         std::lock_guard<std::mutex> lk(score_table_mu_);
         return score_thresholds_;
     }
-    std::vector<int> score_chunks_snapshot() const override {
+    std::vector<int> score_chunks_snapshot() const {
         std::lock_guard<std::mutex> lk(score_table_mu_);
         return score_chunks_;
     }
     bool set_score_table(const std::vector<float> & th,
-                          const std::vector<int>   & ch) override {
+                          const std::vector<int>   & ch) {
         // Accept the same shapes the env-var path accepts:
         //   ch.size() == th.size()       (each threshold pairs with a count)
         //   ch.size() == th.size() + 1   (last entry = tail, below all)
@@ -1225,6 +1228,64 @@ void scheduler_on_managed_node_visit(
     auto & m = as_moe(sched);
     if (!m.instrumenter().is_ready()) return;
     m.instrumenter().on_managed_node_visit(dst, sched, (void *) compute_stream);
+}
+
+bool scheduler_handle_mul_mat(
+    Scheduler &                sched,
+    StreamHandle               stream,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    struct ggml_tensor *       dst)
+{
+    return as_moe(sched).handle_mul_mat(stream, src0, src1, dst);
+}
+
+bool scheduler_handle_mul_mat_id(
+    Scheduler &                sched,
+    StreamHandle               stream,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    struct ggml_tensor *       dst)
+{
+    return as_moe(sched).handle_mul_mat_id(stream, src0, src1, ids, dst);
+}
+
+void scheduler_on_topk_moe_observed(
+    Scheduler &                sched,
+    StreamHandle               stream,
+    const struct ggml_tensor * logits,
+    struct ggml_tensor *       weights,
+    struct ggml_tensor *       ids)
+{
+    as_moe(sched).on_topk_moe_observed(stream, logits, weights, ids);
+}
+
+bool scheduler_claims_tensor(
+    Scheduler &                sched,
+    const struct ggml_tensor * w)
+{
+    return as_moe(sched).claims_tensor(w);
+}
+
+bool scheduler_is_score_policy(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).is_score_policy();
+}
+
+std::vector<float> scheduler_score_thresholds_snapshot(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).score_thresholds_snapshot();
+}
+
+std::vector<int> scheduler_score_chunks_snapshot(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).score_chunks_snapshot();
+}
+
+bool scheduler_set_score_table(
+    Scheduler &                sched,
+    const std::vector<float> & thresholds,
+    const std::vector<int>   & chunks)
+{
+    return as_moe(sched).set_score_table(thresholds, chunks);
 }
 
 }  // namespace qwen3
