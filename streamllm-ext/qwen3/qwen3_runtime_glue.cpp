@@ -175,28 +175,23 @@ __attribute__((weak)) int                streamllm_stat_diag_enabled(void)    { 
 } // extern "C"
 
 extern "C" bool streamllm_set_score_table(
-    const float * thresholds, int n_thresh,
-    const int   * chunks,     int n_chunks)
+    const float * thresholds, int n_thresh)
 {
-    if (thresholds == nullptr || chunks == nullptr) return false;
-    if (n_thresh <= 0 || n_chunks <= 0)             return false;
+    if (thresholds == nullptr || n_thresh <= 0) return false;
     std::vector<float> th(thresholds, thresholds + n_thresh);
-    std::vector<int>   ch(chunks,     chunks     + n_chunks);
     StreamllmRuntime * rt = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_runtime_mu);
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return qwen3::scheduler_set_score_table(rt->scheduler(), th, ch);
+    return qwen3::scheduler_set_score_table(rt->scheduler(), th);
 }
 
 bool streamllm_get_score_table(
-    std::vector<float> & out_thresholds,
-    std::vector<int>   & out_chunks)
+    std::vector<float> & out_thresholds)
 {
     out_thresholds.clear();
-    out_chunks.clear();
     StreamllmRuntime * rt = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_runtime_mu);
@@ -204,7 +199,6 @@ bool streamllm_get_score_table(
     }
     if (rt == nullptr) return false;
     out_thresholds = qwen3::scheduler_score_thresholds_snapshot(rt->scheduler());
-    out_chunks     = qwen3::scheduler_score_chunks_snapshot   (rt->scheduler());
     return true;
 }
 

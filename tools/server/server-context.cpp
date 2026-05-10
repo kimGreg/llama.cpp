@@ -28,12 +28,10 @@
 // The symbols are linked in via the static lib when STREAMLLM_EXT is
 // enabled at build time.
 extern "C" bool streamllm_set_score_table(
-    const float * thresholds, int n_thresh,
-    const int   * chunks,     int n_chunks);
+    const float * thresholds, int n_thresh);
 namespace streamllm_ext {
 bool streamllm_get_score_table(
-    std::vector<float> & out_thresholds,
-    std::vector<int>   & out_chunks);
+    std::vector<float> & out_thresholds);
 } // namespace streamllm_ext
 using streamllm_ext::streamllm_get_score_table;
 
@@ -4174,29 +4172,25 @@ void server_routes::init_routes() {
         bool ctx_server; GGML_UNUSED(ctx_server);
         const json body = json::parse(req.body);
         if (!body.is_object() ||
-            !body.contains("thresholds") || !body.contains("chunks") ||
-            !body["thresholds"].is_array() || !body["chunks"].is_array()) {
+            !body.contains("thresholds") || !body["thresholds"].is_array()) {
             res->error(format_error_response(
-                "body must be an object with array fields "
-                "'thresholds' and 'chunks'", ERROR_TYPE_INVALID_REQUEST));
+                "body must be an object with array field 'thresholds' "
+                "(ascending floats; length = model's full chunk count)",
+                ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         std::vector<float> th;
-        std::vector<int>   ch;
         for (const auto & v : body["thresholds"]) th.push_back(v.get<float>());
-        for (const auto & v : body["chunks"])     ch.push_back(v.get<int>());
-        if (!streamllm_set_score_table(
-                th.data(), (int)th.size(),
-                ch.data(), (int)ch.size())) {
+        if (!streamllm_set_score_table(th.data(), (int)th.size())) {
             res->error(format_error_response(
                 "streamllm: set_score_table rejected the table "
-                "(check sizes match, thresholds descending, chunks in [1, 16])",
+                "(check length matches the model's n_chunks, thresholds "
+                "ascending, values in [0, 1])",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         res->ok({
             {"thresholds", th},
-            {"chunks",     ch},
             {"status",     "applied"},
         });
         return res;
@@ -4206,9 +4200,8 @@ void server_routes::init_routes() {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
         std::vector<float> th;
-        std::vector<int>   ch;
-        streamllm_get_score_table(th, ch);
-        res->ok({{"thresholds", th}, {"chunks", ch}});
+        streamllm_get_score_table(th);
+        res->ok({{"thresholds", th}});
         return res;
     };
 

@@ -884,27 +884,37 @@ bool handle_mul_mat_id_impl(
             // time (per-request live dial); the snapshot guarantees
             // an in-flight LOAD walk doesn't tear if a swap lands
             // mid-iteration.
+            //
+            // Format: ascending vector of length N (= max n_chunks
+            // across managed tensors). thresholds[k] is the lower-
+            // edge gate score for the band that loads (k+1) chunks.
+            // No explicit chunks array — chunks_loaded is implicit
+            // by index. For gate g, return planes_served = base_p +
+            // (largest k where thresholds[k] <= g), with the per-
+            // tensor n_chunks clamping handled by translate_planes.
             const std::vector<float> sc_thresh =
                 qwen3::scheduler_score_thresholds_snapshot(sched);
-            const std::vector<int>   sc_chunks =
-                qwen3::scheduler_score_chunks_snapshot(sched);
-            const int                sc_max    = kMaxChunksPerTensor;
+            const int base_p = any_layout
+                ? (int)any_layout->base_precision : 1;
+            const int sc_max = kMaxChunksPerTensor;
 
-            // Walk descending thresholds; first match wins. Below the
-            // smallest threshold falls back to chunks.back() (the
-            // tail-tier precision the user opted into).
             auto score_lookup = [&](float g) -> int {
-                int desired = sc_chunks.empty() ? sc_max : sc_chunks.back();
-                for (size_t k = 0; k < sc_thresh.size() &&
-                                   k < sc_chunks.size(); ++k) {
-                    if (g >= sc_thresh[k]) {
-                        desired = sc_chunks[k];
-                        break;
-                    }
+                // Find largest k where thresholds[k] <= g.
+                int k = -1;
+                for (int i = (int)sc_thresh.size() - 1; i >= 0; --i) {
+                    if (g >= sc_thresh[i]) { k = i; break; }
                 }
-                if (desired < 1)      desired = 1;
-                if (desired > sc_max) desired = sc_max;
-                return desired;
+                if (k < 0) {
+                    // Below every threshold (shouldn't happen since
+                    // thresholds[0] is typically 0 — but degenerate
+                    // tables can leave gates below thresholds[0]).
+                    // Fall back to base precision: planes = base_p.
+                    return base_p;
+                }
+                int planes = base_p + k;
+                if (planes < 1)      planes = 1;
+                if (planes > sc_max) planes = sc_max;
+                return planes;
             };
 
             // Pass 1: collect per-expert max gate score + register

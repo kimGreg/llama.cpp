@@ -112,11 +112,15 @@ bool scheduler_claims_tensor(
 // Score-table snapshot + replace, used by qwen3/qwen3_runtime_glue.cpp's
 // streamllm_set_score_table / streamllm_get_score_table extern-C
 // entry points. Concrete impl on MoEScheduler.
+//
+// Wire format: a single ascending threshold vector of length
+// scheduler_score_n_tiers() (= max n_chunks across managed tensors).
+// thresholds[k] is the lower-edge gate score for the band that
+// loads (k+1) chunks.  Default = all zeros (full precision).
 std::vector<float>  scheduler_score_thresholds_snapshot(const Scheduler & sched);
-std::vector<int>    scheduler_score_chunks_snapshot   (const Scheduler & sched);
+int                 scheduler_score_n_tiers           (const Scheduler & sched);
 bool                scheduler_set_score_table(
     Scheduler &                sched,
-    const std::vector<float> & thresholds,
-    const std::vector<int>   & chunks);
+    const std::vector<float> & thresholds);
 
 }}  // namespace streamllm_ext::qwen3

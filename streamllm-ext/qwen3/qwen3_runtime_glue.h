@@ -87,22 +87,23 @@ extern "C" bool streamllm_try_cuda_mul_mat_id(
 
 // Live-tunable precision dial. ``thresholds`` (length n_thresh,
 // descending) and ``chunks`` (length n_chunks, same length) replace the
-// active scheduler's score table. Returns true on success, false if no
-// runtime is installed, the active scheduler doesn't support score
-// policy, or the input is malformed (size mismatch, non-descending
-// thresholds, chunk count out of range). Safe to call from any thread —
-// the next mul_mat_id dispatch sees the new table; in-flight dispatches
-// keep using the snapshot they took at entry.
+// active scheduler's score-threshold table.  ``thresholds`` is a
+// length-N ascending vector where N = max n_chunks across managed
+// tensors (the model's "full chunk size").  thresholds[k] is the
+// lower-edge gate score for the band that loads (k+1) chunks; the
+// chunks count is implicit by index.  Returns true on success,
+// false if no runtime is installed or the input is malformed
+// (length mismatch, non-ascending, out-of-range value).  Safe to
+// call from any thread; the next mul_mat_id dispatch sees the new
+// table; in-flight dispatches keep using the snapshot they took
+// at entry.
 extern "C" bool streamllm_set_score_table(
-    const float * thresholds, int n_thresh,
-    const int   * chunks,     int n_chunks);
+    const float * thresholds, int n_thresh);
 
-// Snapshot of the active score table. Returns false if no runtime is
-// installed or the active scheduler isn't running the score policy.
-// Safe from any thread.
+// Snapshot of the active score-threshold table.  Returns false if
+// no runtime is installed.  Safe from any thread.
 bool streamllm_get_score_table(
-    std::vector<float> & out_thresholds,
-    std::vector<int>   & out_chunks);
+    std::vector<float> & out_thresholds);
 
 // Notification before ggml-cuda's fused topk_moe kernel. We stash
 // the (ids, weights) pair so streamllm_try_cuda_mul_mat_id can later

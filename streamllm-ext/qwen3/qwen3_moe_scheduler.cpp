@@ -169,47 +169,22 @@ void register_chunk_io_from_layout(StreamllmRuntime & rt,
 //       auto-evicts least-recently-used on-demand chunks (pinned
 //       MIN planes are never evictable).
 //
-// Two precision policies (selected via STREAMLLM_MOE_POLICY):
-//   "static"  : every routed expert runs at uniform precision = max.
-//               Loads the same chunks for every expert regardless of gate
-//               score. Use this for original-quality prefill.
-//   "dynamic" : per-expert precision derived from gate score. Two ladder
-//               modes:
-//               (a) Linear (default): precision = floor(gate/step)+1
-//                   clamped to [min, max].
-//               (b) Threshold table (set STREAMLLM_MOE_GATE_THRESHOLDS):
-//                   precision = max{n : gate >= t_n} clamped to
-//                   [min, max]. Lets the operator place each
-//                   precision step at an arbitrary gate value.
-//               Planes [0, min) are pinned at install (never evicted);
-//               planes [min, max) are loaded on demand and rotate via
-//               LRU. Same code at decode (single-token gate) and at
-//               batched prefill (max-gate aggregated per expert).
+// Precision policy: per-expert max gate-score → threshold-ladder
+// lookup → chunks_loaded.  Per-expert aggregation takes max(g) over
+// (t, u) hitting the expert; every (t, u) routed to expert e shares
+// the same precision derived from e's highest-scoring token in the
+// minibatch.  Single-token decode and batched prefill go through the
+// same code (the minibatch is just one token at decode).
 //
-// Env vars:
-//   STREAMLLM_MOE_POLICY           "static" | "dynamic" | "score"
-//                                  (default static)
-//   STREAMLLM_MOE_GATE_STEP        dynamic linear ladder step (default 0.1)
-//   STREAMLLM_MOE_GATE_THRESHOLDS  dynamic threshold table: CSV
-//                                  "t_{MIN+1},...,t_MAX". Overrides linear
-//                                  ladder. Each threshold is a raw gate
-//                                  score; precision per expert =
-//                                  max{n: gate_score >= t_n}.
-//   STREAMLLM_MOE_SCORE_THRESHOLDS score-policy threshold table: CSV
-//                                  DESCENDING raw gate-score cutoffs;
-//                                  e.g. "0.4,0.3,0.1,0.05".
-//   STREAMLLM_MOE_SCORE_CHUNKS     score-policy precision-per-bucket: CSV
-//                                  same length as SCORE_THRESHOLDS.
-//                                  Per-(t, u) precision = chunks[k] for
-//                                  the first k where g >= thresholds[k];
-//                                  below the smallest threshold falls back
-//                                  to chunks.back(). Per-expert aggregation
-//                                  takes max(g) over (t, u) hitting the
-//                                  expert and re-runs the same lookup, so
-//                                  every (t, u) routed to expert e shares
-//                                  the same precision derived from e's
-//                                  highest-scoring token in the minibatch.
-//                                  Default "8,6,4,2" if thresholds set.
+// Env var (only one):
+//   STREAMLLM_MOE_SCORE_THRESHOLDS  ascending CSV of length N (=
+//                                   max n_chunks across managed
+//                                   tensors).  thresholds[k] = lower-
+//                                   edge gate score for the band that
+//                                   loads (k+1) chunks.  Default = all
+//                                   zeros (full precision for every
+//                                   gate).  Live-dial via
+//                                   streamllm_set_score_table.
 class MoEScheduler : public Scheduler {
 public:
     void on_install(StreamllmRuntime & rt,
@@ -217,15 +192,23 @@ public:
                     const std::string & gguf_path) override {
         rt_ = &rt;
         // No install-time plane pinning: every chunk loads on demand.
-        // Precision per (token, rank) is decided at dispatch time
-        // by the score-threshold table:
-        //   precision = score_chunks_[k] where k = first index with
-        //               max_gate_score >= score_thresholds_[k]
-        // Below the smallest threshold the lookup falls back to
-        // score_chunks_.back(). This is the only policy — older
-        // BASE/HOT (static) and gate-step (dynamic) variants were
-        // removed in favor of a single threshold-driven knob the
-        // demo's UI dial drives via streamllm_set_score_table.
+        //
+        // Score-table semantics:
+        //   score_thresholds_ is a length-N ascending vector where N
+        //   = max n_chunks across managed tensors (= the model's
+        //   "full chunk size" — every encoded chunk loaded).
+        //   score_thresholds_[k] is the lower-edge gate score for the
+        //   band that loads (k+1) chunks (planes_served = base_p + k).
+        //   At dispatch the per-expert max gate score selects the
+        //   largest index k where score_thresholds_[k] <= g, yielding
+        //   chunks_loaded = k+1.
+        //
+        //   No explicit chunks array — chunks_loaded for index k is
+        //   defined by position. This matches the demo's HTML
+        //   synthesize() output (cumulative band lower edges).
+        //
+        // Default = all zeros → full precision (gate=0 still selects
+        // the highest k → chunks_loaded = N → full precision).
 
         auto parse_csv = [](const char * csv,
                              std::vector<float> & out) {
@@ -240,27 +223,18 @@ public:
             }
         };
 
-        // Score policy tables. Hook reads these to decide precision
-        // per expert via lookup(max_g_for_expert).
         if (const char * csv = getenv("STREAMLLM_MOE_SCORE_THRESHOLDS")) {
             parse_csv(csv, score_thresholds_);
-        }
-        if (const char * csv = getenv("STREAMLLM_MOE_SCORE_CHUNKS")) {
-            std::vector<float> tmp;
-            parse_csv(csv, tmp);
-            score_chunks_.clear();
-            score_chunks_.reserve(tmp.size());
-            for (float v : tmp) score_chunks_.push_back((int)v);
-        }
-        // Default chunks list to "8,6,4,2" if user only set thresholds.
-        if (!score_thresholds_.empty() && score_chunks_.empty()) {
-            score_chunks_ = {8, 6, 4, 2};
-        }
-        // No threshold table set -> default to "always full precision"
-        // so the dispatch never bails on an empty table at first hit.
-        if (score_thresholds_.empty()) {
-            score_thresholds_ = {0.0f};
-            score_chunks_     = {kMaxChunksPerTensor};
+            // Validate ascending; reject otherwise.
+            for (size_t k = 1; k < score_thresholds_.size(); ++k) {
+                if (score_thresholds_[k] < score_thresholds_[k - 1]) {
+                    std::fprintf(stderr,
+                        "streamllm-scheduler[moe]: STREAMLLM_MOE_SCORE_THRESHOLDS "
+                        "must be ascending; clearing the table\n");
+                    score_thresholds_.clear();
+                    break;
+                }
+            }
         }
 
         size_t n_total = 0;
@@ -278,6 +252,7 @@ public:
         }
 
         size_t total_pinned = 0, total_on_demand = 0;
+        int max_n_chunks_ = 0;
         for (const auto & name : reader.chunked_tensor_names()) {
             UpstreamLayoutHost host = read_one(reader, gguf_path, name);
             const int P = host.n_chunks;
@@ -325,6 +300,7 @@ public:
                 });
             }
 
+            if (P > max_n_chunks_) max_n_chunks_ = P;
             P_of_[name]     = P;
             bytes_per_chunk_of_[name] = bytes_per_chunk;
             if (any_prec) {
@@ -356,22 +332,30 @@ public:
                 rt.release_host_bytes(name);
             }
         }
-        std::fprintf(stderr,
-            "streamllm-scheduler[moe]: %zu experts", n_total);
+
+        // Now we know max_n_chunks_ across all managed tensors.
+        // Resize the threshold table to that length:
+        //   - if env-supplied table is shorter, pad with the last value
+        //     (or 0 if empty);
+        //   - if longer, truncate.
+        // Default (no env) → all zeros = full precision for every gate.
+        n_score_tiers_ = max_n_chunks_;
         {
-            // No swap can race here — set_score_table is only callable
-            // post-install via the runtime hook.  Still take the lock
-            // to be uniformly safe with the snapshot accessors.
             std::lock_guard<std::mutex> lk(score_table_mu_);
-            std::fprintf(stderr, " | score_thresholds=[");
+            const float pad = score_thresholds_.empty()
+                              ? 0.0f : score_thresholds_.back();
+            score_thresholds_.resize((size_t)max_n_chunks_, pad);
+        }
+
+        std::fprintf(stderr,
+            "streamllm-scheduler[moe]: %zu experts | n_tiers=%d",
+            n_total, max_n_chunks_);
+        {
+            std::lock_guard<std::mutex> lk(score_table_mu_);
+            std::fprintf(stderr, " | thresholds=[");
             for (size_t i = 0; i < score_thresholds_.size(); ++i) {
                 std::fprintf(stderr, "%s%.3f",
                     i == 0 ? "" : ",", score_thresholds_[i]);
-            }
-            std::fprintf(stderr, "] chunks=[");
-            for (size_t i = 0; i < score_chunks_.size(); ++i) {
-                std::fprintf(stderr, "%s%d",
-                    i == 0 ? "" : ",", score_chunks_[i]);
             }
             std::fprintf(stderr, "]");
         }
@@ -836,38 +820,31 @@ public:
 
     GraphInstrumenter & instrumenter() { return instr_; }
 
-    // Score-table snapshot accessors.  The dispatch reads these to
-    // compute per-expert precision = lookup(max_g_for_expert) and
-    // sets every (t, u) routed to that expert to the same value.
+    // Score-table snapshot.  The dispatch reads this length-N
+    // ascending vector and uses chunks_loaded(g) = (largest k where
+    // threshold[k] <= g) + 1, with chunks_loaded clamped to the
+    // per-tensor n_chunks at the kernel.
     std::vector<float> score_thresholds_snapshot() const {
         std::lock_guard<std::mutex> lk(score_table_mu_);
         return score_thresholds_;
     }
-    std::vector<int> score_chunks_snapshot() const {
-        std::lock_guard<std::mutex> lk(score_table_mu_);
-        return score_chunks_;
-    }
-    bool set_score_table(const std::vector<float> & th,
-                          const std::vector<int>   & ch) {
-        // Accept the same shapes the env-var path accepts:
-        //   ch.size() == th.size()       (each threshold pairs with a count)
-        //   ch.size() == th.size() + 1   (last entry = tail, below all)
-        // The dispatch lookup walks min(th, ch) descending; if no
-        // threshold is met it falls back to ch.back(), so the +1 tail
-        // form is the natural way to express a default chunk count.
-        if (ch.empty()) return false;
-        if (!(ch.size() == th.size() || ch.size() == th.size() + 1)) {
-            return false;
-        }
+    int score_n_tiers() const { return n_score_tiers_; }
+
+    // Replace the live score-threshold table.  The vector must be
+    // ascending and of length ``n_score_tiers_`` (the model-determined
+    // max-n_chunks across managed tensors). Returns false on shape /
+    // ordering / range violations; the in-flight dispatch keeps using
+    // its snapshot so a swap mid-generation never tears.
+    bool set_score_table(const std::vector<float> & th) {
+        if ((int)th.size() != n_score_tiers_) return false;
         for (size_t k = 1; k < th.size(); ++k) {
-            if (th[k] > th[k - 1]) return false;  // must be descending
+            if (th[k] < th[k - 1]) return false;  // must be ascending
         }
-        for (int n : ch) {
-            if (n < 1 || n > kMaxChunksPerTensor) return false;
+        for (float v : th) {
+            if (!(v >= 0.0f && v <= 1.0f)) return false;
         }
         std::lock_guard<std::mutex> lk(score_table_mu_);
         score_thresholds_ = th;
-        score_chunks_     = ch;
         return true;
     }
 
@@ -892,18 +869,19 @@ private:
 
     StreamllmRuntime * rt_ = nullptr;
 
-    // Score policy tables. score_thresholds_ is descending; for a given
-    // gate score g, precision = score_chunks_[k] where k is the first
-    // index with g >= score_thresholds_[k]. Below the smallest threshold
-    // the lookup returns score_chunks_.back().
+    // Score-threshold table.  Length n_score_tiers_ = max n_chunks
+    // across managed tensors; score_thresholds_[k] is the lower-edge
+    // gate score for the band where chunks_loaded = k+1.  Lookup:
+    // largest k where threshold[k] <= g → chunks_loaded = k+1
+    // (planes_served = base_p + k).
     //
-    // Mutable across requests: set_score_table() swaps both vectors
-    // under score_table_mu_. Hot-path readers (the LOAD walk) take a
-    // snapshot via score_*_snapshot() and iterate locally so a swap
+    // Mutable across requests: set_score_table() swaps under
+    // score_table_mu_.  Hot-path readers take a snapshot via
+    // score_thresholds_snapshot() and iterate locally so a swap
     // mid-generation never tears.
     mutable std::mutex score_table_mu_;
     std::vector<float> score_thresholds_;
-    std::vector<int>   score_chunks_;
+    int                n_score_tiers_ = 0;
 
     std::unordered_map<std::string, int> P_of_;
     // Synthetic wids whose host layout flag had any_precision=true.
@@ -1137,16 +1115,15 @@ std::vector<float> scheduler_score_thresholds_snapshot(const Scheduler & sched) 
     return static_cast<const MoEScheduler &>(sched).score_thresholds_snapshot();
 }
 
-std::vector<int> scheduler_score_chunks_snapshot(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).score_chunks_snapshot();
+int scheduler_score_n_tiers(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).score_n_tiers();
 }
 
 bool scheduler_set_score_table(
     Scheduler &                sched,
-    const std::vector<float> & thresholds,
-    const std::vector<int>   & chunks)
+    const std::vector<float> & thresholds)
 {
-    return as_moe(sched).set_score_table(thresholds, chunks);
+    return as_moe(sched).set_score_table(thresholds);
 }
 
 }  // namespace qwen3
