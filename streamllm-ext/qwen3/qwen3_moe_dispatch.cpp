@@ -756,51 +756,14 @@ bool handle_mul_mat_id_impl(
     // Eager dispatch: pre_inputs D2H + host-side plan + worker-pool
     // chunk loads + per-chunk wait_on_stream + comp.execute().
     //
-    // The earlier `cudaLaunchHostFunc`-based path (zesty-questing-hippo
-    // Step 1's `Runtime::run`) was retired in P4 of
-    // vigilant-stitching-heron: the host-fn body deadlocks against
-    // copy_stream event processing on the CUDA driver-internal thread,
-    // and the captured cudaStreamWaitEvent semantics over a same-handle
-    // event re-recorded each replay don't give per-replay ordering.
-    // Partial capture (the P1 user_node_claims hook) is the correct
-    // integration point: at tight cap capture is disabled and this
-    // eager path runs directly; at full pin capture is engaged and the
-    // shorter capture branch below handles dispatch.
-
-    // Under cuda-graph capture the claims hook should have disabled
-    // capture (returns true at tight cap), but at full pin where the
-    // scheduler will never evict we let capture proceed and dispatch
-    // straight to ``execute()``. No LOAD walk is needed because every
-    // managed chunk is already resident; the captured kernel launches
-    // re-execute on every replay against stable plane pointers.
-    cudaStreamCaptureStatus _cap = cudaStreamCaptureStatusNone;
-    const bool _in_capture =
-        cudaStreamIsCapturing(stream, &_cap) == cudaSuccess &&
-        _cap == cudaStreamCaptureStatusActive;
-    if (_in_capture) {
-        // pre_inputs still mutates per-dispatch shape state on the
-        // comp (cur_n_tokens / cur_n_used / cur_n_expert) which
-        // execute reads to size its captured kernels.  The MemcpySpec
-        // list it returns is also issued so the captured graph
-        // re-D2Hs ids/probs/weights on every replay (so host
-        // pinned-buffer state stays fresh for any per-replay reader,
-        // even though the full-pin kernel doesn't currently read
-        // them).
-        for (auto & m : comp->pre_inputs(in)) {
-            if (m.bytes == 0) continue;
-            if (m.is_2d) {
-                cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
-                    m.device_src, m.src_pitch,
-                    m.bytes, m.height,
-                    cudaMemcpyDeviceToHost, stream);
-            } else {
-                cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
-                    cudaMemcpyDeviceToHost, stream);
-            }
-        }
-        comp->execute(in, out, (StreamHandle) stream);
-        return true;
-    }
+    // streamllm is an eager-only framework: ggml-cuda's
+    // user_node_claims hook (consulted via Scheduler::claims_node)
+    // disables cuda-graph capture for any cgraph containing managed
+    // MoE ops, so this dispatch is always invoked outside capture.
+    // The earlier cudaLaunchHostFunc-based path was retired in P4
+    // (deadlocks against copy_stream event processing on the CUDA
+    // driver-internal thread; per-replay ordering on a same-handle
+    // event doesn't work).
 
     for (auto & m : comp->pre_inputs(in)) {
         if (m.bytes == 0) continue;

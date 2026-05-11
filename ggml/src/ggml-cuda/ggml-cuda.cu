@@ -3259,13 +3259,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         const bool allow = enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
         if (!allow) return false;
     }
-    const bool stream_llm_id_hook_active =
-        (g_cuda_mul_mat_id_hook != nullptr) &&
-        ([] {
-            const char * e = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
-            return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
-        })();
-
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
@@ -3285,22 +3278,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            // streamllm-ext: when our F1 fused MoE hook handles this
-            // op (no in-op stream sync), the upstream sync-required
-            // condition doesn't apply. Skip the disable check in that
-            // case so F2 (graph capture for MoE) can proceed.
-            if (!stream_llm_id_hook_active) {
-                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-                if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                    // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                    // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/18958
-                    use_cuda_graph = false;
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+                use_cuda_graph = false;
 #ifndef NDEBUG
-                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
-                }
             }
         }
 

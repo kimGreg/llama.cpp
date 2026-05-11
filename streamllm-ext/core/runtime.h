@@ -133,17 +133,6 @@ public:
     const Scheduler & scheduler() const { return *scheduler_; }
     Scheduler & scheduler() { return *scheduler_; }
 
-    // True iff the pool is sized to comfortably hold every managed
-    // chunk (sum of bytes-per-chunk × n_chunks across all managed
-    // tensors, plus q_bias, plus a small safety margin) so the
-    // scheduler will never need to evict. Computed once at install.
-    // Read by the user_node_claims hook to decide whether cuda-graph
-    // capture is safe for cgraphs containing managed mul_mat_id ops:
-    // at full-pin, the captured plane pointers stay live so capture
-    // works; under tight cap, eviction would invalidate them so we
-    // force eager dispatch.
-    bool can_pin_all_managed() const { return can_pin_all_managed_; }
-
     // Decode-path scratch the encoder-side ``chunk_matmul`` reuses to
     // avoid per-call cudaMallocAsync. Lifetime tied to the runtime.
     NaverKernelScratch * gemv_scratch() const { return gemv_scratch_.get(); }
@@ -352,7 +341,6 @@ public:
 
 private:
     bool installed_ = false;
-    bool can_pin_all_managed_ = false;
 
     // Score-table snapshot, refreshed by the scheduler in
     // on_graph_compute_begin.

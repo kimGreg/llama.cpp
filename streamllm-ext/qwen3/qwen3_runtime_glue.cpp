@@ -127,30 +127,19 @@ bool install_for_gguf(const char * gguf_path) {
 }
 
 extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
-    // Per-node claim predicate consulted by ggml-cuda before deciding
-    // whether to capture the cgraph into a cuda-graph. Delegates to
-    // the active scheduler — the scheduler decides which nodes it
-    // wants to handle in eager mode (where full CUDA API access is
-    // available) versus letting capture proceed.
-    //
-    // STREAMLLM_FORCE_EAGER=1 overrides to always disable capture
-    // (useful for debugging or when residency dynamics defeat the
-    // install-time heuristic).  At full-pin (every managed chunk
-    // fits in pool) the scheduler typically returns false so the
-    // cgraph captures normally.
+    // Per-node claim predicate consulted by ggml-cuda before
+    // deciding whether to capture the cgraph into a cuda-graph.
+    // Streamllm is an eager-only framework — its LOAD walks need
+    // host-side decision-making and full CUDA API access on every
+    // dispatch.  When the scheduler claims any node in the cgraph,
+    // ggml-cuda disables cuda-graph capture for that compute and
+    // every node runs eager.  The streamllm dispatch is fast enough
+    // (load-bound at tight cap, near-eager at full pin) that the
+    // missing capture speedup doesn't matter for streamllm's use
+    // case.
     if (node == nullptr) return false;
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return false;
-    static const bool force_eager = []() {
-        const char * e = std::getenv("STREAMLLM_FORCE_EAGER");
-        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
-    }();
-    if (force_eager) {
-        // Force-eager only matters if the scheduler claims the node at
-        // all; otherwise capture is fine even when we'd disable
-        // ourselves on a "we own this" basis.
-        return g_runtime->scheduler().claims_node(node);
-    }
     return g_runtime->scheduler().claims_node(node);
 }
 

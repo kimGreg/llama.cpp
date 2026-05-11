@@ -761,6 +761,11 @@ public:
     // existing per-op implementations in qwen3_moe_dispatch.cpp.
 
     bool claims_node(const struct ggml_tensor * node) const override {
+        // streamllm always dispatches managed mul_mat / mul_mat_id
+        // ops eagerly — the LOAD walk needs full CUDA API access on
+        // every invocation, which cuda-graph capture forbids. ggml-
+        // cuda consults this predicate per cgraph node and disables
+        // capture for any cgraph where it returns true.
         if (node == nullptr) return false;
         if (node->op != GGML_OP_MUL_MAT &&
             node->op != GGML_OP_MUL_MAT_ID) {
@@ -768,12 +773,7 @@ public:
         }
         const ggml_tensor * w = node->src[0];
         if (w == nullptr || w->name[0] == '\0') return false;
-        if (managed_names_.count(w->name) == 0) return false;
-        // Don't claim for capture purposes when every chunk fits the
-        // pool — at full pin, the captured replay reads stable plane
-        // pointers and we want the cuda-graph speedup.
-        if (rt_ != nullptr && rt_->can_pin_all_managed()) return false;
-        return true;
+        return managed_names_.count(w->name) != 0;
     }
 
     bool dispatch_node(StreamHandle stream,
