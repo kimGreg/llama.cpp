@@ -95,5 +95,13 @@ void print_profile_if_enabled();
 // channel. Called from clear() so a future install starts fresh.
 void clear_topk_weights();
 
+// Step 3 (Milestone 1): increment the MoE dispatch entry counter. The
+// counter itself stays in qwen3_moe_dispatch.cpp alongside the rest of
+// the profile counters; the executor calls this from
+// forward_moe_block's entry now that the dispatch body lives there.
+// No-op when STREAMLLM_PROFILE is unset (the counter just isn't
+// printed).
+void profile_inc_hook_calls();
+
 } // namespace moe_dispatch
 } // namespace streamllm_ext

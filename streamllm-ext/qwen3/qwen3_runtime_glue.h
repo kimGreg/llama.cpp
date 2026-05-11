@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include "executor.h"
+
 #include <cuda_runtime.h>
 
 #include <memory>
@@ -36,11 +38,13 @@ namespace streamllm_ext {
 class StreamllmRuntime;
 
 // Internal — owned by qwen3/qwen3_runtime_glue.cpp (install_for_gguf / clear).
-// Read by qwen3/qwen3_moe_dispatch.cpp under g_runtime_mu so the active
-// runtime is reachable from the scheduler-side dispatch bodies. Not part
-// of the extension's public API.
+// Read by qwen3/qwen3_moe_dispatch.cpp and qwen3/qwen3_moe_executor.cpp
+// under g_runtime_mu so the active runtime + executor are reachable from
+// the scheduler-side dispatch bodies and the executor shim. Not part of
+// the extension's public API.
 extern std::mutex                            g_runtime_mu;
 extern std::unique_ptr<StreamllmRuntime>     g_runtime;
+extern std::unique_ptr<ModelExecutor>        g_executor;
 
 // Build a global StreamllmRuntime from ``gguf_path`` if the file carries
 // streamllm.* metadata, and register the ggml-cuda hook. Idempotent on

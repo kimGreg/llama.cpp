@@ -37,6 +37,13 @@ public:
                             ggml_tensor *              dst) override;
 
 private:
+    // Walk one or two parents up from ``ids`` to find the F32 probs
+    // tensor produced by the router. Returns nullptr when the topology
+    // doesn't match (e.g. ids->src[0] is not the gate output).
+    // Topology is graph-stable so this probe is cheap on every call.
+    static const ggml_tensor * probe_probs_tensor_(const ggml_tensor * ids,
+                                                    int n_tokens);
+
     StreamllmRuntime * rt_ = nullptr;
 };
 

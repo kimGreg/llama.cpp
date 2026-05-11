@@ -612,12 +612,20 @@ bool handle_mul_mat_impl(
 
 // ---- MoE mul_mat_id dispatch ------------------------------------------
 //
-// Thin shim over MoEMatMulComp.  Validates the call, probes for the
-// (probs, weights) device tensors that drive the per-expert score
-// policy, and hands the dispatch to ``StreamllmRuntime::run`` —
-// which emits the universal captured sequence (D2H pre_inputs → host-
-// fn that calls plan() → wait-event → captured kernel launches in
-// execute()) on every invocation, eager or graph-captured.
+// Step 3 (Milestone 1) — the dispatch body lives on the executor now
+// (Qwen3MoEAnyBcqExecutor::forward_moe_block). This symbol is a thin
+// shim that survives so the legacy scheduler ``dispatch_node`` path
+// (qwen3_moe_scheduler.cpp:797) keeps working without being rewired.
+// Step 9 retires the shim entirely once the per-op hook installs are
+// gone for managed installs.
+//
+// **Lock discipline**: the previous implementation held g_runtime_mu
+// across the *entire* dispatch, which serialised every concurrent
+// invocation against any unrelated install/clear and risked deadlock
+// against the worker pool. The new shim copies the executor pointer
+// under the lock, releases the lock immediately, and only then calls
+// into the forward — matching the pattern at
+// qwen3_runtime_glue.cpp::streamllm_try_cuda_mul_mat_id.
 bool handle_mul_mat_id_impl(
     cudaStream_t stream,
     const struct ggml_tensor * src0,
@@ -625,201 +633,22 @@ bool handle_mul_mat_id_impl(
     const struct ggml_tensor * ids,
     struct ggml_tensor * dst)
 {
-    if (src0 == nullptr || src0->name[0] == '\0') return false;
-    if (src1 == nullptr || ids == nullptr || dst == nullptr) return false;
-
-    std::lock_guard<std::mutex> lk(g_runtime_mu);
-    if (!g_runtime) return false;
-
-    const std::string canonical(src0->name);
-    // Scheduler decides if this canonical is claimed; we don't query a
-    // runtime-side managed_names set anymore (P2★ moved that onto the
-    // scheduler). We use the same src0 tensor object — claims_tensor
-    // is exactly the predicate we want.
-    if (!g_runtime->scheduler().claims_tensor(src0)) return false;
-    if (g_runtime->layout(canonical + ":e0") == nullptr) return false;
-
-    qwen3::MoEMatMulComp * comp =
-        qwen3::scheduler_lookup_moe_comp(g_runtime->scheduler(), canonical);
-    if (comp == nullptr || !comp->valid()) return false;
-
-    // Step-4b instrumenter: fire LayerBegin/LayerEnd markers when
-    // crossing a layer boundary. dst is the unique node identity in
-    // the prewalk-built node→layer map.
-    qwen3::scheduler_on_managed_node_visit(
-        g_runtime->scheduler(), dst, (StreamHandle) stream);
-
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-        ids->type != GGML_TYPE_I32) {
-        std::fprintf(stderr,
-            "streamllm-ext: mul_mat_id hook bailing on wid=%s "
-            "(unexpected dtypes: src1=%d ids=%d dst=%d)\n",
-            canonical.c_str(),
-            (int)src1->type, (int)ids->type, (int)dst->type);
-        return false;
-    }
-
-    const int K              = (int)src1->ne[0];
-    const int n_tokens       = (int)src1->ne[2];
-    const int n_used_per_tok = (int)ids->ne[0];
-    const int M              = (int)dst->ne[0];
-
-    const bool shared_x = (src1->ne[1] == 1);
-    const bool per_tu_x = (src1->ne[1] == n_used_per_tok);
-    if (!shared_x && !per_tu_x) {
-        std::fprintf(stderr,
-            "streamllm-ext: mul_mat_id bail %s (src1->ne[1]=%lld, expected 1 or %d)\n",
-            canonical.c_str(), (long long)src1->ne[1], n_used_per_tok);
-        return false;
-    }
-    if ((int)ids->ne[1] != n_tokens ||
-        (int)dst->ne[1] != n_used_per_tok ||
-        (int)dst->ne[2] != n_tokens) {
-        std::fprintf(stderr,
-            "streamllm-ext: mul_mat_id bail %s (ids/dst shape mismatch)\n",
-            canonical.c_str());
-        return false;
-    }
-
-    if (scratch_for_stream(stream) == nullptr) {
-        std::fprintf(stderr,
-            "streamllm-ext: mul_mat_id hook bailing — scratch alloc failed\n");
-        return false;
-    }
-
-    g_moe_profile.hook_calls.fetch_add(1, std::memory_order_relaxed);
-    if (getenv("STREAMLLM_TRACE")) {
-        static std::unordered_set<std::string> seen;
-        static std::mutex seen_mu;
-        std::lock_guard<std::mutex> sk(seen_mu);
-        if (seen.insert(canonical).second) {
-            std::fprintf(stderr,
-                "streamllm-ext: mul_mat_id hook fired wid=%s "
-                "K=%d M=%d n_used=%d n_tokens=%d\n",
-                canonical.c_str(), K, M, n_used_per_tok, n_tokens);
-        }
-    }
-
-    // Probe the cgraph for the F32 probs tensor (lives one or two
-    // parents up from ``ids``); the LOAD walk uses it for per-expert
-    // gate-score lookup when the topk_moe weights side-channel isn't
-    // populated.  Topology is graph-stable so this probe runs once
-    // per recording and is reused on every replay.
-    const ggml_tensor * probs = nullptr;
-    int n_expert_in_probs = 0;
-    if (ids->src[0] != nullptr) {
-        if (ids->src[0]->type == GGML_TYPE_F32 &&
-            ids->src[0]->data != nullptr &&
-            (int64_t)ids->src[0]->ne[1] == n_tokens) {
-            probs = ids->src[0];
-        }
-        if (probs == nullptr && ids->src[0]->src[0] != nullptr &&
-            ids->src[0]->src[0]->type == GGML_TYPE_F32 &&
-            ids->src[0]->src[0]->data != nullptr &&
-            (int64_t)ids->src[0]->src[0]->ne[1] == n_tokens) {
-            probs = ids->src[0]->src[0];
-        }
-    }
-    if (probs != nullptr) n_expert_in_probs = (int) probs->ne[0];
-
-    // Renormalised topk weights side-channel (captured at recording
-    // time by ``on_topk_moe_observed``; ids->data is stable for the
-    // lifetime of one capture session).
-    const ggml_tensor * weights = nullptr;
+    ModelExecutor * exec = nullptr;
     {
-        int n_used_unused = 0;
-        topk_weights_lookup(ids->data, &weights, &n_used_unused);
+        std::lock_guard<std::mutex> lk(g_runtime_mu);
+        exec = g_executor.get();
     }
+    if (exec == nullptr) return false;
+    return exec->forward_moe_block(
+        (StreamHandle) stream, src0, src1, ids, dst);
+}
 
-    qwen3::MoEInput  in;
-    in.src0              = src0;
-    in.src1              = src1;
-    in.ids               = ids;
-    in.probs             = probs;
-    in.weights           = weights;
-    in.K                 = K;
-    in.M                 = M;
-    in.n_tokens          = n_tokens;
-    in.n_used_per_tok    = n_used_per_tok;
-    in.n_expert_in_probs = n_expert_in_probs;
-    in.shared_x          = shared_x;
-    in.layer_index       =
-        std::strncmp(canonical.c_str(), "blk.", 4) == 0
-            ? std::atoi(canonical.c_str() + 4) : -1;
-
-    qwen3::MoEOutput out;
-    out.dst = dst;
-
-    // Eager dispatch: pre_inputs D2H + host-side plan + worker-pool
-    // chunk loads + per-chunk wait_on_stream + comp.execute().
-    //
-    // streamllm is an eager-only framework: ggml-cuda's
-    // user_node_claims hook (consulted via Scheduler::claims_node)
-    // disables cuda-graph capture for any cgraph containing managed
-    // MoE ops, so this dispatch is always invoked outside capture.
-    // The earlier cudaLaunchHostFunc-based path was retired in P4
-    // (deadlocks against copy_stream event processing on the CUDA
-    // driver-internal thread; per-replay ordering on a same-handle
-    // event doesn't work).
-
-    for (auto & m : comp->pre_inputs(in)) {
-        if (m.bytes == 0) continue;
-        if (m.is_2d) {
-            cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
-                m.device_src, m.src_pitch,
-                m.bytes, m.height,
-                cudaMemcpyDeviceToHost, stream);
-        } else {
-            cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
-                cudaMemcpyDeviceToHost, stream);
-        }
-    }
-    cudaStreamSynchronize(stream);
-    ChunkPlan plan = comp->plan(in);
-
-    if (!plan.load_set.empty()) {
-        // Reserve the load_set in the scheduler's tracker so workers'
-        // ``make_room`` (called when the pool is full) skips chunks
-        // we're about to depend on within this dispatch window.
-        // Released after execute() queues its kernels — the tracker's
-        // recency stamps from plan() then take over (the just-touched
-        // chunks score lowest for eviction).  Mirrors the legacy
-        // pre-Step 2 dispatch path.
-        for (const auto & k : plan.load_set) {
-            qwen3::scheduler_reserve_for_dispatch(
-                g_runtime->scheduler(), k.wid, k.cid);
-        }
-        const bool async_on = g_runtime->io_worker_count() > 0;
-        if (async_on) {
-            auto batch = std::make_shared<std::atomic<uint32_t>>(0);
-            for (const auto & k : plan.load_set) {
-                if (g_runtime->pool().is_resident(k.wid, k.cid)) continue;
-                g_runtime->submit_async_load(k.wid, k.cid, batch);
-            }
-            g_runtime->wait_async_load_batch(batch);
-        } else {
-            for (const auto & k : plan.load_set) {
-                if (g_runtime->pool().is_resident(k.wid, k.cid)) continue;
-                g_runtime->move_chunk(k.wid, k.cid, Tier::RAM,
-                                       Tier::VRAM,
-                                       /*compute_stream=*/nullptr);
-            }
-        }
-        // Order the compute stream after the loader's per-chunk
-        // ready_event so the kernel reads up-to-date plane pointers.
-        for (const auto & k : plan.load_set) {
-            g_runtime->pool().wait_on_stream(k.wid, k.cid,
-                                              (StreamHandle) stream);
-        }
-    }
-    comp->execute(in, out, (StreamHandle) stream);
-    if (!plan.load_set.empty()) {
-        for (const auto & k : plan.load_set) {
-            qwen3::scheduler_release_from_dispatch(
-                g_runtime->scheduler(), k.wid, k.cid);
-        }
-    }
-    return true;
+// Step 3 (Milestone 1): counter shim — the executor's forward_moe_block
+// calls this on every managed dispatch. The counter lives in
+// g_moe_profile alongside the rest of the dispatch-time counters so
+// print_profile_if_enabled prints a coherent report.
+void profile_inc_hook_calls() {
+    g_moe_profile.hook_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace moe_dispatch
