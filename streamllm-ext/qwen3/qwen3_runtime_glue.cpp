@@ -121,7 +121,42 @@ bool install_for_gguf(const char * gguf_path) {
         (void *) &streamllm_graph_compute_begin);
     ggml_cuda_set_graph_compute_end_hook(
         (void *) &streamllm_graph_compute_end);
+    ggml_cuda_set_user_node_claims_hook(
+        (void *) &streamllm_user_node_claims);
     return true;
+}
+
+extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
+    // Per-node claim predicate consulted by ggml-cuda before deciding
+    // whether to capture the cgraph into a cuda-graph. Return true for
+    // any node whose dispatch needs the streamllm LOAD walk to run on
+    // every invocation (managed mul_mat / mul_mat_id at tight cap).
+    // Returning true for any node in a cgraph disables cuda-graph
+    // capture for that compute call; everything still works because
+    // the per-op streamllm hooks above intercept the regular dispatch
+    // path in eager mode.
+    //
+    // At full-pin (every managed chunk fits in pool) we return false
+    // so the cgraph captures normally — the captured plane pointers
+    // stay valid across replays since the scheduler never evicts.
+    // STREAMLLM_FORCE_EAGER=1 overrides to always disable capture
+    // (useful for debugging or when residency dynamics defeat the
+    // install-time heuristic).
+    if (node == nullptr) return false;
+    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    const ggml_tensor * w = node->src[0];
+    if (w == nullptr || w->name[0] == '\0') return false;
+    std::lock_guard<std::mutex> lk(g_runtime_mu);
+    if (!g_runtime) return false;
+    if (!g_runtime->is_managed_name(w->name)) return false;
+    static const bool force_eager = []() {
+        const char * e = std::getenv("STREAMLLM_FORCE_EAGER");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+    if (force_eager) return true;
+    return !g_runtime->can_pin_all_managed();
 }
 
 extern "C" bool streamllm_claims_tensor(const struct ggml_tensor * w) {
@@ -227,6 +262,7 @@ void clear() {
     ggml_cuda_set_graph_compute_end_hook(nullptr);
     ggml_cuda_set_mul_mat_id_hook(nullptr);
     ggml_cuda_set_topk_moe_hook(nullptr);
+    ggml_cuda_set_user_node_claims_hook(nullptr);
     moe_dispatch::clear_topk_weights();
     g_runtime.reset();
     moe_dispatch::free_scratch();

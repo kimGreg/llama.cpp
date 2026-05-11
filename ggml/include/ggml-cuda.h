@@ -101,6 +101,27 @@ GGML_BACKEND_API void ggml_cuda_set_topk_moe_hook(void * hook_fn);
 GGML_BACKEND_API void ggml_cuda_set_graph_compute_begin_hook(void * hook_fn);
 GGML_BACKEND_API void ggml_cuda_set_graph_compute_end_hook  (void * hook_fn);
 
+// streamllm-ext integration: user-managed-node claim hook. When set, ggml-
+// cuda asks this predicate per cgraph node before deciding whether to
+// capture the cgraph into a cuda-graph. If the predicate returns true for
+// ANY node in the cgraph, capture is disabled for this compute call and
+// every node runs eager via its regular dispatch path (where the
+// streamllm per-op hooks above can claim it). Capture stays enabled for
+// cgraphs with no claimed nodes (the common dense-only case).
+//
+// Rationale: managed mul_mat_id ops need to run their LOAD walk on every
+// invocation, which is incompatible with whole-cgraph cuda-graph capture
+// (the captured replay would skip the host-side decision-making). Partial
+// per-segment capture is the right long-term answer (see plan
+// vigilant-stitching-heron P1+); disabling capture entirely for the
+// affected cgraph is the correct interim behaviour that matches what
+// llama.cpp does today for MoE models.
+//
+// Callback signature:
+//   bool fn(const struct ggml_tensor * node);
+// Set to null to unregister. Independent of the other streamllm hooks.
+GGML_BACKEND_API void ggml_cuda_set_user_node_claims_hook(void * hook_fn);
+
 #ifdef  __cplusplus
 }
 #endif

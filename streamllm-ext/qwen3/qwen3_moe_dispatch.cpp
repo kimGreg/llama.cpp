@@ -776,13 +776,12 @@ bool handle_mul_mat_id_impl(
         return true;
     }
 
-    // Under cuda-graph capture we cannot host-side wait or call any
-    // sync APIs.  Skip the LOAD walk and just capture the kernel
-    // launches directly — chunks must already be resident from prior
-    // (non-captured) warmup / reserve passes.  This mirrors the
-    // legacy ``_hook_in_capture`` behavior and is the same trade-off
-    // (works at full pin, garbage at tight cap) Step 2's host-fn path
-    // is meant to fix.  The TODO is left for Step 3 hardening.
+    // Under cuda-graph capture the claims hook should have disabled
+    // capture (returns true at tight cap), but at full pin where the
+    // scheduler will never evict we let capture proceed and dispatch
+    // straight to ``execute()``. No LOAD walk is needed because every
+    // managed chunk is already resident; the captured kernel launches
+    // re-execute on every replay against stable plane pointers.
     cudaStreamCaptureStatus _cap = cudaStreamCaptureStatusNone;
     const bool _in_capture =
         cudaStreamIsCapturing(stream, &_cap) == cudaSuccess &&
@@ -792,9 +791,10 @@ bool handle_mul_mat_id_impl(
         // comp (cur_n_tokens / cur_n_used / cur_n_expert) which
         // execute reads to size its captured kernels.  The MemcpySpec
         // list it returns is also issued so the captured graph
-        // re-D2Hs ids/probs/weights on every replay (harmless if the
-        // kernel doesn't end up reading the host buffers in this
-        // capture-only path).
+        // re-D2Hs ids/probs/weights on every replay (so host
+        // pinned-buffer state stays fresh for any per-replay reader,
+        // even though the full-pin kernel doesn't currently read
+        // them).
         for (auto & m : comp->pre_inputs(in)) {
             if (m.bytes == 0) continue;
             if (m.is_2d) {

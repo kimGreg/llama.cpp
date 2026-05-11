@@ -253,6 +253,35 @@ void StreamllmRuntime::install(const StreamReader & reader,
 
     scheduler_->on_install(*this, reader, gguf_path);
 
+    // Compute whether the pool can hold every managed chunk at once.
+    // Read by the ggml-cuda user_node_claims hook to decide whether
+    // cuda-graph capture is safe for cgraphs containing managed MoE
+    // ops: full-pin keeps captured plane pointers live across replays,
+    // tight-cap eviction invalidates them and demands eager dispatch.
+    {
+        size_t total_managed_bytes = 0;
+        for (const auto & name : reader.managed_tensor_names()) {
+            const auto * L = reader.layout(name);
+            if (L == nullptr) continue;
+            // fixed_bytes (q_bias) + sum(chunk_bytes).
+            total_managed_bytes += (size_t) L->fixed_bytes;
+            for (uint32_t cb : L->chunk_bytes) {
+                total_managed_bytes += (size_t) cb;
+            }
+        }
+        const size_t cap = pool_->capacity_bytes();
+        // 5% safety margin — fragmentation + per-allocation slot overhead.
+        can_pin_all_managed_ = (total_managed_bytes > 0) &&
+                               ((double) total_managed_bytes <
+                                0.95 * (double) cap);
+        std::fprintf(stderr,
+            "streamllm-ext: managed bytes %.1f MB / pool cap %.1f MB "
+            "(%scuda-graph capture eligible for managed cgraphs)\n",
+            (double) total_managed_bytes / 1024.0 / 1024.0,
+            (double) cap / 1024.0 / 1024.0,
+            can_pin_all_managed_ ? "" : "NOT ");
+    }
+
     // Spin up the async-prefetch worker pool. Default 8 workers — at
     // QD1 SSD pread latency of ~200 us/call, parallel preads scale
     // sub-linearly until they hit core-count or NVMe queue-depth

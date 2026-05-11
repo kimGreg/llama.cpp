@@ -131,4 +131,12 @@ extern "C" void streamllm_graph_compute_end(
     cudaStream_t                stream,
     const struct ggml_cgraph *  cgraph);
 
+// User-managed-node claim predicate. Registered with
+// ``ggml_cuda_set_user_node_claims_hook``; ggml-cuda calls this per
+// cgraph node to decide whether to disable cuda-graph capture for
+// that cgraph compute. Returns true for managed mul_mat / mul_mat_id
+// nodes so the streamllm LOAD walk runs eager on each invocation.
+extern "C" bool streamllm_user_node_claims(
+    const struct ggml_tensor * node);
+
 } // namespace streamllm_ext

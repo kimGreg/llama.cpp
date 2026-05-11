@@ -2489,6 +2489,34 @@ extern "C" void ggml_cuda_set_graph_compute_end_hook(void * hook_fn) {
     g_cuda_graph_compute_end_hook = (ggml_cuda_graph_compute_hook_t) hook_fn;
 }
 
+// streamllm-ext: user-managed-node claim hook. See header. When set and
+// any node in a cgraph satisfies the predicate, cuda-graph capture for
+// that cgraph compute is disabled — every node runs eager, so the
+// per-op streamllm hooks (mul_mat / mul_mat_id) execute their full
+// LOAD walk on each invocation instead of being captured once and
+// replayed with stale chunk pointers.
+typedef bool (*ggml_cuda_user_node_claims_hook_t)(const struct ggml_tensor *);
+static ggml_cuda_user_node_claims_hook_t g_cuda_user_node_claims_hook = nullptr;
+
+extern "C" void ggml_cuda_set_user_node_claims_hook(void * hook_fn) {
+    g_cuda_user_node_claims_hook =
+        (ggml_cuda_user_node_claims_hook_t) hook_fn;
+}
+
+static inline bool ggml_cuda_cgraph_has_user_node(const ggml_cgraph * cgraph) {
+    if (g_cuda_user_node_claims_hook == nullptr || cgraph == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) continue;
+        if (g_cuda_user_node_claims_hook(node)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // streamllm-ext override path. Runs first so the extension can claim
@@ -4363,13 +4391,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // streamllm-ext: when the scheduler has claimed any node in this
+    // cgraph, force eager execution. The claimed nodes need their LOAD
+    // walk to run on every invocation; whole-cgraph cuda-graph capture
+    // would replay stale chunk pointers and produce garbage at tight
+    // VRAM caps. Per-segment capture is the right long-term answer
+    // (plan vigilant-stitching-heron); disabling capture entirely for
+    // affected cgraphs is the correct interim behaviour.
+    const bool streamllm_force_eager =
+        ggml_cuda_cgraph_has_user_node(cgraph);
+
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (!streamllm_force_eager && graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
