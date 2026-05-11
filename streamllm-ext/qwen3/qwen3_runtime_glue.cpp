@@ -128,46 +128,41 @@ bool install_for_gguf(const char * gguf_path) {
 
 extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     // Per-node claim predicate consulted by ggml-cuda before deciding
-    // whether to capture the cgraph into a cuda-graph. Return true for
-    // any node whose dispatch needs the streamllm LOAD walk to run on
-    // every invocation (managed mul_mat / mul_mat_id at tight cap).
-    // Returning true for any node in a cgraph disables cuda-graph
-    // capture for that compute call; everything still works because
-    // the per-op streamllm hooks above intercept the regular dispatch
-    // path in eager mode.
+    // whether to capture the cgraph into a cuda-graph. Delegates to
+    // the active scheduler — the scheduler decides which nodes it
+    // wants to handle in eager mode (where full CUDA API access is
+    // available) versus letting capture proceed.
     //
-    // At full-pin (every managed chunk fits in pool) we return false
-    // so the cgraph captures normally — the captured plane pointers
-    // stay valid across replays since the scheduler never evicts.
     // STREAMLLM_FORCE_EAGER=1 overrides to always disable capture
     // (useful for debugging or when residency dynamics defeat the
-    // install-time heuristic).
+    // install-time heuristic).  At full-pin (every managed chunk
+    // fits in pool) the scheduler typically returns false so the
+    // cgraph captures normally.
     if (node == nullptr) return false;
-    if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
-        return false;
-    }
-    const ggml_tensor * w = node->src[0];
-    if (w == nullptr || w->name[0] == '\0') return false;
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return false;
-    if (!g_runtime->is_managed_name(w->name)) return false;
     static const bool force_eager = []() {
         const char * e = std::getenv("STREAMLLM_FORCE_EAGER");
         return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
     }();
-    if (force_eager) return true;
-    return !g_runtime->can_pin_all_managed();
+    if (force_eager) {
+        // Force-eager only matters if the scheduler claims the node at
+        // all; otherwise capture is fine even when we'd disable
+        // ourselves on a "we own this" basis.
+        return g_runtime->scheduler().claims_node(node);
+    }
+    return g_runtime->scheduler().claims_node(node);
 }
 
 extern "C" bool streamllm_claims_tensor(const struct ggml_tensor * w) {
-    if (w == nullptr || w->name[0] == '\0') return false;
+    // Fusion-skip predicate. Delegate to the scheduler — it decides
+    // which weight tensors must opt out of ggml-cuda's fused-subgraph
+    // paths so the streamllm per-op dispatch can claim the underlying
+    // mul_mat. Scheduler-agnostic.
+    if (w == nullptr) return false;
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return false;
-    // The default rule — managed-by-name — opts every managed tensor
-    // out of upstream's fused-subgraph paths so the streamllm hook
-    // can claim the underlying mul_mat. Concrete schedulers don't
-    // currently override this beyond the name set.
-    return g_runtime->is_managed_name(w->name);
+    return g_runtime->scheduler().claims_tensor(w);
 }
 
 // /streamllm/stats accessors — pool-tier counters always tracked
@@ -272,15 +267,17 @@ void clear() {
 
 // ---- ggml-cuda extern "C" entry points --------------------------------
 //
-// All four are thin shims: they look up the active runtime, then route
-// through Scheduler::handle_* so the scheduler is architecturally in
-// the dispatch path. MoEScheduler's overrides land in
-// qwen3/qwen3_moe_dispatch.cpp.
+// Scheduler-agnostic: each thin shim looks up the active runtime and
+// delegates to a Scheduler virtual.  No qwen3:: namespace types in this
+// path — adding a new Scheduler subclass (KV-cache attention, dense
+// chunked matmul) needs no changes here.  Per-op dispatch routes to
+// Scheduler::dispatch_node with the destination ggml_tensor (operand
+// info is reachable via node->src[]).
 
 extern "C" bool streamllm_try_cuda_mul_mat(
     cudaStream_t stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
+    const struct ggml_tensor * /*src0*/,
+    const struct ggml_tensor * /*src1*/,
     struct ggml_tensor * dst)
 {
     StreamllmRuntime * rt = nullptr;
@@ -289,8 +286,7 @@ extern "C" bool streamllm_try_cuda_mul_mat(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return qwen3::scheduler_handle_mul_mat(
-        rt->scheduler(), (StreamHandle) stream, src0, src1, dst);
+    return rt->scheduler().dispatch_node((StreamHandle) stream, dst);
 }
 
 extern "C" void streamllm_topk_moe_observed(
@@ -305,15 +301,15 @@ extern "C" void streamllm_topk_moe_observed(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return;
-    qwen3::scheduler_on_topk_moe_observed(
-        rt->scheduler(), (StreamHandle) stream, logits, weights, ids);
+    rt->scheduler().observe_topk_moe(
+        (StreamHandle) stream, logits, weights, ids);
 }
 
 extern "C" bool streamllm_try_cuda_mul_mat_id(
     cudaStream_t stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * ids,
+    const struct ggml_tensor * /*src0*/,
+    const struct ggml_tensor * /*src1*/,
+    const struct ggml_tensor * /*ids*/,
     struct ggml_tensor * dst)
 {
     StreamllmRuntime * rt = nullptr;
@@ -322,8 +318,7 @@ extern "C" bool streamllm_try_cuda_mul_mat_id(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return qwen3::scheduler_handle_mul_mat_id(
-        rt->scheduler(), (StreamHandle) stream, src0, src1, ids, dst);
+    return rt->scheduler().dispatch_node((StreamHandle) stream, dst);
 }
 
 // Graph-compute pre/post hooks. Fire at the top and bottom of
@@ -341,13 +336,9 @@ extern "C" void streamllm_graph_compute_begin(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return;
-    // Snapshot the score table once per replay so every managed
-    // dispatch in this token sees the same dial value (the host-fn
-    // reads ``rt->current_replay_score_table()`` from inside its
-    // plan()). Set/get on the scheduler is mutex-guarded so this
-    // grabs a consistent view at this instant.
-    rt->set_replay_score_table(
-        qwen3::scheduler_score_thresholds_snapshot(rt->scheduler()));
+    // The scheduler owns its per-replay state — score-table
+    // snapshot, residency reservations, anything else routing-
+    // dependent — and seeds it from on_graph_compute_begin.
     rt->scheduler().on_graph_compute_begin((StreamHandle) stream, cgraph);
 }
 
@@ -362,10 +353,10 @@ extern "C" void streamllm_graph_compute_end(
     }
     if (rt == nullptr) return;
     rt->scheduler().on_graph_compute_end((StreamHandle) stream, cgraph);
-    // Drop replay-scoped chunk reservations now that the captured
-    // graph for this token has finished executing. The next replay's
-    // host-fn callbacks rebuild them from scratch.
-    rt->clear_replay_reservations();
+    // Drop replay-scoped chunk reservations.  Scheduler-owned now;
+    // the default base-class clear_replay_reservations is a no-op
+    // for schedulers that don't keep replay state.
+    rt->scheduler().clear_replay_reservations();
 }
 
 } // namespace streamllm_ext

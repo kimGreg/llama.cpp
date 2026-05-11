@@ -88,11 +88,12 @@ public:
     //
     // Two reservation sources are honoured: this tracker's local
     // ``reserved_`` set (legacy hook-window dispatch reservation) AND
-    // the runtime's replay-scoped ``is_replay_reserved`` set populated
-    // before each captured load batch.  Replay reservations protect
-    // the in-flight dispatch's freshly-loaded chunks across the rest
-    // of the captured replay, so a later layer's planner can't evict
-    // chunks the earlier layer's kernel is still about to read.
+    // the scheduler's replay-scoped ``is_replay_reserved`` set
+    // (P2★: moved off the runtime onto the scheduler).  Replay
+    // reservations protect the in-flight dispatch's freshly-loaded
+    // chunks across the rest of the captured replay, so a later
+    // layer's planner can't evict chunks the earlier layer's kernel
+    // is still about to read.
     //
     // Eviction MUST clear the entry's per-plane device-pointer slot
     // (dev.chunk_qw_ptrs[p] / chunk_alpha_ptrs[p]) so the kernel
@@ -101,7 +102,9 @@ public:
     // ``rt->clear_chunk_device_ptr(wid, cid)`` — without it, kernel
     // outputs go subtly wrong under heavy eviction (the model still
     // generates tokens but at degraded / corrupted quality).
-    bool make_room(VramChunkPool & pool, StreamllmRuntime & rt) {
+    bool make_room(VramChunkPool & pool,
+                    StreamllmRuntime & rt,
+                    const Scheduler & sched) {
         std::lock_guard<std::mutex> lk(mu_);
         const uint64_t now = touch_ts_;
         int    best_p   = -1;
@@ -111,7 +114,7 @@ public:
             auto & bucket = buckets_[p];
             for (auto it = bucket.begin(); it != bucket.end(); ++it) {
                 if (reserved_.count(*it)) continue;
-                if (rt.is_replay_reserved(it->wid, it->cid)) continue;
+                if (sched.is_replay_reserved(it->wid, it->cid)) continue;
                 auto ix = index_.find(*it);
                 if (ix == index_.end()) continue;  // defensive
                 const uint64_t age = now - ix->second.last_touch_ts;

@@ -169,6 +169,62 @@ public:
         return false;
     }
 
+    // ─── Per-node claim + dispatch (P2★) ───────────────────────────
+    //
+    // The two-virtual contract that ggml-cuda's per-op hooks delegate
+    // to. Concrete schedulers override one or both to claim cgraph
+    // nodes whose dispatch they want to handle, replacing the stock
+    // ggml-cuda op handler with their own kernel sequence.
+    //
+    // claims_node: cheap predicate, called by ggml-cuda's
+    //   user_node_claims hook before deciding whether to capture this
+    //   cgraph into a cuda-graph (a true return forces eager).
+    // dispatch_node: heavy dispatch, called from the per-op hooks
+    //   (streamllm_try_cuda_mul_mat[_id]) when ggml-cuda is about to
+    //   execute a node. Return true to mean "I handled this; skip
+    //   stock dispatch"; false to fall through.
+    // claims_tensor: legacy fusion-skip predicate. Asked of the
+    //   weight tensor whenever ggml-cuda is about to fold a mul_mat
+    //   into a fused subgraph — returning true keeps the mul_mat in
+    //   the regular dispatch path so the scheduler's per-op handler
+    //   can claim it. Defaults to consulting claims_node for the
+    //   adjacent mul_mat node would require synthetic ggml_tensors;
+    //   subclasses override directly.
+    // observe_topk_moe: notification fired before ggml-cuda's fused
+    //   topk_moe kernel runs, letting the scheduler stash the
+    //   (logits, weights, ids) handles for later use. No dispatch
+    //   replacement; the topk_moe op still runs.
+    //
+    // All four default to "this scheduler doesn't care" so a
+    // non-overriding subclass works correctly.
+    virtual bool claims_node(const struct ggml_tensor * /*node*/) const {
+        return false;
+    }
+    virtual bool dispatch_node(StreamHandle               /*stream*/,
+                                const struct ggml_tensor * /*node*/) {
+        return false;
+    }
+    virtual bool claims_tensor(const struct ggml_tensor * /*w*/) const {
+        return false;
+    }
+    virtual void observe_topk_moe(StreamHandle               /*stream*/,
+                                   const struct ggml_tensor * /*logits*/,
+                                   struct ggml_tensor *       /*weights*/,
+                                   struct ggml_tensor *       /*ids*/) {}
+
+    // ─── Per-replay state (P2★) ────────────────────────────────────
+    //
+    // Schedulers that need per-replay state (e.g. routing reservations
+    // a captured kernel reads through replays) own it themselves
+    // rather than the runtime acting as a model-specific staging area.
+    // Defaults are no-op so a scheduler with no per-replay concerns
+    // pays nothing.
+    virtual void add_replay_reservations(
+        const std::vector<ChunkKey> & /*v*/) {}
+    virtual bool is_replay_reserved(
+        const std::string & /*wid*/, int /*cid*/) const { return false; }
+    virtual void clear_replay_reservations() {}
+
     // Human-readable identifier for log lines.
     virtual const char * name() const = 0;
 };

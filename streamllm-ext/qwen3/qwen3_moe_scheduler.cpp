@@ -192,6 +192,15 @@ public:
                     const StreamReader & reader,
                     const std::string & gguf_path) override {
         rt_ = &rt;
+        // Snapshot every managed name (chunked synthetic wids AND
+        // placeholder-only canonicals).  claims_tensor / claims_node /
+        // dispatch_node consult this set.  Used to live as
+        // StreamllmRuntime::managed_names_ but moved here in P2★
+        // because "which tensors does this scheduler claim" is a
+        // scheduler-policy fact, not a runtime fact.
+        for (const auto & name : reader.managed_tensor_names()) {
+            managed_names_.insert(name);
+        }
         // No install-time plane pinning: every chunk loads on demand.
         //
         // Score-table semantics:
@@ -640,8 +649,9 @@ public:
         // succeeds or this returns false. Passing rt_ lets the tracker
         // also clear the entry's per-plane device-pointer slot so the
         // kernel doesn't read stale memory after the freed VRAM slot
-        // gets reused.
-        return tracker_.make_room(pool, *rt_);
+        // gets reused. ``*this`` carries the replay-reservation set
+        // the tracker consults to skip chunks still in-flight.
+        return tracker_.make_room(pool, *rt_, *this);
     }
 
     void reserve_for_dispatch(const std::string & wid, int cid) {
@@ -744,34 +754,89 @@ public:
 
     const char * name() const override { return "moe"; }
 
-    // ── ggml-cuda hook handlers ──────────────────────────────────
-    // Reached via the qwen3::scheduler_handle_* free-function shims
-    // (qwen3_moe_scheduler.h). Dispatch bodies live in
-    // qwen3/qwen3_moe_dispatch.cpp.
-    bool handle_mul_mat(StreamHandle stream,
-                         const struct ggml_tensor * src0,
-                         const struct ggml_tensor * src1,
-                         struct ggml_tensor *       dst) {
-        return moe_dispatch::handle_mul_mat_impl(
-            (cudaStream_t)stream, src0, src1, dst);
+    // ── ggml-cuda hook handlers (Scheduler virtuals) ──────────────
+    // Per-node dispatch is routed through the Scheduler base via
+    // claims_node + dispatch_node; this scheduler claims managed
+    // MUL_MAT / MUL_MAT_ID nodes and dispatches them through the
+    // existing per-op implementations in qwen3_moe_dispatch.cpp.
+
+    bool claims_node(const struct ggml_tensor * node) const override {
+        if (node == nullptr) return false;
+        if (node->op != GGML_OP_MUL_MAT &&
+            node->op != GGML_OP_MUL_MAT_ID) {
+            return false;
+        }
+        const ggml_tensor * w = node->src[0];
+        if (w == nullptr || w->name[0] == '\0') return false;
+        if (managed_names_.count(w->name) == 0) return false;
+        // Don't claim for capture purposes when every chunk fits the
+        // pool — at full pin, the captured replay reads stable plane
+        // pointers and we want the cuda-graph speedup.
+        if (rt_ != nullptr && rt_->can_pin_all_managed()) return false;
+        return true;
     }
-    bool handle_mul_mat_id(StreamHandle stream,
-                            const struct ggml_tensor * src0,
-                            const struct ggml_tensor * src1,
-                            const struct ggml_tensor * ids,
-                            struct ggml_tensor *       dst) {
-        return moe_dispatch::handle_mul_mat_id_impl(
-            (cudaStream_t)stream, src0, src1, ids, dst);
-    }
-    void on_topk_moe_observed(StreamHandle stream,
-                               const struct ggml_tensor * logits,
-                               struct ggml_tensor *       weights,
-                               struct ggml_tensor *       ids) {
-        moe_dispatch::on_topk_moe_observed_impl(
-            (cudaStream_t)stream, logits, weights, ids);
-    }
-    bool claims_tensor(const struct ggml_tensor * /*w*/) {
+
+    bool dispatch_node(StreamHandle stream,
+                        const struct ggml_tensor * node) override {
+        if (node == nullptr) return false;
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (src0 == nullptr || src0->name[0] == '\0') return false;
+        if (managed_names_.count(src0->name) == 0) return false;
+        // ``node`` is the destination tensor (the op's output). The
+        // legacy per-op impls take the operands plus dst by name; we
+        // rebuild that signature here.  ggml stores the operands at
+        // src[0..N]; the dst is the node itself (= ``node``).
+        ggml_tensor * dst = const_cast<ggml_tensor *>(node);
+        if (node->op == GGML_OP_MUL_MAT) {
+            return moe_dispatch::handle_mul_mat_impl(
+                (cudaStream_t) stream, src0, src1, dst);
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const ggml_tensor * ids = node->src[2];
+            return moe_dispatch::handle_mul_mat_id_impl(
+                (cudaStream_t) stream, src0, src1, ids, dst);
+        }
         return false;
+    }
+
+    bool claims_tensor(const struct ggml_tensor * w) const override {
+        // Fusion-skip: opt every managed weight out of ggml-cuda's
+        // fused-subgraph paths so the per-op dispatch can claim them.
+        if (w == nullptr || w->name[0] == '\0') return false;
+        return managed_names_.count(w->name) != 0;
+    }
+
+    void observe_topk_moe(StreamHandle               stream,
+                           const struct ggml_tensor * logits,
+                           struct ggml_tensor *       weights,
+                           struct ggml_tensor *       ids) override {
+        moe_dispatch::on_topk_moe_observed_impl(
+            (cudaStream_t) stream, logits, weights, ids);
+    }
+
+    // ── Per-replay state (Scheduler virtuals) ─────────────────────
+    // Replay reservations protect chunks against eviction across the
+    // current cgraph_compute pass. Make_room consults
+    // is_replay_reserved before picking a victim.
+    void add_replay_reservations(
+        const std::vector<ChunkKey> & v) override {
+        if (v.empty()) return;
+        std::lock_guard<std::mutex> lk(replay_reservations_mu_);
+        for (const auto & k : v) {
+            replay_reservations_.emplace(
+                k.wid + "#" + std::to_string(k.cid));
+        }
+    }
+    bool is_replay_reserved(const std::string & wid,
+                             int cid) const override {
+        std::lock_guard<std::mutex> lk(replay_reservations_mu_);
+        return replay_reservations_.count(
+            wid + "#" + std::to_string(cid)) != 0;
+    }
+    void clear_replay_reservations() override {
+        std::lock_guard<std::mutex> lk(replay_reservations_mu_);
+        replay_reservations_.clear();
     }
 
     // ── Graph-compute prewalk ────────────────────────────────────
@@ -788,6 +853,11 @@ public:
                                  const struct ggml_cgraph * cgraph) override {
         if (rt_ == nullptr || cgraph == nullptr) return;
 
+        // Snapshot the score table once per cgraph_compute so every
+        // managed dispatch in this token sees the same dial value
+        // even if a live ``set_score_table`` call lands mid-token.
+        rt_->set_replay_score_table(score_thresholds_snapshot());
+
         instr_.on_graph_begin(cgraph);
 
         if (const char * dbg = getenv("STREAMLLM_DEBUG_GRAPH_WALK")) {
@@ -803,13 +873,13 @@ public:
                     if (node->op == GGML_OP_MUL_MAT) {
                         ++n_mul_mat;
                         const ggml_tensor * w = node->src[0];
-                        if (w && w->name[0] && rt_->is_managed_name(w->name)) {
+                        if (w && w->name[0] && managed_names_.count(w->name)) {
                             ++n_managed_mm;
                         }
                     } else if (node->op == GGML_OP_MUL_MAT_ID) {
                         ++n_mul_mat_id;
                         const ggml_tensor * w = node->src[0];
-                        if (w && w->name[0] && rt_->is_managed_name(w->name)) {
+                        if (w && w->name[0] && managed_names_.count(w->name)) {
                             ++n_managed_mmid;
                         }
                     }
@@ -1011,6 +1081,22 @@ private:
     std::unordered_map<std::string, MoeExpertTable> moe_tables_;
     std::mutex moe_tables_mu_;
 
+    // Tensor-name set populated at on_install — every managed
+    // tensor (chunked synthetic wids AND placeholder-only
+    // canonicals).  Read by claims_tensor / claims_node /
+    // dispatch_node.  Replaces the moved-off `is_managed_name`
+    // surface that used to live on StreamllmRuntime.
+    std::unordered_set<std::string> managed_names_;
+
+    // Replay-scoped chunk reservations. Populated by the dispatch
+    // path as it commits to loading chunks; consulted by make_room
+    // via the tracker's is_replay_reserved check; cleared at
+    // graph_compute_end.  Belongs to the scheduler (not the
+    // runtime) because the routing-decision semantics are MoE-
+    // specific.
+    std::unordered_set<std::string>          replay_reservations_;
+    mutable std::mutex                       replay_reservations_mu_;
+
     // Per-canonical MoEMatMulComp.  Built eagerly at install once the
     // per-canonical MoeExpertTable + e0 device layout are known.  The
     // dispatch shim calls ``scheduler_lookup_moe_comp(canonical)`` to
@@ -1124,44 +1210,6 @@ void scheduler_on_managed_node_visit(
     auto & m = as_moe(sched);
     if (!m.instrumenter().is_ready()) return;
     m.instrumenter().on_managed_node_visit(dst, sched, (void *) compute_stream);
-}
-
-bool scheduler_handle_mul_mat(
-    Scheduler &                sched,
-    StreamHandle               stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    struct ggml_tensor *       dst)
-{
-    return as_moe(sched).handle_mul_mat(stream, src0, src1, dst);
-}
-
-bool scheduler_handle_mul_mat_id(
-    Scheduler &                sched,
-    StreamHandle               stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * ids,
-    struct ggml_tensor *       dst)
-{
-    return as_moe(sched).handle_mul_mat_id(stream, src0, src1, ids, dst);
-}
-
-void scheduler_on_topk_moe_observed(
-    Scheduler &                sched,
-    StreamHandle               stream,
-    const struct ggml_tensor * logits,
-    struct ggml_tensor *       weights,
-    struct ggml_tensor *       ids)
-{
-    as_moe(sched).on_topk_moe_observed(stream, logits, weights, ids);
-}
-
-bool scheduler_claims_tensor(
-    Scheduler &                sched,
-    const struct ggml_tensor * w)
-{
-    return as_moe(sched).claims_tensor(w);
 }
 
 std::vector<float> scheduler_score_thresholds_snapshot(const Scheduler & sched) {

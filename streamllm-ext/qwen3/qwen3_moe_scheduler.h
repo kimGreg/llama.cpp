@@ -81,32 +81,13 @@ void scheduler_on_managed_node_visit(
     const struct ggml_tensor * dst,
     StreamHandle               compute_stream);
 
-// ─── ggml-cuda extern-C shim forwarders ────────────────────────────
-// The shims in qwen3/qwen3_runtime_glue.cpp dispatch to these to keep core
-// from having to know about MoEScheduler's vtable. Each is a thin
-// downcast wrapper.
-bool scheduler_handle_mul_mat(
-    Scheduler &                sched,
-    StreamHandle               stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    struct ggml_tensor *       dst);
-bool scheduler_handle_mul_mat_id(
-    Scheduler &                sched,
-    StreamHandle               stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * ids,
-    struct ggml_tensor *       dst);
-void scheduler_on_topk_moe_observed(
-    Scheduler &                sched,
-    StreamHandle               stream,
-    const struct ggml_tensor * logits,
-    struct ggml_tensor *       weights,
-    struct ggml_tensor *       ids);
-bool scheduler_claims_tensor(
-    Scheduler &                sched,
-    const struct ggml_tensor * w);
+// (P2★) The previous per-op extern-C shim forwarders
+// scheduler_handle_mul_mat / _id, scheduler_on_topk_moe_observed,
+// scheduler_claims_tensor have been removed.  Each was a downcast
+// wrapper for what is now a Scheduler virtual; the per-op extern-C
+// entries in qwen3_runtime_glue.cpp call ``Scheduler::claims_node``
+// / ``Scheduler::dispatch_node`` / ``Scheduler::observe_topk_moe`` /
+// ``Scheduler::claims_tensor`` directly.
 
 // ─── Live precision dial accessors ─────────────────────────────────
 // Score-table snapshot + replace, used by qwen3/qwen3_runtime_glue.cpp's

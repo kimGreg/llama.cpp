@@ -105,11 +105,8 @@ public:
     void install(const StreamReader & reader,
                  const std::string & gguf_path);
 
-    // True iff ``name`` is a managed tensor (chunked OR placeholder-only).
-    // Used by the fusion-skip hook to opt managed canonicals out of
-    // upstream's fused MoE kernels — without this, fused FFN kernels
-    // read src0_exps directly and dereference the seed pointer.
-    bool is_managed_name(const std::string & name) const;
+    // (P2★) ``is_managed_name`` removed — scheduler-policy concern,
+    // moved to ``Scheduler::claims_tensor`` (consult that directly).
 
     // --- primitives -----------------------------------------------------
 
@@ -252,7 +249,6 @@ private:
     std::unique_ptr<VramChunkPool> pool_;
     std::unique_ptr<Scheduler>     scheduler_;
     std::unordered_map<std::string, Entry> entries_;
-    std::unordered_set<std::string>        managed_names_;
     std::unique_ptr<NaverKernelScratch> gemv_scratch_;  // decode hot-path scratch
     std::string                    gguf_path_;     // stashed at install for SSD-streaming preads
 
@@ -346,20 +342,11 @@ public:
     // Number of async-load worker threads (0 = disabled).
     int  io_worker_count() const { return (int)io_workers_.size(); }
 
-    // Replay-scoped chunk reservation. Cleared in graph_compute_end.
-    // The loader treats reserved chunks as non-evictable for the
-    // remainder of the replay so the captured kernel for layer N
-    // can finish reading its plane pointers before layer N+1's
-    // planner evicts them.
-    void add_replay_reservations(const std::vector<ChunkKey> & v);
-    bool is_replay_reserved(const std::string & wid, int cid) const;
-    void clear_replay_reservations();
-
-    // Score-table snapshot taken once per replay in
-    // ``streamllm_graph_compute_begin``. Computations that depend on
-    // the dial read this snapshot inside their plan() method so the
-    // dial value is consistent across all managed dispatches in the
-    // same replay.
+    // Score-table snapshot taken once per cgraph_compute by the
+    // scheduler's ``on_graph_compute_begin``. Computations that
+    // depend on the live dial read this snapshot during their plan()
+    // so the dial value is consistent across all managed dispatches
+    // in the same compute pass.
     void                       set_replay_score_table(std::vector<float> snap);
     const std::vector<float> & current_replay_score_table() const;
 
@@ -367,13 +354,8 @@ private:
     bool installed_ = false;
     bool can_pin_all_managed_ = false;
 
-    // Replay-scoped reservations. Mutated under replay_reservations_mu_.
-    // is_replay_reserved is read-only under the same mutex from worker
-    // threads computing eviction sets.
-    std::unordered_set<std::string>          replay_reservations_;  // "wid#cid"
-    mutable std::mutex                       replay_reservations_mu_;
-
-    // Score-table snapshot, refreshed in graph_compute_begin.
+    // Score-table snapshot, refreshed by the scheduler in
+    // on_graph_compute_begin.
     std::vector<float>                       replay_score_table_;
     mutable std::mutex                       replay_score_table_mu_;
 };

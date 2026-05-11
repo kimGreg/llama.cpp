@@ -148,14 +148,7 @@ void StreamllmRuntime::install(const StreamReader & reader,
         throw std::runtime_error(
             "StreamllmRuntime: already installed; each instance handles one GGUF");
     }
-    // Snapshot every managed name (chunked synthetic wids AND
-    // placeholder-only canonicals) so claims_tensor can answer
-    // ``is this tensor under our control?`` for the fusion-skip hook.
-    // Without canonicals in this set, the fused MoE kernels read
-    // src0_exps directly and dereference the seed pointer.
-    for (const auto & name : reader.managed_tensor_names()) {
-        managed_names_.insert(name);
-    }
+    // (P2★) managed_names_ snapshot moved to the scheduler.
     gguf_path_ = gguf_path;
 
     // Open the GGUF once for SSD-streaming preads. fd lives until the
@@ -295,10 +288,6 @@ void StreamllmRuntime::install(const StreamReader & reader,
     }
 
     installed_ = true;
-}
-
-bool StreamllmRuntime::is_managed_name(const std::string & name) const {
-    return managed_names_.count(name) != 0;
 }
 
 void StreamllmRuntime::register_layout(const std::string & wid,
@@ -930,25 +919,6 @@ void StreamllmRuntime::io_worker_loop_() {
 // Replay-scoped state — score-table snapshot + chunk reservations cleared
 // at the end of each graph_compute pass.
 // ---------------------------------------------------------------------------
-
-void StreamllmRuntime::add_replay_reservations(const std::vector<ChunkKey> & v) {
-    if (v.empty()) return;
-    std::lock_guard<std::mutex> lk(replay_reservations_mu_);
-    replay_reservations_.reserve(replay_reservations_.size() + v.size());
-    for (const auto & k : v) {
-        replay_reservations_.emplace(k.wid + "#" + std::to_string(k.cid));
-    }
-}
-
-bool StreamllmRuntime::is_replay_reserved(const std::string & wid, int cid) const {
-    std::lock_guard<std::mutex> lk(replay_reservations_mu_);
-    return replay_reservations_.count(wid + "#" + std::to_string(cid)) != 0;
-}
-
-void StreamllmRuntime::clear_replay_reservations() {
-    std::lock_guard<std::mutex> lk(replay_reservations_mu_);
-    replay_reservations_.clear();
-}
 
 void StreamllmRuntime::set_replay_score_table(std::vector<float> snap) {
     std::lock_guard<std::mutex> lk(replay_score_table_mu_);

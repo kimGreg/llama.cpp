@@ -635,7 +635,11 @@ bool handle_mul_mat_id_impl(
     if (!g_runtime) return false;
 
     const std::string canonical(src0->name);
-    if (!g_runtime->is_managed_name(canonical)) return false;
+    // Scheduler decides if this canonical is claimed; we don't query a
+    // runtime-side managed_names set anymore (P2★ moved that onto the
+    // scheduler). We use the same src0 tensor object — claims_tensor
+    // is exactly the predicate we want.
+    if (!g_runtime->scheduler().claims_tensor(src0)) return false;
     if (g_runtime->layout(canonical + ":e0") == nullptr) return false;
 
     qwen3::MoEMatMulComp * comp =
