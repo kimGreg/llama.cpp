@@ -749,32 +749,19 @@ bool handle_mul_mat_id_impl(
     qwen3::MoEOutput out;
     out.dst = dst;
 
-    // Default eager dispatch: inline-load chunks + direct execute().
+    // Eager dispatch: pre_inputs D2H + host-side plan + worker-pool
+    // chunk loads + per-chunk wait_on_stream + comp.execute().
     //
-    // We bypass ``Runtime::run``'s host-fn-driven path under eager
-    // mode because the cuda-driver-threading constraints around
-    // cudaLaunchHostFunc + cross-stream cudaStreamWaitEvent
-    // synchronisation are still being worked out (Step 3 hardening).
-    // The plan body still needs ids/probs/weights, so we issue the
-    // pre_inputs D2H, sync to ensure the pinned buffers land, run
-    // plan() on the host, fan out the load_set via the existing
-    // worker-thread move_chunk path (which lives in
-    // io_worker_loop_), and sync copy_stream so the kernel sees
-    // up-to-date plane pointers before launch.
-    //
-    // Set STREAMLLM_USE_HOSTFN_DISPATCH=1 to opt in to the future
-    // ``Runtime::run`` host-fn path (currently incomplete: works at
-    // generous cap, deadlocks at tight cap because workers' CUDA
-    // ops contend with the driver-internal thread that runs the
-    // host-fn body).
-    const bool use_hostfn = std::getenv("STREAMLLM_USE_HOSTFN_DISPATCH") != nullptr;
-    if (use_hostfn) {
-        g_runtime->run(*comp, in, out, (StreamHandle) stream);
-        if (std::getenv("STREAMLLM_DISPATCH_SYNC") != nullptr) {
-            cudaStreamSynchronize(stream);
-        }
-        return true;
-    }
+    // The earlier `cudaLaunchHostFunc`-based path (zesty-questing-hippo
+    // Step 1's `Runtime::run`) was retired in P4 of
+    // vigilant-stitching-heron: the host-fn body deadlocks against
+    // copy_stream event processing on the CUDA driver-internal thread,
+    // and the captured cudaStreamWaitEvent semantics over a same-handle
+    // event re-recorded each replay don't give per-replay ordering.
+    // Partial capture (the P1 user_node_claims hook) is the correct
+    // integration point: at tight cap capture is disabled and this
+    // eager path runs directly; at full pin capture is engaged and the
+    // shorter capture branch below handles dispatch.
 
     // Under cuda-graph capture the claims hook should have disabled
     // capture (returns true at tight cap), but at full pin where the

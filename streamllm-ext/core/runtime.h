@@ -302,18 +302,6 @@ private:
         // by the global ``io_in_flight_`` counter that
         // ``wait_async_load_idle`` polls.
         std::shared_ptr<std::atomic<uint32_t>> batch_remaining;
-        // false = load (the existing path: pread → H2D via move_chunk).
-        // true  = evict (calls pool.evict + clear_chunk_device_ptr; uses
-        //                a CUDA kernel via after_evict so it must run on
-        //                the worker thread, not from the host-fn body).
-        bool         is_evict = false;
-        // If set on the request that decrements ``batch_remaining`` to
-        // zero, the worker records this event on the pool's copy_stream
-        // after its job finishes. This is how Runtime::run wires the
-        // host-fn → captured-stream-wait handoff without ever calling
-        // CUDA APIs from the host-fn body itself. Every request in a
-        // batch carries the same value; only the LAST decrementer acts.
-        cudaEvent_t  batch_ready_event = nullptr;
     };
     std::vector<std::thread>           io_workers_;
     std::mutex                         io_mu_;
@@ -358,28 +346,6 @@ public:
     // Number of async-load worker threads (0 = disabled).
     int  io_worker_count() const { return (int)io_workers_.size(); }
 
-    // ---------------------------------------------------------------
-    // Universal chunked-load + compute lifecycle (eager + cuda-graph).
-    //
-    // ``run`` is the single entry point hooks should use. It emits
-    // the captured-style sequence on ``stream``:
-    //
-    //   [1]  cudaMemcpyAsync(D2H)   each entry of comp.pre_inputs(in)
-    //   [2]  cudaLaunchHostFunc     runtime_chunked_load_cb(state)
-    //   [3]  cudaStreamWaitEvent    waits on state.ready_event
-    //   [4]  comp.execute(in, out, stream)
-    //
-    // Under cuda-graph capture, [1]–[4] become graph nodes; the host
-    // node [2] runs on every replay. Outside capture they are queued
-    // on the stream as ordinary async work; the host node still runs
-    // when the stream reaches it. Same code, same node types, same
-    // order. No cudaStreamIsCapturing branch in the dispatch path.
-    // ---------------------------------------------------------------
-    void run(ChunkedComputation & comp,
-             const ComputationInput & in,
-             ComputationOutput & out,
-             StreamHandle stream);
-
     // Replay-scoped chunk reservation. Cleared in graph_compute_end.
     // The loader treats reserved chunks as non-evictable for the
     // remainder of the replay so the captured kernel for layer N
@@ -397,47 +363,9 @@ public:
     void                       set_replay_score_table(std::vector<float> snap);
     const std::vector<float> & current_replay_score_table() const;
 
-    // IoWorkerPool extension: submit a batch of (loads + evictions)
-    // and record ``ready_event`` on the pool's copy_stream after the
-    // batch's last job finishes. From a host-fn body, callers issue
-    // this then wait via wait_async_load_batch — both are pure host
-    // (no CUDA APIs). The worker thread is the only place that
-    // issues cudaEventRecord.
-    //
-    // - ``batch`` must be a fresh shared_ptr<atomic<u32>>{0}; this
-    //   method bumps it once per request and the workers decrement.
-    // - ``ready_event`` must be a pre-allocated event that lives
-    //   beyond all replays of this comp.
-    bool submit_load_batch_with_event(
-        const std::vector<ChunkKey> &                  evict_set,
-        const std::vector<ChunkKey> &                  load_set,
-        std::shared_ptr<std::atomic<uint32_t>>         batch,
-        cudaEvent_t                                    ready_event);
-
 private:
-    // Per-ChunkedComputation runtime state keyed by ``comp.state_key()``.
-    // Holds the cuda event the host-fn records via the loader, plus
-    // a side-channel pointer to the current ComputationInput so the
-    // host-fn can read it without taking userdata that drifts across
-    // capture/replay.
-    struct ChunkedCompState {
-        StreamllmRuntime *        runtime    = nullptr;
-        ChunkedComputation *      comp       = nullptr;
-        cudaEvent_t               ready_event = nullptr;
-        const ComputationInput *  cached_input = nullptr;
-        // Reused across replays; fresh batch counter created per dispatch.
-        std::shared_ptr<std::atomic<uint32_t>> batch;
-    };
-
-    ChunkedCompState & ensure_state(ChunkedComputation & comp);
-
     bool installed_ = false;
     bool can_pin_all_managed_ = false;
-
-    // Per-comp state map. Allocated lazily by ensure_state on first
-    // dispatch; entries persist until clear() / dtor.
-    std::unordered_map<std::string, ChunkedCompState> comp_state_;
-    std::mutex                                         comp_state_mu_;
 
     // Replay-scoped reservations. Mutated under replay_reservations_mu_.
     // is_replay_reserved is read-only under the same mutex from worker
@@ -448,20 +376,6 @@ private:
     // Score-table snapshot, refreshed in graph_compute_begin.
     std::vector<float>                       replay_score_table_;
     mutable std::mutex                       replay_score_table_mu_;
-
-    // Friend the host-fn callback so it can poke ChunkedCompState.
-    friend void runtime_chunked_load_cb(void * userdata) noexcept;
 };
-
-// Host function fired by Runtime::run via cudaLaunchHostFunc. Pure
-// host — NO CUDA API CALLS. Reads the comp's pinned input buffers,
-// invokes comp.plan(in), submits the resulting load/evict batch to
-// the IoWorkerPool with a trailing event-record, blocks until the
-// worker has recorded the ready_event, and adds the load_set to the
-// runtime's replay reservations.
-//
-// Declared with C linkage so cudaLaunchHostFunc accepts its address
-// as a cudaHostFn_t (typedef-d in cuda_runtime.h with C linkage).
-void runtime_chunked_load_cb(void * userdata) noexcept;
 
 } // namespace streamllm_ext
