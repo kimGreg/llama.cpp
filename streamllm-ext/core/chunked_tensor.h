@@ -77,8 +77,11 @@ public:
     // Encoder-private post-evict hook: the chunk's VRAM slot has
     // been freed by the pool; subclass clears any pointer-table
     // entry that referenced it so the kernel doesn't read a stale
-    // pointer if the slot is later reused.
-    virtual void after_evict(int chunk_idx)               = 0;
+    // pointer if the slot is later reused.  ``stream`` is the pool's
+    // copy stream when called mid-run (preferred — clear runs async
+    // and overlaps with subsequent loads) or ``nullptr`` on teardown.
+    virtual void after_evict(int chunk_idx,
+                              StreamHandle stream)         = 0;
 };
 
 }  // namespace streamllm_ext

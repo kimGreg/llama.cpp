@@ -173,9 +173,16 @@ UpstreamLayoutHost build_upstream_layout_shortcut(
         }
     };
     out.after_evict_fn = +[](
-        void ** d_qw_ptrs, void ** d_alpha_ptrs, int plane_idx)
+        void ** d_qw_ptrs, void ** d_alpha_ptrs, int plane_idx,
+        StreamHandle stream)
     {
-        anybcq::clear_per_plane_after_evict(d_qw_ptrs, d_alpha_ptrs, plane_idx);
+        if (stream != nullptr) {
+            anybcq::clear_per_plane_after_evict_async(
+                d_qw_ptrs, d_alpha_ptrs, plane_idx, stream);
+        } else {
+            anybcq::clear_per_plane_after_evict(
+                d_qw_ptrs, d_alpha_ptrs, plane_idx);
+        }
     };
 
     return out;

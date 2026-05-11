@@ -135,7 +135,14 @@ public:
         buckets_[best_p].erase(best_it);
         index_.erase(victim);
         pool.evict(victim.wid, victim.cid);
-        rt.clear_chunk_device_ptr(victim.wid, victim.cid);
+        // Clear the per-plane device pointer-table slot async on the
+        // pool's copy_stream (SSOT §6.1.6 step 6).  The worker is
+        // holding ``io_stream_mu_`` so this emission is FIFO-ordered
+        // against subsequent loads on the same stream — the next
+        // chunk that lands in this slot writes a fresh non-null
+        // pointer before any kernel reads through it.
+        rt.clear_chunk_device_ptr(victim.wid, victim.cid,
+                                   pool.copy_stream());
         return true;
     }
 

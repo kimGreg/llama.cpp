@@ -134,8 +134,14 @@ void update_per_plane_after_load_async(void ** d_qw, void ** d_alpha,
 
 // Zero a freed slot after pool eviction so the kernel doesn't read a
 // stale pointer (the slot may have been reused by another chunk).
+// The async variant runs as a 1-thread kernel on the pool's
+// copy_stream — preferred mid-run.  The sync variant is for install
+// teardown where no copy_stream is available.
 void clear_per_plane_after_evict(void ** d_qw, void ** d_alpha,
                                  int plane);
+void clear_per_plane_after_evict_async(void ** d_qw, void ** d_alpha,
+                                       int plane,
+                                       StreamHandle stream);
 
 // Any-prec layout: chunk i packs [n_planes signs | precision_at_chunk α
 // blocks | β]. Writes the n_planes sign pointers at [plane_idx_first..]

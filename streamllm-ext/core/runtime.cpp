@@ -421,7 +421,8 @@ StreamllmRuntime::tensor_anybcq(const std::string & wid) const {
     return it->second.tensor.get();
 }
 
-void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid) {
+void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid,
+                                              StreamHandle stream) {
     if (!cid_is_chunk(cid)) return;
     auto it = entries_.find(wid);
     if (it == entries_.end()) return;
@@ -429,8 +430,9 @@ void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid) 
     // ChunkedTensor::after_evict knows the encoder's chunk_idx →
     // plane_idx mapping (shortcut: identity; any-prec: plane_idx_first
     // off chunk_planes). Routes to the registered encoder callback
-    // internally.
-    it->second.tensor->after_evict(p);
+    // internally.  Caller passes the pool's copy_stream so the clear
+    // is async and ordered against subsequent loads (SSOT §6.1.6 step 6).
+    it->second.tensor->after_evict(p, stream);
 }
 
 void * StreamllmRuntime::small_alloc(size_t bytes) {

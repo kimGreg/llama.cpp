@@ -42,7 +42,8 @@ public:
     void after_load    (int chunk_idx,
                          const void * device_ptr,
                          StreamHandle stream) override;
-    void after_evict   (int chunk_idx) override;
+    void after_evict   (int chunk_idx,
+                         StreamHandle stream) override;
 
     // ─── Encoder-private accessors ─────────────────────────────
     UpstreamLayoutHost &       host()       { return host_; }

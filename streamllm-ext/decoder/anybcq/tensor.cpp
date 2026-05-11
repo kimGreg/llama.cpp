@@ -63,7 +63,7 @@ void AnyBCQFamilyTensor::after_load(int chunk_idx,
                         stream);
 }
 
-void AnyBCQFamilyTensor::after_evict(int chunk_idx) {
+void AnyBCQFamilyTensor::after_evict(int chunk_idx, StreamHandle stream) {
     if (host_.after_evict_fn == nullptr) return;
     // The encoder maps chunk_idx → plane_idx differently per family:
     //   - shortcut: chunk_idx == plane_idx
@@ -74,7 +74,7 @@ void AnyBCQFamilyTensor::after_evict(int chunk_idx) {
         chunk_idx < (int)host_.chunk_planes.size()) {
         plane_idx = host_.chunk_planes[chunk_idx].plane_idx_first;
     }
-    host_.after_evict_fn(d_qw_ptrs_, d_alpha_ptrs_, plane_idx);
+    host_.after_evict_fn(d_qw_ptrs_, d_alpha_ptrs_, plane_idx, stream);
 }
 
 void AnyBCQFamilyTensor::set_device_state(void ** d_qw_ptrs,

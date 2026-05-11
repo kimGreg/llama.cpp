@@ -173,8 +173,12 @@ public:
     // pointer arrays the fused MoE kernel reads, so without this call
     // the kernel keeps using the freed pointer (the slot may have been
     // re-allocated to a different chunk's load), silently corrupting
-    // outputs. q_bias and unknown cids are silently ignored.
-    void clear_chunk_device_ptr(const std::string & wid, int cid);
+    // outputs.  ``stream`` is the pool's copy stream (mid-run) so the
+    // clear runs async and overlaps with subsequent loads, or
+    // ``nullptr`` (teardown).  q_bias and unknown cids are silently
+    // ignored.
+    void clear_chunk_device_ptr(const std::string & wid, int cid,
+                                StreamHandle stream = nullptr);
 
     // Drop a single (wid, cid) chunk's host bytes synchronously. Called
     // by the scheduler under its DRAM-cache LRU mutex when evicting to

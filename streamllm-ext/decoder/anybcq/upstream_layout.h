@@ -76,10 +76,14 @@ using ChunkAfterLoadFn = void (*)(
 // stale pointers if the slot is reused. ``plane_idx`` is the plane
 // in the per-encoder per-tensor index (shortcut: chunk_idx == plane_idx;
 // any-prec: ``host.chunk_planes[chunk_idx].plane_idx_first``).
+//   ``stream`` is the pool's copy stream — clear should be enqueued
+//   async so it overlaps with the worker's other emissions (SSOT
+//   §6.1.6 step 6).  May be null only on teardown.
 using ChunkAfterEvictFn = void (*)(
     void **       d_qw_ptrs,
     void **       d_alpha_ptrs,
-    int           plane_idx);
+    int           plane_idx,
+    StreamHandle  stream);
 
 
 // Host-side layout for one managed tensor. Fields used by both

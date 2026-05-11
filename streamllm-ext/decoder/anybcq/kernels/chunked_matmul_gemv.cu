@@ -204,7 +204,28 @@ void free_per_plane_arrays(void *& d_qw, void *& d_alpha) {
     if (d_alpha) { cudaFree(d_alpha); d_alpha = nullptr; }
 }
 
+namespace {
+__global__ void k_clear_two_ptrs(void ** d_qw, void ** d_alpha, int plane) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        d_qw[plane]    = nullptr;
+        d_alpha[plane] = nullptr;
+    }
+}
+}  // anon
+
+void clear_per_plane_after_evict_async(void ** d_qw, void ** d_alpha,
+                                       int plane,
+                                       StreamHandle stream) {
+    if (d_qw == nullptr || d_alpha == nullptr) return;
+    if (plane < 0) return;
+    auto s = (cudaStream_t) stream;
+    k_clear_two_ptrs<<<1, 1, 0, s>>>(d_qw, d_alpha, plane);
+}
+
 void clear_per_plane_after_evict(void ** d_qw, void ** d_alpha, int plane) {
+    // Synchronous fallback for callers without a copy_stream (install
+    // teardown).  Prefer the async variant on the pool's copy_stream
+    // when an eviction fires mid-run (SSOT §6.1.6 step 6).
     if (d_qw == nullptr || d_alpha == nullptr) return;
     if (plane < 0) return;
     void * null_ptr = nullptr;
