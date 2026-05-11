@@ -867,56 +867,65 @@ void StreamllmRuntime::io_worker_loop_() {
             io_queue_.pop_front();
         }
 
-        try {
-            if (req.is_evict) {
-                // Eviction must run on a worker thread because
-                // pool.evict drives the encoder's after_evict
-                // callback, which issues a CUDA kernel
-                // (clear_per_plane_after_evict) that the host-fn
-                // invoking us cannot call directly.
-                pool_->evict(req.wid, req.cid);
-                clear_chunk_device_ptr(req.wid, req.cid);
-            } else {
-                // Each worker handles one chunk per loop iteration.
-                // Concurrency comes from running multiple workers in
-                // parallel; in-flight SSD reads = n_workers.
-                (void)move_chunk(req.wid, req.cid,
-                                  Tier::RAM, Tier::VRAM,
-                                  /*compute_stream=*/nullptr);
+        // Serialize copy_stream emissions across workers — see
+        // io_stream_mu_'s field doc on runtime.h.  The lock covers
+        // (1) the worker's move_chunk emission, (2) the per-batch
+        // counter decrement, and (3) the trailing batch_ready_event
+        // record.  Holding all three under one lock guarantees:
+        //   - emissions on copy_stream queue in lock-acquire order,
+        //   - the worker that decrements to zero is also the one
+        //     last under the lock, so its batch_ready_event record
+        //     is queued AFTER every other batch worker's emission.
+        // The SSD pread + CPU-side disk→kernel transform inside
+        // move_chunk are still serialized too; pread dominates the
+        // wall time, so the lost worker overlap is a few μs/chunk
+        // vs. the correctness gain (kernel reads up-to-date plane
+        // pointers).
+        bool last_batch = false;
+        {
+            std::lock_guard<std::mutex> stream_lk(io_stream_mu_);
+            try {
+                if (req.is_evict) {
+                    // Eviction must run on a worker thread because
+                    // pool.evict drives the encoder's after_evict
+                    // callback, which issues a CUDA kernel
+                    // (clear_per_plane_after_evict) that the host-fn
+                    // invoking us cannot call directly.
+                    pool_->evict(req.wid, req.cid);
+                    clear_chunk_device_ptr(req.wid, req.cid);
+                } else {
+                    // Each worker handles one chunk per loop iteration.
+                    (void)move_chunk(req.wid, req.cid,
+                                      Tier::RAM, Tier::VRAM,
+                                      /*compute_stream=*/nullptr);
+                }
+            } catch (const std::exception & e) {
+                static std::atomic<uint64_t> err_count{0};
+                uint64_t v = err_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (v < 8 || (v % 100000 == 0)) {
+                    std::fprintf(stderr,
+                        "streamllm-ext: %s worker failed for "
+                        "(%s, %d): %s [err#%lu]\n",
+                        req.is_evict ? "evict" : "load",
+                        req.wid.c_str(), req.cid, e.what(),
+                        (unsigned long)(v + 1));
+                }
             }
-        } catch (const std::exception & e) {
-            static std::atomic<uint64_t> err_count{0};
-            uint64_t v = err_count.fetch_add(1, std::memory_order_relaxed);
-            if (v < 8 || (v % 100000 == 0)) {
-                std::fprintf(stderr,
-                    "streamllm-ext: %s worker failed for "
-                    "(%s, %d): %s [err#%lu]\n",
-                    req.is_evict ? "evict" : "load",
-                    req.wid.c_str(), req.cid, e.what(),
-                    (unsigned long)(v + 1));
+            last_batch = req.batch_remaining
+                ? req.batch_remaining->fetch_sub(
+                      1, std::memory_order_acq_rel) == 1
+                : false;
+            if (last_batch && req.batch_ready_event != nullptr) {
+                cudaStream_t cs = (cudaStream_t) pool_->copy_stream();
+                // copy_stream is non-null whenever the pool was built
+                // with copy_stream=true (the cuda-graphs setup).
+                cudaEventRecord(req.batch_ready_event, cs);
             }
         }
 
         const bool last_global =
             io_in_flight_.fetch_sub(1, std::memory_order_acq_rel) == 1;
-        const bool last_batch = req.batch_remaining
-            ? req.batch_remaining->fetch_sub(1, std::memory_order_acq_rel) == 1
-            : false;
-        // If this request was the last in its batch AND a trailing
-        // event was attached, record it now on the pool's copy_stream.
-        // This is the synchronization the host-fn (which cannot call
-        // CUDA APIs) and the captured stream's wait-event use to
-        // hand off ownership of the just-loaded chunks.
-        if (last_batch && req.batch_ready_event != nullptr) {
-            cudaStream_t cs = (cudaStream_t) pool_->copy_stream();
-            // copy_stream is non-null whenever the pool was built
-            // with copy_stream=true (the cuda-graphs setup).  When
-            // copy_stream is null (synchronous-loads mode) we still
-            // record on the default stream so the host-side wait
-            // doesn't deadlock — the captured wait-event will
-            // simply have a no-op delay.
-            cudaEventRecord(req.batch_ready_event, cs);
-        }
         if (last_global || last_batch) {
             std::lock_guard<std::mutex> lk(io_mu_);
             io_cv_done_.notify_all();
@@ -1104,24 +1113,46 @@ void runtime_chunked_load_cb(void * userdata) noexcept {
     //    reads them and fills the comp's pinned output buffers.
     ChunkPlan p = st->comp->plan(*st->cached_input);
 
-    // 2. Fresh batch counter per dispatch; reuse the slot in state.
+    // 2. Reserve the load_set BEFORE submitting — concurrent loader
+    //    workers consult ``is_replay_reserved`` from inside
+    //    ``make_room_for`` to skip victim candidates that another
+    //    worker in this same batch (or an earlier dispatch in this
+    //    replay) is about to depend on. Reserving the load_set up
+    //    front protects partial in-flight loads, including chunks
+    //    that aren't yet resident — making them un-evictable from
+    //    the moment plan() committed to needing them.
+    st->runtime->add_replay_reservations(p.load_set);
+
+    // 3. Fresh batch counter per dispatch; reuse the slot in state.
     if (!st->batch) st->batch = std::make_shared<std::atomic<uint32_t>>(0);
     else            st->batch->store(0, std::memory_order_relaxed);
 
-    // 3. Submit loads + evictions. The worker that decrements the
+    // 4. Submit loads + evictions. The worker that decrements the
     //    batch counter to zero records ``st->ready_event`` on the
     //    pool's copy_stream — that's the synchronization the captured
     //    cudaStreamWaitEvent (next op) sees.
     st->runtime->submit_load_batch_with_event(
         p.evict_set, p.load_set, st->batch, st->ready_event);
 
-    // 4. Block until the worker has recorded the event. Pure host
-    //    (atomic + condvar); no CUDA calls.
+    // 5. Host-side wait until the loader has finished and recorded
+    //    ``st->ready_event`` on copy_stream.
+    //
+    // Why we MUST wait here, not just rely on the captured
+    // ``cudaStreamWaitEvent`` after this node: the captured wait only
+    // synchronises with the LATEST recording of ``ready_event``.  On
+    // a comp's first dispatch the event was never recorded, so the
+    // captured wait returns immediately and the kernel races ahead of
+    // the loader.  Even on later dispatches a stale prior record would
+    // satisfy the wait without ordering after THIS dispatch's loads.
+    //
+    // KNOWN ISSUE (Step 3 hardening):  this wait can deadlock under
+    // tight cap on some CUDA driver versions because the IO workers'
+    // cudaMemcpyAsync calls contend with the driver-internal thread
+    // that runs this host-fn.  The dispatch shim therefore opts into
+    // the legacy synchronous-load path under eager mode by default;
+    // set STREAMLLM_USE_HOSTFN_DISPATCH=1 to force this path while
+    // we work the deadlock.
     st->runtime->wait_async_load_batch(st->batch);
-
-    // 5. Reserve this dispatch's load_set against later layers'
-    //    evictions within the same replay.
-    st->runtime->add_replay_reservations(p.load_set);
 }
 
 } // namespace streamllm_ext

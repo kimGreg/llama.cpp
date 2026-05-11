@@ -86,6 +86,14 @@ public:
     // evictable entry (front of LRU list, skipping reserved); compute
     // its score; pop the global maximum.
     //
+    // Two reservation sources are honoured: this tracker's local
+    // ``reserved_`` set (legacy hook-window dispatch reservation) AND
+    // the runtime's replay-scoped ``is_replay_reserved`` set populated
+    // before each captured load batch.  Replay reservations protect
+    // the in-flight dispatch's freshly-loaded chunks across the rest
+    // of the captured replay, so a later layer's planner can't evict
+    // chunks the earlier layer's kernel is still about to read.
+    //
     // Eviction MUST clear the entry's per-plane device-pointer slot
     // (dev.chunk_qw_ptrs[p] / chunk_alpha_ptrs[p]) so the kernel
     // doesn't read stale memory after the freed slot gets reused by
@@ -103,6 +111,7 @@ public:
             auto & bucket = buckets_[p];
             for (auto it = bucket.begin(); it != bucket.end(); ++it) {
                 if (reserved_.count(*it)) continue;
+                if (rt.is_replay_reserved(it->wid, it->cid)) continue;
                 auto ix = index_.find(*it);
                 if (ix == index_.end()) continue;  // defensive
                 const uint64_t age = now - ix->second.last_touch_ts;

@@ -311,6 +311,17 @@ private:
     std::deque<AsyncLoadRequest>       io_queue_;
     std::atomic<uint32_t>              io_in_flight_{0};
     std::atomic<bool>                  io_stop_{false};
+    // Serializes copy_stream emissions across workers. ``pool->load``
+    // already holds ``pool::mu_`` around its ``cudaMemcpyAsync`` +
+    // per-chunk ``cudaEventRecord``, but ``move_chunk``'s post-load
+    // ``after_load`` kernel + the per-chunk re-record happen OUTSIDE
+    // that lock. With concurrent workers a racing emission can let the
+    // trailing batch ready_event land on copy_stream BEFORE another
+    // worker's ``after_load`` — so the captured kernel reads still-
+    // stale per-plane pointers. ``io_stream_mu_`` covers the entire
+    // worker-thread emission window so copy_stream's queued order is
+    // strictly batch-FIFO and ``batch_ready_event`` is the last node.
+    std::mutex                         io_stream_mu_;
 
     void io_worker_loop_();
 

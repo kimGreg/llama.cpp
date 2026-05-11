@@ -35,6 +35,7 @@ if (GGML_CUDA)
     list(APPEND STREAMLLM_EXT_SOURCES
         qwen3/qwen3_runtime_glue.cpp
         qwen3/qwen3_moe_dispatch.cpp
+        qwen3/qwen3_moe_matmul_comp.cpp
     )
 endif()
 

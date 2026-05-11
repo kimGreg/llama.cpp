@@ -10,6 +10,7 @@
 #include "runtime.h"
 #include "anybcq_gemv.h"
 #include "qwen3_moe_fused.h"   // MoeExpertTable + qwen3::alloc/free_moe_expert_table
+#include "qwen3_moe_matmul_comp.h"  // MoEMatMulComp (registered at install)
 #include "qwen3_moe_residency.h"
 #include "qwen3_moe_dispatch.h"
 #include "qwen3_graph_instrumenter.h"
@@ -379,6 +380,49 @@ public:
         std::fprintf(stderr,
             "streamllm-scheduler[moe]: built %zu expert tables eagerly\n",
             canonical_seen.size());
+
+        // Build one MoEMatMulComp per managed canonical.  The dispatch
+        // shim hands these off to ``StreamllmRuntime::run`` (Step 2 of
+        // the unified chunked-load + compute lifecycle).  We size each
+        // comp's pinned input buffers off STREAMLLM_BATCH_N_MAX
+        // (default 2048; same env knob that sizes the MoE scratch).
+        int max_n_tokens = 2048;
+        if (const char * s = std::getenv("STREAMLLM_BATCH_N_MAX")) {
+            int v = std::atoi(s); if (v > 0) max_n_tokens = v;
+        }
+        size_t comps_built = 0;
+        for (const auto & canonical : canonical_seen) {
+            const MoeExpertTable * table = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(moe_tables_mu_);
+                auto it = moe_tables_.find(canonical);
+                if (it != moe_tables_.end()) table = &it->second;
+            }
+            const auto * any_layout = rt_->layout(canonical + ":e0");
+            if (table == nullptr || any_layout == nullptr) continue;
+            const int n_experts = table->n_experts;
+            // n_used_per_tok is at most n_experts. Some warmup graphs
+            // capture an "all-experts" pass (ids->ne[0] == n_experts),
+            // so the comp's pinned buffers must accommodate that worst
+            // case.  Floor at 32 to keep small-expert canonicals' tu
+            // count predictable for the kernel-arg fast path.
+            const int max_n_used = std::max(32, n_experts);
+
+            auto comp = std::make_unique<qwen3::MoEMatMulComp>(
+                rt, *this, canonical, table, any_layout,
+                n_experts, max_n_tokens, max_n_used);
+            moe_comps_.emplace(canonical, std::move(comp));
+            ++comps_built;
+        }
+        std::fprintf(stderr,
+            "streamllm-scheduler[moe]: built %zu MoEMatMulComp instances\n",
+            comps_built);
+    }
+
+    qwen3::MoEMatMulComp * lookup_moe_comp(const std::string & canonical) {
+        auto it = moe_comps_.find(canonical);
+        if (it == moe_comps_.end()) return nullptr;
+        return it->second.get();
     }
 
     const Plan * plan_for(const std::string & tensor_name,
@@ -967,6 +1011,15 @@ private:
     std::unordered_map<std::string, MoeExpertTable> moe_tables_;
     std::mutex moe_tables_mu_;
 
+    // Per-canonical MoEMatMulComp.  Built eagerly at install once the
+    // per-canonical MoeExpertTable + e0 device layout are known.  The
+    // dispatch shim calls ``scheduler_lookup_moe_comp(canonical)`` to
+    // hand off to ``StreamllmRuntime::run``.  Owned by the scheduler;
+    // destroyed in the dtor (after the runtime, since comps hold pinned
+    // buffers freed via cudaFreeHost).
+    std::unordered_map<std::string, std::unique_ptr<qwen3::MoEMatMulComp>>
+        moe_comps_;
+
     // Step-4b graph instrumenter. Built per-cgraph-compute by
     // on_graph_compute_begin (node→layer map); read by
     // on_managed_node_visit on each per-op hook firing to detect
@@ -1124,6 +1177,13 @@ bool scheduler_set_score_table(
     const std::vector<float> & thresholds)
 {
     return as_moe(sched).set_score_table(thresholds);
+}
+
+MoEMatMulComp * scheduler_lookup_moe_comp(
+    Scheduler &         sched,
+    const std::string & canonical_wid)
+{
+    return as_moe(sched).lookup_moe_comp(canonical_wid);
 }
 
 }  // namespace qwen3

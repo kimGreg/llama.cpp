@@ -10,6 +10,7 @@
 #include "qwen3_moe_dispatch.h"
 
 #include "qwen3_runtime_glue.h"   // g_runtime + g_runtime_mu (internal externs)
+#include "qwen3_moe_matmul_comp.h" // MoEMatMulComp + scheduler_lookup_moe_comp
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "stream_reader.h"
@@ -92,18 +93,11 @@ std::mutex                                       g_topk_weights_mu;
 std::unordered_map<const void *, WeightsHandle>  g_topk_weights;
 
 // Per-stream scratch for F32↔F16 cast bridges + ids/precision device
-// buffers used by the fused MoE kernel.
-struct StreamScratch {
-    void *  x_f16          = nullptr;
-    void *  y_f16          = nullptr;
-    void *  xb_f16         = nullptr;
-    void *  yb_f16         = nullptr;
-    void *  w_f16          = nullptr;
-    void *  ids_d          = nullptr;
-    void *  prec_per_tu_d  = nullptr;
-};
+// buffers used by the fused MoE kernel.  ``StreamScratch`` itself is
+// declared in qwen3_moe_dispatch.h so MoEMatMulComp::execute can read
+// its fields without a TU-private re-definition.
 std::mutex g_scratch_mu;
-std::unordered_map<cudaStream_t, StreamScratch> g_scratch;
+std::unordered_map<cudaStream_t, moe_dispatch::StreamScratch> g_scratch;
 size_t g_scratch_x_bytes   = 0;
 size_t g_scratch_y_bytes   = 0;
 size_t g_scratch_xb_bytes  = 0;
@@ -111,34 +105,6 @@ size_t g_scratch_yb_bytes  = 0;
 size_t g_scratch_w_bytes   = 0;
 size_t g_scratch_ids_bytes = 0;
 int    g_batch_n_max       = 0;
-
-StreamScratch * scratch_for_stream(cudaStream_t stream) {
-    std::lock_guard<std::mutex> lk(g_scratch_mu);
-    auto it = g_scratch.find(stream);
-    if (it != g_scratch.end()) return &it->second;
-    StreamScratch s{};
-    auto fail = [&]() {
-        if (s.x_f16)         cudaFree(s.x_f16);
-        if (s.y_f16)         cudaFree(s.y_f16);
-        if (s.xb_f16)        cudaFree(s.xb_f16);
-        if (s.yb_f16)        cudaFree(s.yb_f16);
-        if (s.w_f16)         cudaFree(s.w_f16);
-        if (s.ids_d)         cudaFree(s.ids_d);
-        if (s.prec_per_tu_d) cudaFree(s.prec_per_tu_d);
-        return nullptr;
-    };
-    if (cudaMalloc(&s.x_f16,  g_scratch_x_bytes)  != cudaSuccess) return fail();
-    if (cudaMalloc(&s.y_f16,  g_scratch_y_bytes)  != cudaSuccess) return fail();
-    if (cudaMalloc(&s.xb_f16, g_scratch_xb_bytes) != cudaSuccess) return fail();
-    if (cudaMalloc(&s.yb_f16, g_scratch_yb_bytes) != cudaSuccess) return fail();
-    if (cudaMalloc(&s.w_f16,  g_scratch_w_bytes)  != cudaSuccess) return fail();
-    if (g_scratch_ids_bytes > 0 &&
-        cudaMalloc(&s.ids_d, g_scratch_ids_bytes) != cudaSuccess) return fail();
-    if (g_scratch_ids_bytes > 0 &&
-        cudaMalloc(&s.prec_per_tu_d, g_scratch_ids_bytes) != cudaSuccess) return fail();
-    auto ins = g_scratch.emplace(stream, s);
-    return &ins.first->second;
-}
 
 } // anonymous namespace
 
@@ -202,6 +168,54 @@ void on_topk_moe_observed_impl(
     std::lock_guard<std::mutex> lk(g_topk_weights_mu);
     g_topk_weights[ids->data] = WeightsHandle{weights, n_used};
 }
+
+bool topk_weights_lookup(
+    const void *               ids_data,
+    const struct ggml_tensor ** out_weights,
+    int *                       out_n_used)
+{
+    if (ids_data == nullptr) return false;
+    std::lock_guard<std::mutex> lk(g_topk_weights_mu);
+    auto it = g_topk_weights.find(ids_data);
+    if (it == g_topk_weights.end()) return false;
+    if (it->second.weights == nullptr) return false;
+    if (out_weights) *out_weights = it->second.weights;
+    if (out_n_used)  *out_n_used  = it->second.n_used;
+    return true;
+}
+
+StreamScratch * scratch_for_stream(cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_scratch_mu);
+    auto it = g_scratch.find(stream);
+    if (it != g_scratch.end()) return &it->second;
+    StreamScratch s{};
+    auto fail = [&]() {
+        if (s.x_f16)         cudaFree(s.x_f16);
+        if (s.y_f16)         cudaFree(s.y_f16);
+        if (s.xb_f16)        cudaFree(s.xb_f16);
+        if (s.yb_f16)        cudaFree(s.yb_f16);
+        if (s.w_f16)         cudaFree(s.w_f16);
+        if (s.ids_d)         cudaFree(s.ids_d);
+        if (s.prec_per_tu_d) cudaFree(s.prec_per_tu_d);
+        return nullptr;
+    };
+    if (cudaMalloc(&s.x_f16,  g_scratch_x_bytes)  != cudaSuccess) return fail();
+    if (cudaMalloc(&s.y_f16,  g_scratch_y_bytes)  != cudaSuccess) return fail();
+    if (cudaMalloc(&s.xb_f16, g_scratch_xb_bytes) != cudaSuccess) return fail();
+    if (cudaMalloc(&s.yb_f16, g_scratch_yb_bytes) != cudaSuccess) return fail();
+    if (cudaMalloc(&s.w_f16,  g_scratch_w_bytes)  != cudaSuccess) return fail();
+    if (g_scratch_ids_bytes > 0 &&
+        cudaMalloc(&s.ids_d, g_scratch_ids_bytes) != cudaSuccess) return fail();
+    if (g_scratch_ids_bytes > 0 &&
+        cudaMalloc(&s.prec_per_tu_d, g_scratch_ids_bytes) != cudaSuccess) return fail();
+    auto ins = g_scratch.emplace(stream, s);
+    return &ins.first->second;
+}
+
+size_t scratch_xb_bytes_total()  { return g_scratch_xb_bytes; }
+size_t scratch_yb_bytes_total()  { return g_scratch_yb_bytes; }
+size_t scratch_ids_bytes_total() { return g_scratch_ids_bytes; }
+int    scratch_batch_n_max()     { return g_batch_n_max; }
 
 
 bool size_scratch_for(const StreamReader & r) {
@@ -600,33 +614,34 @@ bool handle_mul_mat_impl(
 
 
 // ---- MoE mul_mat_id dispatch ------------------------------------------
-
+//
+// Thin shim over MoEMatMulComp.  Validates the call, probes for the
+// (probs, weights) device tensors that drive the per-expert score
+// policy, and hands the dispatch to ``StreamllmRuntime::run`` —
+// which emits the universal captured sequence (D2H pre_inputs → host-
+// fn that calls plan() → wait-event → captured kernel launches in
+// execute()) on every invocation, eager or graph-captured.
 bool handle_mul_mat_id_impl(
     cudaStream_t stream,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * ids,
-    struct ggml_tensor * dst) {
-    if (src0 == nullptr || src0->name[0] == '\0') {
-        return false;
-    }
-    if (src1 == nullptr || ids == nullptr || dst == nullptr) {
-        return false;
-    }
+    struct ggml_tensor * dst)
+{
+    if (src0 == nullptr || src0->name[0] == '\0') return false;
+    if (src1 == nullptr || ids == nullptr || dst == nullptr) return false;
 
     std::lock_guard<std::mutex> lk(g_runtime_mu);
-    if (!g_runtime) {
-        return false;
-    }
+    if (!g_runtime) return false;
 
     const std::string canonical(src0->name);
-    if (!g_runtime->is_managed_name(canonical)) {
-        return false;
-    }
-    const std::string synth_zero = canonical + ":e0";
-    if (g_runtime->layout(synth_zero) == nullptr) {
-        return false;
-    }
+    if (!g_runtime->is_managed_name(canonical)) return false;
+    if (g_runtime->layout(canonical + ":e0") == nullptr) return false;
+
+    qwen3::MoEMatMulComp * comp =
+        qwen3::scheduler_lookup_moe_comp(g_runtime->scheduler(), canonical);
+    if (comp == nullptr || !comp->valid()) return false;
+
     // Step-4b instrumenter: fire LayerBegin/LayerEnd markers when
     // crossing a layer boundary. dst is the unique node identity in
     // the prewalk-built node→layer map.
@@ -665,129 +680,13 @@ bool handle_mul_mat_id_impl(
         return false;
     }
 
-    StreamScratch * sc = scratch_for_stream(stream);
-    if (sc == nullptr) {
+    if (scratch_for_stream(stream) == nullptr) {
         std::fprintf(stderr,
             "streamllm-ext: mul_mat_id hook bailing — scratch alloc failed\n");
         return false;
     }
 
-    cudaStreamCaptureStatus _cap_status = cudaStreamCaptureStatusNone;
-    const bool _hook_in_capture =
-        cudaStreamIsCapturing(stream, &_cap_status) == cudaSuccess &&
-        _cap_status == cudaStreamCaptureStatusActive;
-
-    std::vector<int32_t> ids_host;
-    std::vector<float>   probs_host;
-    int64_t              n_expert_in_probs = 0;
-    bool                 have_real_scores  = false;
-    std::vector<float>   weights_host;
-    bool                 have_renorm_weights = false;
-    if (!_hook_in_capture) {
-        ids_host.resize((size_t)n_used_per_tok * (size_t)n_tokens);
-        {
-            const size_t row_bytes = (size_t)n_used_per_tok * sizeof(int32_t);
-            const size_t src_pitch = (size_t)ids->nb[1];
-            cudaError_t err = cudaMemcpy2DAsync(
-                ids_host.data(), /*dpitch=*/row_bytes,
-                ids->data,       /*spitch=*/src_pitch,
-                /*width=*/row_bytes,
-                /*height=*/(size_t)n_tokens,
-                cudaMemcpyDeviceToHost, stream);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr,
-                    "streamllm-ext: mul_mat_id hook ids host-readback failed: %s\n",
-                    cudaGetErrorString(err));
-                return false;
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> tlk(g_topk_weights_mu);
-            auto it = g_topk_weights.find(ids->data);
-            if (it != g_topk_weights.end() &&
-                it->second.weights != nullptr &&
-                it->second.weights->data != nullptr) {
-                const ggml_tensor * w = it->second.weights;
-                const size_t bytes = (size_t)n_used_per_tok *
-                                     (size_t)n_tokens * sizeof(float);
-                weights_host.resize((size_t)n_used_per_tok * (size_t)n_tokens);
-                if (cudaMemcpyAsync(weights_host.data(), w->data, bytes,
-                                    cudaMemcpyDeviceToHost,
-                                    stream) == cudaSuccess) {
-                    have_renorm_weights = true;
-                }
-                // Don't erase the entry — under cuda-graph decode the
-                // captured topk_moe op replays each token but the
-                // host-side on_topk_moe_observed hook only fires at
-                // CAPTURE time.  weights->data is a stable device
-                // buffer that gets rewritten by each kernel replay,
-                // so we re-read fresh values via the same map entry.
-            }
-        }
-
-        const ggml_tensor * probs = nullptr;
-        if (ids->src[0] != nullptr) {
-            if (ids->src[0]->type == GGML_TYPE_F32 &&
-                ids->src[0]->data != nullptr &&
-                (int64_t)ids->src[0]->ne[1] == n_tokens) {
-                probs = ids->src[0];
-            }
-            if (probs == nullptr && ids->src[0]->src[0] != nullptr &&
-                ids->src[0]->src[0]->type == GGML_TYPE_F32 &&
-                ids->src[0]->src[0]->data != nullptr &&
-                (int64_t)ids->src[0]->src[0]->ne[1] == n_tokens) {
-                probs = ids->src[0]->src[0];
-            }
-        }
-        if (probs != nullptr) {
-            n_expert_in_probs = probs->ne[0];
-            probs_host.resize((size_t)n_expert_in_probs * (size_t)n_tokens);
-            if (cudaMemcpyAsync(probs_host.data(), probs->data,
-                                probs_host.size() * sizeof(float),
-                                cudaMemcpyDeviceToHost, stream) == cudaSuccess) {
-                have_real_scores = true;
-            }
-        }
-
-        if (cudaStreamSynchronize(stream) != cudaSuccess) {
-            std::fprintf(stderr,
-                "streamllm-ext: mul_mat_id hook stream-sync after ids/probs copy failed\n");
-            return false;
-        }
-        static std::atomic<int> probs_logged{0};
-        if (probs_logged.exchange(1) == 0) {
-            const char * pname = (probs && probs->name[0])
-                ? probs->name : "(unnamed)";
-            double sum0 = 0.0;
-            float  min0 = 0.0f, max0 = 0.0f;
-            int    n_neg = 0;
-            const int n_view = std::min((int)n_expert_in_probs,
-                                        (int)probs_host.size());
-            if (n_view > 0) {
-                min0 = max0 = probs_host[0];
-                for (int i = 0; i < n_view; ++i) {
-                    const float v = probs_host[i];
-                    sum0 += v;
-                    if (v < min0) min0 = v;
-                    if (v > max0) max0 = v;
-                    if (v < 0.0f) ++n_neg;
-                }
-            }
-            std::fprintf(stderr,
-                "streamllm-ext: gate scores %s — tensor='%s' "
-                "n_expert=%lld  token0_sum=%.4f min=%.4f max=%.4f "
-                "n_negative=%d/%d  renorm_weights=%s\n",
-                have_real_scores ? "captured"
-                                  : "FALLBACK (rank-based)",
-                pname,
-                (long long)n_expert_in_probs,
-                sum0, min0, max0, n_neg, n_view,
-                have_renorm_weights ? "captured (preferred)"
-                                    : "not captured");
-        }
-    }
-
+    g_moe_profile.hook_calls.fetch_add(1, std::memory_order_relaxed);
     if (getenv("STREAMLLM_TRACE")) {
         static std::unordered_set<std::string> seen;
         static std::mutex seen_mu;
@@ -800,483 +699,177 @@ bool handle_mul_mat_id_impl(
         }
     }
 
-    Scheduler & sched = g_runtime->scheduler();
-    g_moe_profile.hook_calls.fetch_add(1, std::memory_order_relaxed);
-
-    const auto _hook_t0 = std::chrono::steady_clock::now();
-    struct HookExit {
-        std::chrono::steady_clock::time_point t0;
-        ~HookExit() {
-            const auto dt = std::chrono::steady_clock::now() - t0;
-            g_moe_profile.hook_total_ns.fetch_add(
-                (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
-                std::memory_order_relaxed);
+    // Probe the cgraph for the F32 probs tensor (lives one or two
+    // parents up from ``ids``); the LOAD walk uses it for per-expert
+    // gate-score lookup when the topk_moe weights side-channel isn't
+    // populated.  Topology is graph-stable so this probe runs once
+    // per recording and is reused on every replay.
+    const ggml_tensor * probs = nullptr;
+    int n_expert_in_probs = 0;
+    if (ids->src[0] != nullptr) {
+        if (ids->src[0]->type == GGML_TYPE_F32 &&
+            ids->src[0]->data != nullptr &&
+            (int64_t)ids->src[0]->ne[1] == n_tokens) {
+            probs = ids->src[0];
         }
-    } _hook_exit{_hook_t0};
-
-    const bool async_on = g_runtime->io_worker_count() > 0;
-
-    struct PerSlot {
-        std::string synth;
-        int         n_chunks_desired = 0;
-        std::shared_ptr<std::atomic<uint32_t>> batch;
-    };
-    std::vector<PerSlot> slots((size_t)n_tokens * (size_t)n_used_per_tok);
-
-    struct Reservation { std::string wid; int cid; };
-    std::vector<Reservation> reservations;
-    reservations.reserve(slots.size() * 4);
-
-    const MoeExpertTable * fuse_table =
-        qwen3::scheduler_moe_expert_table(sched, canonical);
-    if (fuse_table == nullptr) {
-        return false;
-    }
-    const auto * any_layout = g_runtime->layout(canonical + ":e0");
-    const int group_size = any_layout ? any_layout->group_size : 0;
-    if (group_size <= 0) {
-        return false;
-    }
-
-    const uint8_t * x_base = (const uint8_t *) src1->data;
-    uint8_t       * y_base = (uint8_t *)       dst->data;
-    const size_t x_used_stride  = src1->nb[1];
-    const size_t x_tok_stride   = src1->nb[2];
-    const size_t y_tok_stride   = dst->nb[2];
-
-    if (sc->ids_d == nullptr) {
-        std::fprintf(stderr, "streamllm-ext: ids_d scratch missing\n");
-        return false;
-    }
-    int32_t * ids_d = (int32_t *) sc->ids_d;
-    const size_t x_tile_bytes = (size_t)K * sizeof(__half);
-
-    // Single-batch over the whole token range. The score policy is
-    // already a per-expert max-aggregation across the minibatch, so
-    // splitting wouldn't change which chunks are needed (it only
-    // affects per-(t,u) precision granularity, which the kernel
-    // already takes per-(t,u) via host_prec_per_tu).
-    const int minibatch = n_tokens;
-
-    const auto t_load_start = std::chrono::steady_clock::now();
-    STLM_NVTX_RANGE("moe_hook");
-
-    for (int t_base = 0; t_base < n_tokens; t_base += minibatch) {
-        const int sub_n = std::min(minibatch, n_tokens - t_base);
-
-        int sub_max_precision = 0;
-        // Only populate host_prec_per_tu inside the LOAD walk below
-        // (gated by !_hook_in_capture).  When capture is active the
-        // LOAD walk is skipped — we leave host_prec_per_tu empty so
-        // prec_per_tu_d stays null and the kernel falls back to
-        // uniform_precision.  Filling it with zeros + uploading
-        // would make the kernel read 0 planes per (t, u) → garbage.
-        std::vector<int> host_prec_per_tu;
-        std::shared_ptr<std::atomic<uint32_t>> batch;
-        if (!_hook_in_capture) {
-            STLM_NVTX_RANGE("LOAD");
-            host_prec_per_tu.assign((size_t)sub_n * n_used_per_tok, 0);
-
-            // Per-expert max gate score across the minibatch.  One
-            // expert may serve many tokens with different scores; we
-            // load enough chunks for the highest and re-use them
-            // across the lower-scoring tokens (free, since the chunks
-            // are already resident).
-            std::unordered_map<int, float> max_gate_by_expert;
-            std::unordered_map<int, int>   max_prec_by_expert;
-            std::vector<int> unique_experts;
-            const size_t reserve_n = (size_t)n_used_per_tok * 4;
-            max_gate_by_expert.reserve(reserve_n);
-            max_prec_by_expert.reserve(reserve_n);
-            unique_experts.reserve(reserve_n);
-
-            const auto _ph_load_t0 = std::chrono::steady_clock::now();
-
-            // Snapshot the score table once per minibatch.
-            // set_score_table() can swap the active table at any
-            // time (per-request live dial); the snapshot guarantees
-            // an in-flight LOAD walk doesn't tear if a swap lands
-            // mid-iteration.
-            //
-            // Format: ascending vector of length N (= max n_chunks
-            // across managed tensors). thresholds[k] is the lower-
-            // edge gate score for the band that loads (k+1) chunks.
-            // No explicit chunks array — chunks_loaded is implicit
-            // by index. For gate g, return planes_served = base_p +
-            // (largest k where thresholds[k] <= g), with the per-
-            // tensor n_chunks clamping handled by translate_planes.
-            const std::vector<float> sc_thresh =
-                qwen3::scheduler_score_thresholds_snapshot(sched);
-            const int base_p = any_layout
-                ? (int)any_layout->base_precision : 1;
-            const int sc_max = kMaxChunksPerTensor;
-
-            auto score_lookup = [&](float g) -> int {
-                // Find largest k where thresholds[k] <= g.
-                int k = -1;
-                for (int i = (int)sc_thresh.size() - 1; i >= 0; --i) {
-                    if (g >= sc_thresh[i]) { k = i; break; }
-                }
-                if (k < 0) {
-                    // Below every threshold — happens when the gate
-                    // tensor we're reading is raw logits (negative)
-                    // instead of post-softmax probs (Qwen3 case).
-                    // Fall back to MAX planes for quality; the dial
-                    // doesn't differentiate in this regime, but the
-                    // alternative (returning base_p) drops every
-                    // expert to 2-plane precision and the model
-                    // hallucinates / output goes garbled.
-                    if (!sc_thresh.empty()) {
-                        int planes = base_p + (int)sc_thresh.size() - 1;
-                        if (planes > sc_max) planes = sc_max;
-                        return planes;
-                    }
-                    return sc_max;
-                }
-                int planes = base_p + k;
-                if (planes < 1)      planes = 1;
-                if (planes > sc_max) planes = sc_max;
-                return planes;
-            };
-
-            // Pass 1: collect per-expert max gate score + register
-            // every (t, u)'s eid so unique_experts is dedup'd in
-            // encounter order.  Per-(t, u) precision is filled in
-            // Pass 2 once we know the per-expert max.
-            std::vector<float> g_per_tu(
-                (size_t)sub_n * n_used_per_tok, 0.0f);
-            for (int t = t_base; t < t_base + sub_n; ++t) {
-                for (int u = 0; u < n_used_per_tok; ++u) {
-                    const int eid =
-                        ids_host[(size_t)t * n_used_per_tok + u];
-                    float g;
-                    if (have_renorm_weights) {
-                        g = weights_host[(size_t)t * n_used_per_tok +
-                                          (size_t)u];
-                    } else if (have_real_scores &&
-                        eid >= 0 && eid < n_expert_in_probs) {
-                        g = probs_host[
-                            (size_t)t * n_expert_in_probs + (size_t)eid];
-                    } else {
-                        g = 0.45f - 0.05f * (float)u;
-                        if (g < 0.05f) g = 0.05f;
-                    }
-                    auto it_g = max_gate_by_expert.find(eid);
-                    if (it_g == max_gate_by_expert.end()) {
-                        max_gate_by_expert.emplace(eid, g);
-                        unique_experts.push_back(eid);
-                    } else if (g > it_g->second) {
-                        it_g->second = g;
-                    }
-                    g_per_tu[(size_t)(t - t_base) *
-                              n_used_per_tok + u] = g;
-                }
-            }
-
-            // Pass 2: per-expert max precision from per-expert max g;
-            // broadcast back to per-(t, u).
-            // For any-prec wids, translate the requested target precision
-            // (in PLANES) to the precision actually served — chunks are
-            // packed in tiers of [base_p planes][+1 plane]×(Pa−1), so
-            // serving target P_t needs n_chunks = max(1, P_t−base_p+1)
-            // clamped to Pa, yielding planes_served = base_p+n_chunks−1.
-            // The kernel's prec_per_tu_d must equal planes_served to
-            // avoid reading past the last-loaded plane pointer.
-            auto translate_planes = [&](int target) -> int {
-                if (any_layout && any_layout->any_precision) {
-                    const int base_p = (int)any_layout->base_precision;
-                    const int Pa     = (int)any_layout->n_chunks;
-                    int n_chunks = target - base_p + 1;
-                    if (n_chunks < 1)  n_chunks = 1;
-                    if (n_chunks > Pa) n_chunks = Pa;
-                    return base_p + n_chunks - 1;
-                }
-                return target;
-            };
-            for (int eid : unique_experts) {
-                max_prec_by_expert[eid] =
-                    translate_planes(score_lookup(max_gate_by_expert[eid]));
-            }
-            const int layer =
-                std::strncmp(canonical.c_str(), "blk.", 4) == 0
-                    ? std::atoi(canonical.c_str() + 4) : -1;
-            for (int t = t_base; t < t_base + sub_n; ++t) {
-                for (int u = 0; u < n_used_per_tok; ++u) {
-                    const int eid =
-                        ids_host[(size_t)t * n_used_per_tok + u];
-                    const int desired = max_prec_by_expert[eid];
-                    host_prec_per_tu[(size_t)(t - t_base) *
-                                     n_used_per_tok + u] = desired;
-                    const float g = g_per_tu[(size_t)(t - t_base) *
-                                              n_used_per_tok + u];
-                    diag::record_gate_event(layer, t, u, eid,
-                                            g, /*cum_before=*/0.0f,
-                                            desired);
-                    const std::string synthetic =
-                        canonical + ":e" + std::to_string(eid);
-                    for (int pp = 0; pp < desired; ++pp) {
-                        diag::record_chunk(*g_runtime, synthetic,
-                                           u, pp, cid_chunk(pp));
-                    }
-                }
-            }
-
-            {
-                const auto dt = std::chrono::steady_clock::now() - _ph_load_t0;
-                g_moe_profile.ph_load_walk_ns.fetch_add(
-                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
-                    std::memory_order_relaxed);
-            }
-            const auto _ph_plan_t0 = std::chrono::steady_clock::now();
-            std::unordered_set<std::string> issued_keys;
-            issued_keys.reserve(unique_experts.size() * 8);
-            if (async_on && !batch) {
-                batch = std::make_shared<std::atomic<uint32_t>>(0);
-            }
-            for (int eid : unique_experts) {
-                const int desired = max_prec_by_expert[eid];
-                const Plan * plan =
-                    qwen3::scheduler_plan_for_expert_with_precision(
-                        sched, canonical, eid, desired, stream);
-                if (plan == nullptr) continue;
-                const int n_chunks_desired =
-                    std::max(0, (int)plan->chunks.size() - 1);
-                // n_chunks_desired counts data chunks emitted by the plan;
-                // for shortcut that equals plane count, but for any-prec
-                // we have planes = base_p + n_chunks − 1.
-                const int planes_for_kernel =
-                    (any_layout && any_layout->any_precision &&
-                     n_chunks_desired > 0)
-                        ? (int)any_layout->base_precision + n_chunks_desired - 1
-                        : n_chunks_desired;
-                if (planes_for_kernel > sub_max_precision)
-                    sub_max_precision = planes_for_kernel;
-
-                for (const auto & mv : plan->moves) {
-                    g_moe_profile.async_load_attempts.fetch_add(
-                        1, std::memory_order_relaxed);
-                    std::string key = mv.wid + "#" + std::to_string(mv.cid);
-                    if (!issued_keys.insert(std::move(key)).second) {
-                        g_moe_profile.async_load_skipped.fetch_add(
-                            1, std::memory_order_relaxed);
-                        continue;
-                    }
-                    qwen3::scheduler_reserve_for_dispatch(sched, mv.wid, mv.cid);
-                    reservations.push_back({mv.wid, mv.cid});
-
-                    if (g_runtime->pool().is_resident(mv.wid, mv.cid)) {
-                        g_moe_profile.async_load_skipped.fetch_add(
-                            1, std::memory_order_relaxed);
-                        continue;
-                    }
-                    g_moe_profile.async_load_issued.fetch_add(
-                        1, std::memory_order_relaxed);
-
-                    if (async_on) {
-                        g_runtime->submit_async_load(mv.wid, mv.cid, batch);
-                    } else {
-                        g_runtime->move_chunk(mv.wid, mv.cid, mv.src, mv.dst,
-                                              /*compute_stream=*/nullptr);
-                    }
-                }
-            }
-
-            {
-                const auto dt = std::chrono::steady_clock::now() - _ph_plan_t0;
-                g_moe_profile.ph_plan_lookup_ns.fetch_add(
-                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
-                    std::memory_order_relaxed);
-            }
+        if (probs == nullptr && ids->src[0]->src[0] != nullptr &&
+            ids->src[0]->src[0]->type == GGML_TYPE_F32 &&
+            ids->src[0]->src[0]->data != nullptr &&
+            (int64_t)ids->src[0]->src[0]->ne[1] == n_tokens) {
+            probs = ids->src[0]->src[0];
         }
+    }
+    if (probs != nullptr) n_expert_in_probs = (int) probs->ne[0];
 
-        int uniform_precision = sub_max_precision;
-        if (uniform_precision <= 0) {
-            // LOAD walk skipped (cuda graph capture) or score table
-            // didn't yield any positive precision.  Default to the
-            // model's actual full precision (base_p + n_chunks − 1
-            // for any-prec; n_chunks for shortcut).  Falling back to
-            // kMaxChunksPerTensor (16) made the kernel read past the
-            // last loaded plane → out-of-bounds reads → garbage
-            // output during decode (cuda graph captures the dispatch).
-            if (any_layout && any_layout->any_precision) {
-                uniform_precision =
-                    (int)any_layout->base_precision +
-                    (int)any_layout->n_chunks - 1;
-            } else if (any_layout) {
-                uniform_precision = (int)any_layout->n_chunks;
+    // Renormalised topk weights side-channel (captured at recording
+    // time by ``on_topk_moe_observed``; ids->data is stable for the
+    // lifetime of one capture session).
+    const ggml_tensor * weights = nullptr;
+    {
+        int n_used_unused = 0;
+        topk_weights_lookup(ids->data, &weights, &n_used_unused);
+    }
+
+    qwen3::MoEInput  in;
+    in.src0              = src0;
+    in.src1              = src1;
+    in.ids               = ids;
+    in.probs             = probs;
+    in.weights           = weights;
+    in.K                 = K;
+    in.M                 = M;
+    in.n_tokens          = n_tokens;
+    in.n_used_per_tok    = n_used_per_tok;
+    in.n_expert_in_probs = n_expert_in_probs;
+    in.shared_x          = shared_x;
+    in.layer_index       =
+        std::strncmp(canonical.c_str(), "blk.", 4) == 0
+            ? std::atoi(canonical.c_str() + 4) : -1;
+
+    qwen3::MoEOutput out;
+    out.dst = dst;
+
+    // Default eager dispatch: inline-load chunks + direct execute().
+    //
+    // We bypass ``Runtime::run``'s host-fn-driven path under eager
+    // mode because the cuda-driver-threading constraints around
+    // cudaLaunchHostFunc + cross-stream cudaStreamWaitEvent
+    // synchronisation are still being worked out (Step 3 hardening).
+    // The plan body still needs ids/probs/weights, so we issue the
+    // pre_inputs D2H, sync to ensure the pinned buffers land, run
+    // plan() on the host, fan out the load_set via the existing
+    // worker-thread move_chunk path (which lives in
+    // io_worker_loop_), and sync copy_stream so the kernel sees
+    // up-to-date plane pointers before launch.
+    //
+    // Set STREAMLLM_USE_HOSTFN_DISPATCH=1 to opt in to the future
+    // ``Runtime::run`` host-fn path (currently incomplete: works at
+    // generous cap, deadlocks at tight cap because workers' CUDA
+    // ops contend with the driver-internal thread that runs the
+    // host-fn body).
+    const bool use_hostfn = std::getenv("STREAMLLM_USE_HOSTFN_DISPATCH") != nullptr;
+    if (use_hostfn) {
+        g_runtime->run(*comp, in, out, (StreamHandle) stream);
+        if (std::getenv("STREAMLLM_DISPATCH_SYNC") != nullptr) {
+            cudaStreamSynchronize(stream);
+        }
+        return true;
+    }
+
+    // Under cuda-graph capture we cannot host-side wait or call any
+    // sync APIs.  Skip the LOAD walk and just capture the kernel
+    // launches directly — chunks must already be resident from prior
+    // (non-captured) warmup / reserve passes.  This mirrors the
+    // legacy ``_hook_in_capture`` behavior and is the same trade-off
+    // (works at full pin, garbage at tight cap) Step 2's host-fn path
+    // is meant to fix.  The TODO is left for Step 3 hardening.
+    cudaStreamCaptureStatus _cap = cudaStreamCaptureStatusNone;
+    const bool _in_capture =
+        cudaStreamIsCapturing(stream, &_cap) == cudaSuccess &&
+        _cap == cudaStreamCaptureStatusActive;
+    if (_in_capture) {
+        // pre_inputs still mutates per-dispatch shape state on the
+        // comp (cur_n_tokens / cur_n_used / cur_n_expert) which
+        // execute reads to size its captured kernels.  The MemcpySpec
+        // list it returns is also issued so the captured graph
+        // re-D2Hs ids/probs/weights on every replay (harmless if the
+        // kernel doesn't end up reading the host buffers in this
+        // capture-only path).
+        for (auto & m : comp->pre_inputs(in)) {
+            if (m.bytes == 0) continue;
+            if (m.is_2d) {
+                cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
+                    m.device_src, m.src_pitch,
+                    m.bytes, m.height,
+                    cudaMemcpyDeviceToHost, stream);
             } else {
-                uniform_precision = kMaxChunksPerTensor;
+                cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
+                    cudaMemcpyDeviceToHost, stream);
             }
         }
-        if (!_hook_in_capture) {
-            const auto _ph_wait_t0 = std::chrono::steady_clock::now();
-            if (batch) {
-                g_runtime->wait_async_load_batch(batch);
-            } else {
-                g_runtime->wait_async_load_idle();
-            }
-            const auto dt = std::chrono::steady_clock::now() - _ph_wait_t0;
-            g_moe_profile.ph_wait_barrier_ns.fetch_add(
-                (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
-                std::memory_order_relaxed);
-        }
+        comp->execute(in, out, (StreamHandle) stream);
+        return true;
+    }
 
-        // Cross-stream sync: ``wait_async_load_*`` only drains the host
-        // worker queue — it does NOT order compute_stream after the
-        // copy_stream events that completed the H2D + per-plane
-        // pointer-table updates.  Without an explicit wait_on_stream,
-        // the refresh kernel below (and the GEMV kernel after it) can
-        // start before the per-plane update kernel has run on
-        // copy_stream → reads still-zero ``d_qbias_slot[e][0]`` →
-        // d_q_bias_per_expert[e] = nullptr → kernel illegal-access.
-        //
-        // For shortcut canonicals this race exists too but doesn't
-        // bite because d_q_bias_per_expert was captured at MoE-table
-        // build with a valid pointer (install-time q_bias upload).
-        // For any-prec, q_bias is per-chunk so the pointer is updated
-        // by ``update_anyprec_after_load_async`` on every chunk land —
-        // the compute side MUST wait on those events.
-        for (const auto & r : reservations) {
-            g_runtime->pool().wait_on_stream(r.wid, r.cid,
+    for (auto & m : comp->pre_inputs(in)) {
+        if (m.bytes == 0) continue;
+        if (m.is_2d) {
+            cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
+                m.device_src, m.src_pitch,
+                m.bytes, m.height,
+                cudaMemcpyDeviceToHost, stream);
+        } else {
+            cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
+                cudaMemcpyDeviceToHost, stream);
+        }
+    }
+    cudaStreamSynchronize(stream);
+    ChunkPlan plan = comp->plan(in);
+
+    if (!plan.load_set.empty()) {
+        // Reserve the load_set in the scheduler's tracker so workers'
+        // ``make_room`` (called when the pool is full) skips chunks
+        // we're about to depend on within this dispatch window.
+        // Released after execute() queues its kernels — the tracker's
+        // recency stamps from plan() then take over (the just-touched
+        // chunks score lowest for eviction).  Mirrors the legacy
+        // pre-Step 2 dispatch path.
+        for (const auto & k : plan.load_set) {
+            qwen3::scheduler_reserve_for_dispatch(
+                g_runtime->scheduler(), k.wid, k.cid);
+        }
+        const bool async_on = g_runtime->io_worker_count() > 0;
+        if (async_on) {
+            auto batch = std::make_shared<std::atomic<uint32_t>>(0);
+            for (const auto & k : plan.load_set) {
+                if (g_runtime->pool().is_resident(k.wid, k.cid)) continue;
+                g_runtime->submit_async_load(k.wid, k.cid, batch);
+            }
+            g_runtime->wait_async_load_batch(batch);
+        } else {
+            for (const auto & k : plan.load_set) {
+                if (g_runtime->pool().is_resident(k.wid, k.cid)) continue;
+                g_runtime->move_chunk(k.wid, k.cid, Tier::RAM,
+                                       Tier::VRAM,
+                                       /*compute_stream=*/nullptr);
+            }
+        }
+        // Order the compute stream after the loader's per-chunk
+        // ready_event so the kernel reads up-to-date plane pointers.
+        for (const auto & k : plan.load_set) {
+            g_runtime->pool().wait_on_stream(k.wid, k.cid,
                                               (StreamHandle) stream);
         }
-        const auto _ph_compute_t0 = std::chrono::steady_clock::now();
-
-        const int n_x_slots = shared_x ? sub_n : sub_n * n_used_per_tok;
-
-        const size_t k_bytes_f32 = (size_t)K * sizeof(float);
-        const bool x_contig =
-            shared_x ? (x_tok_stride == k_bytes_f32)
-                     : (x_used_stride == k_bytes_f32 &&
-                        x_tok_stride  == (size_t)n_used_per_tok * k_bytes_f32);
-        if (x_contig) {
-            const uint8_t * x_src0 =
-                x_base + (size_t)t_base * x_tok_stride;
-            launch_f32_to_f16(
-                x_src0, sc->xb_f16, n_x_slots * K, stream);
-        } else {
-            for (int i = 0; i < n_x_slots; ++i) {
-                const uint8_t * x_src = shared_x
-                    ? x_base + (size_t)(t_base + i) * x_tok_stride
-                    : x_base + (size_t)(t_base + i / n_used_per_tok) * x_tok_stride
-                             + (size_t)(i % n_used_per_tok) * x_used_stride;
-                launch_f32_to_f16(
-                    x_src,
-                    (uint8_t *)sc->xb_f16 + (size_t)i * x_tile_bytes,
-                    K, stream);
-            }
-        }
-
-        {
-            const size_t row_bytes =
-                (size_t)n_used_per_tok * sizeof(int32_t);
-            const size_t sub_ids_bytes =
-                (size_t)sub_n * row_bytes;
-            if (sub_ids_bytes > g_scratch_ids_bytes) {
-                std::fprintf(stderr,
-                    "streamllm-ext: ids_d scratch too small for %zu B (have %zu B)\n",
-                    sub_ids_bytes, g_scratch_ids_bytes);
-                for (auto & r : reservations) {
-                    qwen3::scheduler_release_from_dispatch(sched, r.wid, r.cid);
-                }
-                return false;
-            }
-            const uint8_t * ids_src =
-                (const uint8_t *)ids->data + (size_t)t_base * ids->nb[1];
-            cudaMemcpy2DAsync(
-                ids_d, /*dpitch=*/row_bytes,
-                ids_src, /*spitch=*/(size_t)ids->nb[1],
-                /*width=*/row_bytes,
-                /*height=*/(size_t)sub_n,
-                cudaMemcpyDeviceToDevice, stream);
-        }
-
-        void * dst_sub = y_base + (size_t)t_base * y_tok_stride;
-        const size_t dst_sub_bytes =
-            (size_t)sub_n * n_used_per_tok * M * sizeof(float);
-        cudaMemsetAsync(dst_sub, 0, dst_sub_bytes, stream);
-
-        const int * prec_per_tu_d = nullptr;
-        if (!host_prec_per_tu.empty()) {
-            const size_t bytes =
-                host_prec_per_tu.size() * sizeof(int);
-            if (bytes <= g_scratch_ids_bytes && sc->prec_per_tu_d) {
-                cudaMemcpyAsync(sc->prec_per_tu_d,
-                                host_prec_per_tu.data(),
-                                bytes, cudaMemcpyHostToDevice, stream);
-                prec_per_tu_d = (const int *) sc->prec_per_tu_d;
-            }
-        }
-
-        // Any-prec wids store β per-chunk; the table's d_q_bias_per_expert
-        // entries were captured at install (then null) and need to be
-        // refreshed from each expert's current d_qbias_slot[0] before
-        // the kernel reads them. No-op for shortcut canonicals.
-        qwen3::refresh_q_bias_for_anyprec_launch(*fuse_table,
-                                                   (StreamHandle) stream);
-
-        qwen3::naver_gemv_moe_launch(
-            sc->xb_f16, dst_sub, ids_d, *fuse_table,
-            M, K, sub_n, n_used_per_tok,
-            uniform_precision, prec_per_tu_d,
-            group_size,
-            shared_x ? 1 : 0,
-            (StreamHandle) stream);
-
-        const int n_disp = sub_n * n_used_per_tok;
-        g_moe_profile.compute_dispatches.fetch_add(
-            n_disp, std::memory_order_relaxed);
-        if (prec_per_tu_d) {
-            size_t total_chunks = 0;
-            for (int p : host_prec_per_tu) {
-                int hist_idx = std::min(p, (int)kMaxChunksPerTensor);
-                if (hist_idx >= 0) {
-                    g_moe_profile.compute_planes_hist[hist_idx].fetch_add(
-                        1, std::memory_order_relaxed);
-                }
-                total_chunks += (size_t)(p + 1);  // +1 for q_bias
-            }
-            g_moe_profile.compute_chunks_sum.fetch_add(
-                total_chunks, std::memory_order_relaxed);
-        } else {
-            g_moe_profile.compute_chunks_sum.fetch_add(
-                (size_t)n_disp * (uniform_precision + 1),
-                std::memory_order_relaxed);
-            const int hist_idx = std::min(
-                uniform_precision, (int)kMaxChunksPerTensor);
-            g_moe_profile.compute_planes_hist[hist_idx].fetch_add(
-                n_disp, std::memory_order_relaxed);
-        }
-        {
-            const auto dt = std::chrono::steady_clock::now() - _ph_compute_t0;
-            g_moe_profile.ph_compute_ops_ns.fetch_add(
-                (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
-                std::memory_order_relaxed);
+    }
+    comp->execute(in, out, (StreamHandle) stream);
+    if (!plan.load_set.empty()) {
+        for (const auto & k : plan.load_set) {
+            qwen3::scheduler_release_from_dispatch(
+                g_runtime->scheduler(), k.wid, k.cid);
         }
     }
-
-    g_runtime->pool().record_compute_event(stream);
-    const auto _ph_release_t0 = std::chrono::steady_clock::now();
-
-    {
-        auto dt = std::chrono::steady_clock::now() - t_load_start;
-        g_moe_profile.compute_ns.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
-            std::memory_order_relaxed);
-    }
-
-    for (auto & r : reservations) {
-        qwen3::scheduler_release_from_dispatch(sched, r.wid, r.cid);
-    }
-    {
-        const auto dt = std::chrono::steady_clock::now() - _ph_release_t0;
-        g_moe_profile.ph_release_ns.fetch_add(
-            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(),
-            std::memory_order_relaxed);
-    }
-
     return true;
 }
 
-} // namespace moe_dispatch
-} // namespace streamllm_ext
+}  // namespace moe_dispatch
+}  // namespace streamllm_ext
