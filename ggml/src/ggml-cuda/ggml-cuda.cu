@@ -2517,6 +2517,22 @@ static inline bool ggml_cuda_cgraph_has_user_node(const ggml_cgraph * cgraph) {
     return false;
 }
 
+// streamllm-ext integration: generic pre-op claim hook. Fires at the
+// very top of ggml_cuda_compute_forward, before the per-op dispatch
+// switch — gives a registered hook the chance to claim ANY op by
+// returning true. See ggml-cuda.h::ggml_cuda_set_pre_op_hook for the
+// public surface. Used by Mode A milestone-1's sentinel-dispatch
+// mechanism (a GGML_OP_DUP node named "streamllm.moe_layer_<N>"
+// carries pre-built routing tensors in src[1..3]; the streamllm
+// executor recognises the name, runs the managed MoE block as a
+// host-eager call, and returns true to skip the default DUP kernel).
+typedef bool (*ggml_cuda_pre_op_hook_t)(cudaStream_t, struct ggml_tensor *);
+static ggml_cuda_pre_op_hook_t g_cuda_pre_op_hook = nullptr;
+
+extern "C" void ggml_cuda_set_pre_op_hook(void * hook_fn) {
+    g_cuda_pre_op_hook = (ggml_cuda_pre_op_hook_t) hook_fn;
+}
+
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // streamllm-ext override path. Runs first so the extension can claim
@@ -2777,6 +2793,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // streamllm-ext pre-op claim hook (Mode A milestone-1). When set,
+    // the hook inspects every node before its default dispatch and may
+    // claim it by returning true. Returning true short-circuits the
+    // switch below — the default kernel does NOT execute, so the hook
+    // is responsible for filling dst (or leaving it intentionally
+    // unwritten, e.g. when dst is a sentinel whose payload was already
+    // produced by a host-eager call). Returning false falls through to
+    // the regular switch dispatch.
+    if (g_cuda_pre_op_hook != nullptr &&
+        g_cuda_pre_op_hook(ctx.stream(), dst)) {
+        return true;
+    }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);

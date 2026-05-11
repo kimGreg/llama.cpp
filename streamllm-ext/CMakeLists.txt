@@ -155,6 +155,19 @@ target_link_libraries(streamllm-gguf-dump PRIVATE streamllm_ext ggml)
 add_executable(streamllm-loader-gate-test test_loader_gate.cpp)
 target_link_libraries(streamllm-loader-gate-test PRIVATE streamllm_ext ggml)
 
+# streamllm-sentinel-poc: throwaway exploratory test for Milestone 1
+# Step 7-POC. Verifies six sentinel-dispatch properties on a 3-node
+# cgraph (GGML_OP_DUP sentinel with manually-wired src[1..3] +
+# consumer node). Uses ggml_cuda_set_pre_op_hook. Pure CUDA backend
+# test; runs against a small synthetic graph with no real model.
+# Throwaway: keep alongside the gate test so future POC reruns can
+# rebuild it, but it ships nothing to production code.
+if (GGML_CUDA)
+    add_executable(streamllm-sentinel-poc test_sentinel_poc.cpp)
+    target_link_libraries(streamllm-sentinel-poc
+        PRIVATE streamllm_ext ggml ggml-cuda CUDA::cudart)
+endif()
+
 if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     # streamllm-gpu-test: end-to-end kernel check (GGUF → VramChunkPool

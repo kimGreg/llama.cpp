@@ -122,6 +122,26 @@ GGML_BACKEND_API void ggml_cuda_set_graph_compute_end_hook  (void * hook_fn);
 // Set to null to unregister. Independent of the other streamllm hooks.
 GGML_BACKEND_API void ggml_cuda_set_user_node_claims_hook(void * hook_fn);
 
+// streamllm-ext integration: generic pre-op claim hook. Fires at the
+// top of ggml_cuda_compute_forward for EVERY op — the hook inspects
+// dst (op type, name, src[i]) and returns true to indicate "I handled
+// this node; skip the default dispatch." Used by Mode A milestone-1's
+// sentinel-dispatch mechanism (a named GGML_OP_DUP node carries
+// pre-built routing tensors in src[1..3]; the streamllm executor
+// claims it via this hook and runs the managed MoE block as a host-
+// eager call).
+//
+// Pre-op semantics are critical: the hook MUST be consulted BEFORE
+// the default kernel executes. ggml-cuda's existing per-op hooks
+// (mul_mat / mul_mat_id) live inside their respective ops' dispatch
+// functions and only protect those single ops. The pre-op hook is
+// generic — it sees every node and decides per-node.
+//
+// Callback signature:
+//   bool fn(cudaStream_t stream, struct ggml_tensor * dst);
+// Set to null to unregister. Independent of the other streamllm hooks.
+GGML_BACKEND_API void ggml_cuda_set_pre_op_hook(void * hook_fn);
+
 #ifdef  __cplusplus
 }
 #endif
