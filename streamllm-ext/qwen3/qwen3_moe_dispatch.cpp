@@ -190,13 +190,12 @@ StreamScratch * scratch_for_stream(cudaStream_t stream) {
     if (it != g_scratch.end()) return &it->second;
     StreamScratch s{};
     auto fail = [&]() {
-        if (s.x_f16)         cudaFree(s.x_f16);
-        if (s.y_f16)         cudaFree(s.y_f16);
-        if (s.xb_f16)        cudaFree(s.xb_f16);
-        if (s.yb_f16)        cudaFree(s.yb_f16);
-        if (s.w_f16)         cudaFree(s.w_f16);
-        if (s.ids_d)         cudaFree(s.ids_d);
-        if (s.prec_per_tu_d) cudaFree(s.prec_per_tu_d);
+        if (s.x_f16)  cudaFree(s.x_f16);
+        if (s.y_f16)  cudaFree(s.y_f16);
+        if (s.xb_f16) cudaFree(s.xb_f16);
+        if (s.yb_f16) cudaFree(s.yb_f16);
+        if (s.w_f16)  cudaFree(s.w_f16);
+        if (s.ids_d)  cudaFree(s.ids_d);
         return nullptr;
     };
     if (cudaMalloc(&s.x_f16,  g_scratch_x_bytes)  != cudaSuccess) return fail();
@@ -206,8 +205,6 @@ StreamScratch * scratch_for_stream(cudaStream_t stream) {
     if (cudaMalloc(&s.w_f16,  g_scratch_w_bytes)  != cudaSuccess) return fail();
     if (g_scratch_ids_bytes > 0 &&
         cudaMalloc(&s.ids_d, g_scratch_ids_bytes) != cudaSuccess) return fail();
-    if (g_scratch_ids_bytes > 0 &&
-        cudaMalloc(&s.prec_per_tu_d, g_scratch_ids_bytes) != cudaSuccess) return fail();
     auto ins = g_scratch.emplace(stream, s);
     return &ins.first->second;
 }

@@ -47,7 +47,7 @@ __global__ void nqmv_bias_planes_moe_fused(
     const int K,
     const int n_used,
     const int     uniform_precision,
-    const int * __restrict__ prec_per_tu,
+    const int * __restrict__ prec_per_eid,
     const int group_size,
     const int shared_x)
 {
@@ -55,13 +55,18 @@ __global__ void nqmv_bias_planes_moe_fused(
     const int t   = tu / n_used;
     const int eid = ids[tu];
     if (eid < 0) return;
-    const int precision = prec_per_tu ? prec_per_tu[tu] : uniform_precision;
+    const int precision = prec_per_eid ? prec_per_eid[eid] : uniform_precision;
     if (precision <= 0) return;
 
+    // Required-non-null contract (SSOT §6.9 M1).  When precision > 0 and
+    // eid >= 0 the scheduler must have reserved + loaded all planes in
+    // [0, precision) for this expert.  Per-expert tables and q_bias must
+    // be non-null; per-plane pointers in [0, precision) must be non-null.
+    // Null here is a loader/synchronization bug, not "skip plane".
     const uint32_t * const * qw    = qw_planes_per_expert   [eid];
     const __half   * const * alpha = alpha_planes_per_expert[eid];
     const __half   *         q_bias = q_bias_per_expert     [eid];
-    if (qw == nullptr || alpha == nullptr || q_bias == nullptr) return;
+    if (qw == nullptr || alpha == nullptr || q_bias == nullptr) __trap();
 
     const __half * X_t = shared_x
         ? X_fp16 + (size_t)t  * K
@@ -146,7 +151,9 @@ __global__ void nqmv_bias_planes_moe_fused(
         }
 
         for (int b = 0; b < precision; ++b) {
-            if (qw[b] == nullptr || alpha[b] == nullptr) continue;
+            // Required-non-null (M1): plane b ∈ [0, precision) must be
+            // resident.  Null → loader/sync bug → trap.
+            if (qw[b] == nullptr || alpha[b] == nullptr) __trap();
             const uint32_t * __restrict__ bW_p = qw[b] +
                                                  (size_t)K_over_32_offset * M;
             const __half   * __restrict__ alpha_p = alpha[b];
@@ -190,12 +197,12 @@ void naver_gemv_moe_launch(
     int                    n_tokens,
     int                    n_used,
     int                    uniform_precision,
-    const int *            prec_per_tu_d,
+    const int *            prec_per_eid_d,
     int                    group_size,
     int                    shared_x,
     StreamHandle           stream_opaque)
 {
-    if (prec_per_tu_d == nullptr) {
+    if (prec_per_eid_d == nullptr) {
         if (uniform_precision < 1 || uniform_precision > 8) {
             throw std::runtime_error(
                 "qwen3_moe_fused: uniform_precision out of range [1, 8]: " +
@@ -225,7 +232,7 @@ void naver_gemv_moe_launch(
         (const uint32_t * const * const *) table.d_qw_planes_per_expert,
         (const __half   * const * const *) table.d_alpha_planes_per_expert,
         (const __half   *               *) table.d_q_bias_per_expert,
-        M, K, n_used, uniform_precision, prec_per_tu_d,
+        M, K, n_used, uniform_precision, prec_per_eid_d,
         group_size, shared_x);
 
     cudaError_t last = cudaGetLastError();

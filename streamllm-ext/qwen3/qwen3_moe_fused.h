@@ -72,10 +72,12 @@ void refresh_q_bias_for_anyprec_launch(
 //   Y_dst_f32     : [n_tokens, n_used, M], must be pre-zeroed
 //   ids_d         : [n_tokens, n_used] int32 device
 //   table         : per-canonical expert table from MoEScheduler
-//   uniform_precision : plane count consumed per (t, u) when
-//                       prec_per_tu_d is nullptr.
-//   prec_per_tu_d : optional [n_tokens × n_used] device array of
-//                   per-(t, u) plane counts; overrides uniform_precision.
+//   uniform_precision : plane count used when prec_per_eid_d is nullptr.
+//   prec_per_eid_d : optional [n_experts] device array of per-expert
+//                    plane counts; kernel reads
+//                    ``P = prec_per_eid_d[ids[tu]]``.  Required planes
+//                    [0, P) MUST be non-null at launch (SSOT §6.9 M1);
+//                    null required pointer → __trap().
 void naver_gemv_moe_launch(
     const void *           X_fp16,
     void *                 Y_dst_f32,
@@ -86,7 +88,7 @@ void naver_gemv_moe_launch(
     int                    n_tokens,
     int                    n_used,
     int                    uniform_precision,
-    const int *            prec_per_tu_d,
+    const int *            prec_per_eid_d,
     int                    group_size,
     int                    shared_x,
     StreamHandle           stream);

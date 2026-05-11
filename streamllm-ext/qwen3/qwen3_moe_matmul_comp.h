@@ -7,22 +7,18 @@
 //   pre_inputs() — captured D2H of ids / probs / renorm-weights into
 //                  this comp's pinned buffers.  Called once at graph
 //                  recording time; replays re-fire the captured copies.
-//   plan()       — pure host (NO CUDA APIs).  Reads the pinned input
-//                  buffers, computes per-expert max gate score, asks
-//                  the scheduler for a per-expert chunk plan, fills
-//                  the pinned ``host_prec_pinned_`` array (per-(t, u)
-//                  precision the kernel will read).  Returns the
-//                  load_set the loader thread should bring resident.
-//                  Called once per replay via ``cudaLaunchHostFunc``.
-//   execute()    — captured kernel launches: F32→F16 cast of src1,
-//                  ids D2D into the per-stream scratch, dst zero,
-//                  H2D of host_prec_pinned_ → prec_per_tu_d,
+//   plan()       — pure host.  Reads the pinned input buffers,
+//                  computes per-expert max gate score, asks the
+//                  scheduler for a per-expert chunk plan, fills the
+//                  ``host_prec_per_expert_`` array (size n_experts —
+//                  SSOT §6.9 M1).  Returns the load_set the loader
+//                  thread should bring resident.
+//   execute()    — kernel launches: F32→F16 cast of src1, ids D2D
+//                  into the per-stream scratch, dst zero, H2D of
+//                  host_prec_per_expert_ → prec_per_eid_d_,
 //                  ``refresh_q_bias_for_anyprec_launch``, and the
-//                  fused ``naver_gemv_moe_launch``.
-//
-// Wraps the same kernel surface today's ``qwen3_moe_dispatch.cpp``
-// invokes; the dispatch shim just looks up the right comp by canonical
-// name and hands off to ``Runtime::run``.
+//                  fused ``naver_gemv_moe_launch``.  Kernel traps
+//                  on null required plane (M1).
 
 #pragma once
 
@@ -112,16 +108,18 @@ private:
     int  base_precision_    = 0;
     bool any_precision_     = false;
     // Static fallback uniform_precision passed to the fused kernel
-    // launcher.  When ``prec_per_tu_d`` is non-null (always, in this
-    // path) the kernel ignores ``uniform_precision``; we still pass a
-    // valid value so the launcher's [1, 8] range check is satisfied.
+    // launcher.  When ``prec_per_eid_d_`` is non-null (always, in
+    // this path) the kernel ignores ``uniform_precision``; we still
+    // pass a valid value so the launcher's [1, 8] range check is
+    // satisfied.
     int  uniform_precision_static_ = 0;
 
     // Pinned host buffers.  Sized at construction; never reallocated.
-    int32_t * ids_pinned_       = nullptr;  // [max_n_tokens × max_n_used] int32
-    float   * probs_pinned_     = nullptr;  // [max_n_tokens × n_experts] float
-    float   * weights_pinned_   = nullptr;  // [max_n_tokens × max_n_used] float
-    int     * host_prec_pinned_ = nullptr;  // [max_n_tokens × max_n_used] int
+    int32_t * ids_pinned_           = nullptr;  // [max_n_tokens × max_n_used] int32
+    float   * probs_pinned_         = nullptr;  // [max_n_tokens × n_experts] float
+    float   * weights_pinned_       = nullptr;  // [max_n_tokens × max_n_used] float
+    int     * host_prec_per_expert_ = nullptr;  // [n_experts] int (SSOT §6.9 M1)
+    void    * prec_per_eid_d_       = nullptr;  // device, [n_experts × int]
 
     int max_n_tokens_ = 0;
     int max_n_used_   = 0;

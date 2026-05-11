@@ -28,6 +28,10 @@ namespace moe_dispatch {
 // stream; sized once at install_for_gguf via size_scratch_for(). The
 // dispatch shim and ``MoEMatMulComp::execute`` both consume these
 // buffers.
+//
+// Note: per-expert precision buffer (``prec_per_eid_d``) is owned per
+// MoEMatMulComp, not per stream — sized n_experts × int per comp
+// (SSOT §6.9 M1).  The dispatch shim does not need a slot for it.
 struct StreamScratch {
     void *  x_f16          = nullptr;
     void *  y_f16          = nullptr;
@@ -35,7 +39,6 @@ struct StreamScratch {
     void *  yb_f16         = nullptr;
     void *  w_f16          = nullptr;
     void *  ids_d          = nullptr;
-    void *  prec_per_tu_d  = nullptr;
 };
 
 StreamScratch * scratch_for_stream(cudaStream_t stream);
