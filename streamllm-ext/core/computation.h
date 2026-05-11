@@ -86,6 +86,31 @@ struct ChunkPlan {
     std::vector<ChunkKey> load_set;
 };
 
+// Kind enum lets the dispatch path short-circuit the canonical
+// lifecycle when a subclass doesn't need every step. Today's MoE
+// path is LoadCompute (the default). PipelinedMoEMatMulComp would be
+// Custom — it owns its own orchestration via ``run_custom`` instead
+// of the three simple-lifecycle virtuals.
+enum class HookKind {
+    Load,         // copy_stream work only; no compute. Used by
+                  // speculative-prefetch hooks.
+    Compute,      // compute_stream work only; no chunk movement.
+                  // Used by hand-fused subgraph replacements.
+    LoadCompute,  // simple lifecycle (pre_inputs + plan + execute).
+                  // The canonical case; today's MoEMatMulComp.
+    Sync,         // event record / wait, no kernels.
+    Observe,      // host-side state update, no GPU work.
+    Custom,       // fully-custom callback via ``run_custom``.
+};
+
+struct SchedulerContext {
+    // Reserved for the framework — pinned-buffer accessors, pool
+    // references, residency-tracker handles, etc.  Filled in as
+    // P6/P7 subclasses (PipelinedMoEMatMulComp, KvAttnComp) define
+    // what they actually need.  Today's MoEMatMulComp doesn't use
+    // run_custom so this stays empty.
+};
+
 class ChunkedComputation {
 public:
     virtual ~ChunkedComputation() = default;
@@ -94,6 +119,12 @@ public:
     // Typical implementation: return the canonical tensor name (e.g.
     // ``blk.0.ffn_gate_exps.weight``).
     virtual std::string state_key() const = 0;
+
+    // Hook flavour the dispatch path uses to route this comp.
+    // Default is LoadCompute — pre_inputs / plan / execute lifecycle.
+    // Subclasses that own their orchestration (pipelined MoE, KV
+    // attention) override to Custom and implement ``run_custom``.
+    virtual HookKind kind() const { return HookKind::LoadCompute; }
 
     // Captured D2H copies that must complete BEFORE plan() can run.
     // Default: no inputs needed.
@@ -109,15 +140,31 @@ public:
         return {};
     }
 
-    // Run the kernel.  Caller (Runtime::run) has waited on the
-    // loader's ready event on ``stream`` after the planner completed,
-    // so all chunks in plan().load_set are resident with their
-    // pointer-table entries updated. The subclass casts
+    // Run the kernel.  Caller (the dispatch shim) has waited on each
+    // loaded chunk's ready event on ``stream`` after the planner
+    // completed, so all chunks in plan().load_set are resident with
+    // their pointer-table entries updated. The subclass casts
     // ``ComputationInput`` and ``ComputationOutput`` to whatever
     // concrete payload it expects and launches the kernel(s).
-    virtual void execute(const ComputationInput & inputs,
-                          ComputationOutput &      out,
-                          StreamHandle             stream) = 0;
+    //
+    // Default = required for LoadCompute subclasses.  Subclasses
+    // overriding ``run_custom`` can leave this as a no-op
+    // (the dispatch path won't call execute on Custom comps).
+    virtual void execute(const ComputationInput & /*inputs*/,
+                          ComputationOutput &      /*out*/,
+                          StreamHandle             /*stream*/) {}
+
+    // Custom callback form. Used by subclasses whose dispatch doesn't
+    // fit the canonical lifecycle — pipelining, iteration-level
+    // scheduling, anything that wants to interleave loads and
+    // launches its own way.  Default falls through to the simple
+    // lifecycle (pre_inputs + plan + execute orchestrated by the
+    // caller) so a subclass can opt in by overriding only the
+    // virtuals it needs.
+    virtual void run_custom(const ComputationInput & /*in*/,
+                             ComputationOutput &      /*out*/,
+                             StreamHandle             /*stream*/,
+                             SchedulerContext &       /*ctx*/) {}
 };
 
 }  // namespace streamllm_ext
