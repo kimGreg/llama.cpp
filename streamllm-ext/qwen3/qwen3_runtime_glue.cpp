@@ -266,6 +266,18 @@ unsigned long long streamllm_stat_pool_h2d_calls(void) {
     return rt ? (unsigned long long) rt->pool().total_h2d_calls() : 0ull;
 }
 
+// Mode A Milestone 1, Step 6: cumulative count of chunks that
+// were not at POINTER_TABLE_READY when the executor's pre-launch
+// validation ran. Process-wide; release builds increment this
+// instead of aborting. Debug builds abort on first miss and
+// never increment past 0. See
+// Qwen3MoEAnyBcqExecutor::validate_required_set_.
+unsigned long long streamllm_stat_required_set_misses(void) {
+    return (unsigned long long)
+        qwen3::Qwen3MoEAnyBcqExecutor::required_set_misses_
+            .load(std::memory_order_relaxed);
+}
+
 // DIAG-off weak fallbacks: the real implementations live in
 // core/runtime_diag.cpp and only get linked when STREAMLLM_DIAG=ON.
 // When the diag TU isn't in the build, these zeros become the answer.

@@ -17,6 +17,8 @@
 #include "qwen3_moe_dispatch.h"        // scratch_for_stream, topk_weights_lookup, profile_inc_hook_calls
 #include "qwen3_moe_matmul_comp.h"     // MoEMatMulComp, MoEInput/Output
 #include "qwen3_moe_scheduler.h"       // qwen3::scheduler_* helpers
+#include "computation.h"               // ChunkPlan, ChunkKey
+#include "vram_pool.h"                 // ChunkState
 #include "runtime.h"
 #include "scheduler.h"
 
@@ -24,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,12 +37,73 @@
 
 namespace streamllm_ext { namespace qwen3 {
 
+std::atomic<std::uint64_t> Qwen3MoEAnyBcqExecutor::required_set_misses_{0};
+
 void Qwen3MoEAnyBcqExecutor::bind_to_model(
     StreamllmRuntime &  rt,
     const StreamReader & /*reader*/,
     const std::string &  /*gguf_path*/)
 {
     rt_ = &rt;
+}
+
+bool Qwen3MoEAnyBcqExecutor::validate_required_set_(
+    const ChunkPlan & plan,
+    StreamHandle      stream) const
+{
+    if (rt_ == nullptr) return false;
+    if (plan.required_set.empty()) return true;
+
+    const auto & pool = rt_->pool();
+    int n_miss = 0;
+    const ChunkKey * first_miss = nullptr;
+    for (const auto & k : plan.required_set) {
+        if (!pool.kernel_ready_on(k.wid, k.cid, stream)) {
+            if (first_miss == nullptr) first_miss = &k;
+            ++n_miss;
+        }
+    }
+    if (n_miss == 0) return true;
+
+    required_set_misses_.fetch_add((std::uint64_t) n_miss,
+                                    std::memory_order_relaxed);
+
+    // Build the failure message once — useful for both the
+    // debug-build abort and the release-build rate-limited log.
+    auto state_to_str = [](ChunkState s) -> const char * {
+        switch (s) {
+            case ChunkState::NOT_RESIDENT:        return "NOT_RESIDENT";
+            case ChunkState::SLOT_ALLOCATED:      return "SLOT_ALLOCATED";
+            case ChunkState::H2D_ISSUED:          return "H2D_ISSUED";
+            case ChunkState::POINTER_TABLE_READY: return "POINTER_TABLE_READY";
+        }
+        return "?";
+    };
+    const ChunkState first_state =
+        pool.chunk_state(first_miss->wid, first_miss->cid);
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "streamllm-ext: required_set residency violation — "
+        "%d/%zu chunks not kernel-ready before launch "
+        "(first miss: wid=%s cid=%d state=%s required >= POINTER_TABLE_READY)",
+        n_miss, plan.required_set.size(),
+        first_miss->wid.c_str(), first_miss->cid,
+        state_to_str(first_state));
+
+#ifndef NDEBUG
+    GGML_ABORT("%s", buf);
+#else
+    // Release-build: rate-limit to once per wid via a small static set.
+    static std::unordered_set<std::string> seen;
+    static std::mutex                      seen_mu;
+    {
+        std::lock_guard<std::mutex> lk(seen_mu);
+        if (seen.insert(first_miss->wid).second) {
+            std::fprintf(stderr, "%s\n", buf);
+        }
+    }
+    return false;
+#endif
 }
 
 const ggml_tensor * Qwen3MoEAnyBcqExecutor::probe_probs_tensor_(
@@ -237,6 +301,26 @@ bool Qwen3MoEAnyBcqExecutor::forward_moe_block(
             rt_->pool().wait_on_stream(k.wid, k.cid, stream);
         }
     }
+
+    // Step 6 (Milestone 1): host-side pre-launch validation. After
+    // submit_loads + wait_loads_on, every chunk in plan.required_set
+    // (load_set ∪ keep_set) MUST be at POINTER_TABLE_READY. Catches
+    // a missed load or a stale keep_set entry before the kernel
+    // trap fires — debug build aborts, release build counts + logs.
+    if (!validate_required_set_(plan, stream)) {
+        // Release-build path: the validation already logged the
+        // failure and incremented required_set_misses_. Bail
+        // instead of launching the kernel, which would M1-trap on
+        // device anyway.
+        if (!plan.load_set.empty()) {
+            for (const auto & k : plan.load_set) {
+                qwen3::scheduler_release_from_dispatch(
+                    rt_->scheduler(), k.wid, k.cid);
+            }
+        }
+        return false;
+    }
+
     comp->execute(in, out, stream);
     if (!plan.load_set.empty()) {
         for (const auto & k : plan.load_set) {

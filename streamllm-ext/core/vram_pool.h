@@ -49,6 +49,30 @@ struct ChunkHandle {
     EventHandle  ready_event = nullptr;
 };
 
+// Per-chunk residency-progress state (Mode A Milestone 1 Step 6).
+//
+// A chunk advances monotonically through these states as the loader
+// pipeline processes it.  Eviction resets to NOT_RESIDENT.  Backward
+// transitions other than eviction are bugs.
+//
+// Host-side validation (Qwen3MoEAnyBcqExecutor::validate_required_set_)
+// checks ``chunk_state(wid, cid) >= POINTER_TABLE_READY`` for every
+// chunk the kernel will read, before launching the fused MoE op.
+// The device-side M1 required-non-null trap (qwen3_moe_fused.cu) is the
+// final guard; Step 6 catches misses earlier with a useful message.
+enum class ChunkState : uint8_t {
+    NOT_RESIDENT        = 0,   // not in the pool
+    SLOT_ALLOCATED      = 1,   // slot reserved; H2D not yet enqueued
+    H2D_ISSUED          = 2,   // cudaMemcpyAsync enqueued; ready_event recorded
+    POINTER_TABLE_READY = 3,   // loader ran ChunkedTensor::after_load —
+                               // per-plane device pointer-table store is
+                               // visible after a wait on ready_event
+    // KERNEL_READY is conceptual rather than tracked per-(stream, chunk).
+    // Step 6 derives it from "POINTER_TABLE_READY + caller has called
+    // wait_on_stream(this stream) since the last after_load", which the
+    // single-stream Mode A pipeline holds by construction.
+};
+
 // Chunks are identified by (wid, cid). wid is a string — usually the
 // GGUF tensor name; cid is an integer plane / offset index.
 struct ChunkKey {
@@ -104,7 +128,32 @@ public:
     // View an already-resident chunk. Returns nullptr device_ptr if not
     // resident (caller can then load() it).
     ChunkHandle view(const std::string & wid, int cid) const;
+    // Back-compat shim: returns true iff chunk_state >= SLOT_ALLOCATED.
+    // Note this is too weak to imply kernel-readiness — H2D may still
+    // be in flight, and after_load may not have run. Use
+    // after_load_done / chunk_state for stronger checks.  (See SSOT
+    // §6.4.2.2 / Milestone 1 Step 6.)
     bool is_resident(const std::string & wid, int cid) const;
+
+    // Step 6 (Milestone 1): residency-progress accessors. None of
+    // these read device memory — pure host state queries.
+    ChunkState chunk_state(const std::string & wid, int cid) const;
+    bool       after_load_done(const std::string & wid, int cid) const;
+    // True iff chunk_state >= POINTER_TABLE_READY.  ``stream`` is
+    // reserved for a future per-(stream, chunk) waited-set; for
+    // milestone 1 it is unused — the executor's call sequence
+    // (submit_loads → wait_loads_on(stream) → validate) establishes
+    // stream-ordering against ready_event by construction (see
+    // docs/MODE_A_MILESTONE1.md Step 6 "Host validation API").
+    bool       kernel_ready_on(const std::string & wid, int cid,
+                                StreamHandle stream) const;
+
+    // Loader transition: advances chunk_state to POINTER_TABLE_READY.
+    // Called by ``StreamllmRuntime::move_chunk`` after the encoder's
+    // ChunkedTensor::after_load callback has queued the per-plane
+    // pointer-table store on copy_stream AND the ready_event has been
+    // re-recorded post-after_load.  Idempotent — second call is a no-op.
+    void       mark_pointer_table_ready(const std::string & wid, int cid);
 
     // Make ``stream`` wait on the chunk's pending H2D. No-op in sync mode
     // or if the chunk's copy has already completed.
@@ -143,6 +192,7 @@ private:
     struct Resident {
         Slot        slot;
         EventHandle ready_event;  // nullptr if sync-copied or already waited on
+        ChunkState  state = ChunkState::NOT_RESIDENT;  // Step 6 progression
     };
 
     // First-fit free-list helpers.

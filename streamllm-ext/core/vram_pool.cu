@@ -250,7 +250,14 @@ ChunkHandle VramChunkPool::load(
         ++total_h2d_calls_;
     }
 
-    residents_.emplace(key, Resident{slot, evt});
+    // Step 6: the chunk has been allocated and (in async mode) had its
+    // H2D enqueued on copy_stream. The encoder's after_load callback
+    // hasn't run yet — that happens in StreamllmRuntime::move_chunk
+    // which calls mark_pointer_table_ready when after_load completes.
+    const ChunkState initial_state = (host_ptr != nullptr)
+        ? ChunkState::H2D_ISSUED
+        : ChunkState::SLOT_ALLOCATED;
+    residents_.emplace(key, Resident{slot, evt, initial_state});
     if (used_bytes_ > peak_used_bytes_) peak_used_bytes_ = used_bytes_;
 
     return ChunkHandle{
@@ -300,6 +307,41 @@ ChunkHandle VramChunkPool::view(const std::string & wid, int cid) const {
 bool VramChunkPool::is_resident(const std::string & wid, int cid) const {
     std::lock_guard<std::mutex> lk(mu_);
     return residents_.find({wid, cid}) != residents_.end();
+}
+
+ChunkState VramChunkPool::chunk_state(const std::string & wid, int cid) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = residents_.find({wid, cid});
+    if (it == residents_.end()) return ChunkState::NOT_RESIDENT;
+    return it->second.state;
+}
+
+bool VramChunkPool::after_load_done(const std::string & wid, int cid) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = residents_.find({wid, cid});
+    if (it == residents_.end()) return false;
+    return it->second.state >= ChunkState::POINTER_TABLE_READY;
+}
+
+bool VramChunkPool::kernel_ready_on(const std::string & wid, int cid,
+                                     StreamHandle /*stream*/) const {
+    // Stream-ordering against ready_event is established by the
+    // executor's submit_loads → wait_loads_on(stream) sequence (for
+    // load_set) plus the single-compute-stream invariant in Mode A
+    // milestone 1 (for keep_set). Host-side check is therefore reduced
+    // to "after_load has run" — anything weaker is a bug worth
+    // catching here rather than in the M1 kernel trap.  See
+    // docs/MODE_A_MILESTONE1.md Step 6 "Host validation API".
+    return after_load_done(wid, cid);
+}
+
+void VramChunkPool::mark_pointer_table_ready(const std::string & wid, int cid) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = residents_.find({wid, cid});
+    if (it == residents_.end()) return;        // raced with eviction
+    if (it->second.state < ChunkState::POINTER_TABLE_READY) {
+        it->second.state = ChunkState::POINTER_TABLE_READY;
+    }
 }
 
 

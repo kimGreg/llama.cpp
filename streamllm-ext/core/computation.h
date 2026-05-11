@@ -80,10 +80,18 @@ struct MemcpySpec {
 };
 
 // Result of plan(): the chunks the loader thread should evict /
-// load before the captured kernel runs. Either set may be empty.
+// load before the captured kernel runs.  Either set may be empty.
+//
+// ``required_set`` (Milestone 1 Step 6) is the *superset* the kernel
+// will read on this dispatch — load_set ∪ (chunks already resident
+// and reused on this layer). The executor's pre-launch validation
+// walks this set asserting every (wid, cid) is at
+// ``ChunkState::POINTER_TABLE_READY`` before the fused MoE kernel
+// fires. Empty for hooks that don't need the check.
 struct ChunkPlan {
     std::vector<ChunkKey> evict_set;
     std::vector<ChunkKey> load_set;
+    std::vector<ChunkKey> required_set;
 };
 
 // Kind enum lets the dispatch path short-circuit the canonical

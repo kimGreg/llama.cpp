@@ -737,6 +737,15 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
                     cudaEventRecord((cudaEvent_t)h.ready_event,
                                     (cudaStream_t)pool_->copy_stream());
                 }
+                // Step 6 (Milestone 1): advance the chunk's residency
+                // state to POINTER_TABLE_READY now that after_load has
+                // been enqueued on copy_stream and ready_event has
+                // been re-recorded post-after_load. The host-side
+                // pre-launch validation in
+                // Qwen3MoEAnyBcqExecutor::validate_required_set_
+                // refuses to launch until every required chunk reaches
+                // this state.
+                pool_->mark_pointer_table_ready(wid, cid);
                 // Any-prec only: stash β pointer host-side so the kernel
                 // launcher can dereference dev.q_bias_fp16 directly.
                 // Last-landed chunk wins; chunk_matmul re-asserts this

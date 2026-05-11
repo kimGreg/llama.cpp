@@ -341,13 +341,24 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     }
 
 
-    // ── Pass 3: per-expert plan → load_set (deduplicated).
+    // ── Pass 3: per-expert plan → load_set (deduplicated) +
+    //            full required_set (every (eid, plane) the kernel
+    //            will read).  Step 6 (Milestone 1) walks required_set
+    //            pre-launch to verify each chunk reached
+    //            POINTER_TABLE_READY — catches a missed load or a
+    //            stale keep_set entry before the kernel trap fires.
     std::unordered_set<std::string> issued_keys;
     issued_keys.reserve(unique_experts.size() * 8);
     out_plan.load_set.reserve(unique_experts.size() * 8);
+    out_plan.required_set.reserve(unique_experts.size() * 8);
 
     for (int eid : unique_experts) {
         const int desired = max_prec_by_expert[eid];
+        const std::string synthetic =
+            canonical_ + ":e" + std::to_string(eid);
+        for (int p = 0; p < desired; ++p) {
+            out_plan.required_set.push_back(ChunkKey{synthetic, cid_chunk(p)});
+        }
         const Plan * exp_plan =
             qwen3::scheduler_plan_for_expert_with_precision(
                 *sched_, canonical_, eid, desired,
