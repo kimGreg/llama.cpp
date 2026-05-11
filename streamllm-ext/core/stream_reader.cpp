@@ -92,6 +92,37 @@ std::vector<uint32_t> get_arr_u32(const gguf_context * ctx, const char * key) {
     return out;
 }
 
+// Optional bool — returns ``fallback`` if the key is absent. The gguf
+// writer emits booleans as GGUF_TYPE_BOOL (1 byte); also accept the
+// common u8/u32/i32 0/1 encodings for compatibility with older
+// encoder versions that may have stored the value as an int.
+bool get_bool_or(const gguf_context * ctx, const char * key, bool fallback) {
+    int64_t id = optional_key(ctx, key);
+    if (id < 0) return fallback;
+    gguf_type t = gguf_get_kv_type(ctx, id);
+    switch (t) {
+        case GGUF_TYPE_BOOL:  return gguf_get_val_bool(ctx, id);
+        case GGUF_TYPE_UINT8: return gguf_get_val_u8(ctx, id)  != 0;
+        case GGUF_TYPE_INT8:  return gguf_get_val_i8(ctx, id)  != 0;
+        case GGUF_TYPE_UINT32:return gguf_get_val_u32(ctx, id) != 0;
+        case GGUF_TYPE_INT32: return gguf_get_val_i32(ctx, id) != 0;
+        default:
+            throw std::runtime_error(
+                std::string("streamllm-ext: key '") + key +
+                "' has unsupported bool encoding " +
+                std::to_string((int)t));
+    }
+}
+
+// Optional string — returns ``fallback`` if the key is absent.
+std::string get_str_or(const gguf_context * ctx, const char * key,
+                       const std::string & fallback) {
+    int64_t id = optional_key(ctx, key);
+    if (id < 0) return fallback;
+    const char * s = gguf_get_val_str(ctx, id);
+    return s ? std::string(s) : std::string();
+}
+
 } // anonymous namespace
 
 
@@ -111,6 +142,13 @@ std::optional<StreamReader> StreamReader::from_gguf(const gguf_context * ctx,
     r.global_.group_size       = get_u32(ctx, "streamllm.group_size");
     r.global_.base_precision   = get_u32(ctx, "streamllm.base_precision");
     r.global_.target_precision = get_u32(ctx, "streamllm.target_precision");
+    // Mode A loader gate (Milestone 1, Step 1).  Both keys are optional —
+    // absent keys mean "pre-gate artifact, keep legacy behaviour":
+    //   required_runtime: missing → false  (no refuse-to-load)
+    //   executor:         missing → ""     (install resolves to the
+    //                                       hardcoded default)
+    r.global_.required_runtime = get_bool_or(ctx, "streamllm.required_runtime", false);
+    r.global_.executor         = get_str_or (ctx, "streamllm.executor",         std::string());
     r.managed_                 = get_arr_str(ctx, "streamllm.managed_tensors");
 
     r.layouts_.reserve(r.managed_.size());
@@ -184,6 +222,8 @@ void dump(const StreamReader & r) {
     std::printf("  group_size        = %u\n", g.group_size);
     std::printf("  base_precision    = %u\n", g.base_precision);
     std::printf("  target_precision  = %u\n", g.target_precision);
+    std::printf("  required_runtime  = %s\n", g.required_runtime ? "true" : "false");
+    std::printf("  executor          = %s\n", g.executor.empty() ? "(unset)" : g.executor.c_str());
     std::printf("  managed_tensors   = %zu names\n", r.managed_tensor_names().size());
     if (!r.gguf_path().empty()) {
         std::printf("  gguf_path         = %s\n", r.gguf_path().c_str());

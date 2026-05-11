@@ -67,6 +67,15 @@ struct GlobalMeta {
     uint32_t group_size;
     uint32_t base_precision;
     uint32_t target_precision;
+
+    // Mode A loader gate (Milestone 1, Step 1).  When ``required_runtime``
+    // is true, ``install_for_gguf`` MUST resolve ``executor`` against the
+    // ModelExecutor registry and MUST refuse-to-load if the named executor
+    // is not present — stock GGUFs and pre-gate streamllm artifacts (no
+    // such keys) default to ``false`` / ``""`` and keep the legacy
+    // behaviour (hardcoded executor name with a soft fallback).
+    bool        required_runtime = false;
+    std::string executor;            // versioned, e.g. "qwen3_moe_anybcq_v1"
 };
 
 // Parse streamllm.* metadata from an already-loaded gguf_context. The

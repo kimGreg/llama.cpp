@@ -147,6 +147,14 @@ endif()
 add_executable(streamllm-gguf-dump streamllm_gguf_dump.cpp)
 target_link_libraries(streamllm-gguf-dump PRIVATE streamllm_ext ggml)
 
+# streamllm-loader-gate-test: synthetic-failure test for Milestone 1
+# Step 1's required_runtime + executor gate. Builds three minimal
+# in-memory GGUFs (pre-gate / required-ok / required-bad), drives
+# them through StreamReader::from_gguf + the executor registry
+# lookup, and asserts the gate semantics. No CUDA needed.
+add_executable(streamllm-loader-gate-test test_loader_gate.cpp)
+target_link_libraries(streamllm-loader-gate-test PRIVATE streamllm_ext ggml)
+
 if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     # streamllm-gpu-test: end-to-end kernel check (GGUF → VramChunkPool

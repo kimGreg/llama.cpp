@@ -36,7 +36,29 @@ std::mutex                            g_runtime_mu;
 std::unique_ptr<StreamllmRuntime>     g_runtime;
 std::unique_ptr<ModelExecutor>        g_executor;
 
+// Mode A loader gate (Milestone 1, Step 1) — remember whether the
+// currently-installed runtime came from a GGUF with
+// ``streamllm.required_runtime=true``.  A second install while a
+// required-runtime model is live MUST hard-fail (see the
+// executor-lifetime contract in docs/MODE_A_MILESTONE1.md Step 7
+// design).  Defaults to false on cold start and after clear().
+bool                                  g_required_runtime_was_true = false;
+
 namespace {
+
+// Default executor name preserved from pre-Step-1 installs.  Used when
+// the GGUF does not carry ``streamllm.executor`` (pre-gate artifact)
+// and required_runtime is false.  This is the soft-fallback name; the
+// hard refuse-to-load path lives below.
+constexpr const char * kDefaultExecutorName = "qwen3_moe_anybcq_v1";
+
+// Resolve the executor name to look up in the registry.
+//   GGUF carries streamllm.executor → use it.
+//   Missing key                     → kDefaultExecutorName (legacy).
+std::string resolve_executor_name(const GlobalMeta & g) {
+    return g.executor.empty() ? std::string(kDefaultExecutorName)
+                              : g.executor;
+}
 
 // Conservative pool sizing used by install_for_gguf. Mirrors
 // test_runtime_full.cpp::estimate_pool_bytes — summed over every
@@ -79,10 +101,23 @@ bool install_for_gguf(const char * gguf_path) {
     std::lock_guard<std::mutex> lk(g_runtime_mu);
 
     if (g_runtime) {
+        // Step 1 (Milestone 1) — refuse to silently replace a runtime
+        // whose model declared required_runtime=true.  Any
+        // llama_model::streamllm_executor pointers into the prior
+        // runtime would become dangling.  See the executor-lifetime
+        // contract in docs/MODE_A_MILESTONE1.md (Step 7 design).
+        // Pre-gate installs (required_runtime=false) keep the legacy
+        // silent-replace behaviour for backward compatibility.
+        if (g_required_runtime_was_true) {
+            throw std::runtime_error(
+                "streamllm-ext: a required_runtime model is already loaded; "
+                "free it before loading another StreamLLM model");
+        }
         std::fprintf(stderr,
-            "streamllm-ext: replacing previously-installed runtime "
-            "(prior model not cleared explicitly)\n");
+            "streamllm-ext: replacing previously-installed (non-required) "
+            "runtime — prior model was not cleared explicitly\n");
         g_runtime.reset();
+        g_executor.reset();
     }
 
     size_t cap = estimate_pool_bytes(reader);
@@ -105,21 +140,49 @@ bool install_for_gguf(const char * gguf_path) {
             "streamllm-ext: failed to size cast scratch");
     }
 
-    // Mode A executor (SSOT §6.1.1).  Register the Qwen3-MoE AnyBCQ
-    // executor (idempotent), instantiate it via the registry, and
-    // bind it to this model.  The per-op hook routes managed
-    // mul_mat_id dispatches through g_executor->forward_moe_block
-    // — the executor is the canonical owner of the streamed forward.
-    // Today the registry name is hardcoded; the GGUF
-    // ``streamllm.executor`` key validation lands as a follow-up.
+    // Mode A executor (SSOT §6.1.1, Milestone 1 Step 1 loader gate).
+    // Register the Qwen3-MoE AnyBCQ executor (idempotent), then resolve
+    // the executor name against the GGUF's streamllm.executor key (with
+    // a soft-fallback default for pre-gate artifacts).  When
+    // streamllm.required_runtime=true and the named executor is not in
+    // the registry — e.g. binary mismatch, missing build config — refuse
+    // to load with a greppable error rather than silently downgrade.
     qwen3::register_qwen3_moe_anybcq_executor();
-    g_executor = make_executor("qwen3_moe_anybcq_v1");
+    const std::string exec_name = resolve_executor_name(reader.global());
+    g_executor = make_executor(exec_name.c_str());
     if (g_executor == nullptr) {
-        g_runtime.reset();
-        throw std::runtime_error(
-            "streamllm-ext: executor 'qwen3_moe_anybcq_v1' not registered");
+        if (reader.global().required_runtime) {
+            // Bring-up escape hatch: STREAMLLM_REQUIRED_RUNTIME_IGNORE=1
+            // downgrades the throw to a warning so operators can run a
+            // mismatched binary against a required_runtime artifact for
+            // diagnosis. The default behaviour (no env var) is the safe
+            // refuse-to-load.
+            if (getenv("STREAMLLM_REQUIRED_RUNTIME_IGNORE")) {
+                std::fprintf(stderr,
+                    "streamllm-ext: WARNING — required_runtime=true but "
+                    "executor '%s' is not registered. Continuing because "
+                    "STREAMLLM_REQUIRED_RUNTIME_IGNORE is set; managed "
+                    "dispatch will fall back to legacy paths and may "
+                    "produce wrong output.\n", exec_name.c_str());
+            } else {
+                g_runtime.reset();
+                throw std::runtime_error(
+                    "streamllm-ext: required_runtime=true but executor '"
+                    + exec_name + "' is not registered (build mismatch?)");
+            }
+        } else {
+            // Legacy soft-fail: pre-gate artifacts (no required_runtime
+            // key) still expect the hardcoded default to resolve. If we
+            // somehow got here with the default name unregistered,
+            // surface a clear error so the operator knows the build is
+            // broken.
+            g_runtime.reset();
+            throw std::runtime_error(
+                "streamllm-ext: executor '" + exec_name + "' not registered");
+        }
     }
     g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
+    g_required_runtime_was_true = reader.global().required_runtime;
 
     std::fprintf(stderr,
         "streamllm-ext: runtime ready "
@@ -270,6 +333,7 @@ void clear() {
     moe_dispatch::clear_topk_weights();
     g_executor.reset();
     g_runtime.reset();
+    g_required_runtime_was_true = false;
     moe_dispatch::free_scratch();
     batched_gemm_shutdown();
 }
