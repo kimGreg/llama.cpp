@@ -9,10 +9,12 @@
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "stream_reader.h"
+#include "executor.h"
 #include "anybcq_gemm.h"
 
 #include "qwen3_moe_dispatch.h"
 #include "qwen3_moe_scheduler.h"  // qwen3::scheduler_* free-fn shims
+#include "qwen3_moe_executor.h"   // Qwen3MoEAnyBcqExecutor + registration
 
 #include <ggml.h>
 #include <gguf.h>
@@ -32,6 +34,7 @@ namespace streamllm_ext {
 // mutex.
 std::mutex                            g_runtime_mu;
 std::unique_ptr<StreamllmRuntime>     g_runtime;
+std::unique_ptr<ModelExecutor>        g_executor;
 
 namespace {
 
@@ -102,10 +105,27 @@ bool install_for_gguf(const char * gguf_path) {
             "streamllm-ext: failed to size cast scratch");
     }
 
+    // Mode A executor (SSOT §6.1.1).  Register the Qwen3-MoE AnyBCQ
+    // executor (idempotent), instantiate it via the registry, and
+    // bind it to this model.  The per-op hook routes managed
+    // mul_mat_id dispatches through g_executor->forward_moe_block
+    // — the executor is the canonical owner of the streamed forward.
+    // Today the registry name is hardcoded; the GGUF
+    // ``streamllm.executor`` key validation lands as a follow-up.
+    qwen3::register_qwen3_moe_anybcq_executor();
+    g_executor = make_executor("qwen3_moe_anybcq_v1");
+    if (g_executor == nullptr) {
+        g_runtime.reset();
+        throw std::runtime_error(
+            "streamllm-ext: executor 'qwen3_moe_anybcq_v1' not registered");
+    }
+    g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
+
     std::fprintf(stderr,
         "streamllm-ext: runtime ready "
-        "(scheduler=%s, pool %.1f / %.1f MB used)\n",
+        "(scheduler=%s, executor=%s, pool %.1f / %.1f MB used)\n",
         g_runtime->scheduler().name(),
+        g_executor->name(),
         (double)g_runtime->pool().used_bytes()     / 1024.0 / 1024.0,
         (double)g_runtime->pool().capacity_bytes() / 1024.0 / 1024.0);
 
@@ -248,6 +268,7 @@ void clear() {
     ggml_cuda_set_topk_moe_hook(nullptr);
     ggml_cuda_set_user_node_claims_hook(nullptr);
     moe_dispatch::clear_topk_weights();
+    g_executor.reset();
     g_runtime.reset();
     moe_dispatch::free_scratch();
     batched_gemm_shutdown();
@@ -296,17 +317,28 @@ extern "C" void streamllm_topk_moe_observed(
 
 extern "C" bool streamllm_try_cuda_mul_mat_id(
     cudaStream_t stream,
-    const struct ggml_tensor * /*src0*/,
-    const struct ggml_tensor * /*src1*/,
-    const struct ggml_tensor * /*ids*/,
-    struct ggml_tensor * dst)
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * ids,
+    struct ggml_tensor *       dst)
 {
-    StreamllmRuntime * rt = nullptr;
+    ModelExecutor *    exec = nullptr;
+    StreamllmRuntime * rt   = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_runtime_mu);
-        rt = g_runtime.get();
+        rt   = g_runtime.get();
+        exec = g_executor.get();
     }
     if (rt == nullptr) return false;
+    // Mode A: managed MoE dispatches route through the model
+    // executor (SSOT §6.4.2).  The executor wraps the current
+    // scheduler + plan + load + kernel flow; the per-op hook is the
+    // integration boundary, the executor is the canonical owner.
+    if (exec != nullptr) {
+        return exec->forward_moe_block(
+            (StreamHandle) stream, src0, src1, ids, dst);
+    }
+    // Fallback for legacy installs that pre-date the executor.
     return rt->scheduler().dispatch_node((StreamHandle) stream, dst);
 }
 

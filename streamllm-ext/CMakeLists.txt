@@ -20,6 +20,7 @@ endif()
 set(STREAMLLM_EXT_SOURCES
     core/stream_reader.cpp
     core/runtime.cpp
+    core/executor.cpp
     qwen3/qwen3_moe_scheduler.cpp
     qwen3/qwen3_graph_instrumenter.cpp
     decoder/anybcq/upstream_layout.cpp
@@ -36,6 +37,7 @@ if (GGML_CUDA)
         qwen3/qwen3_runtime_glue.cpp
         qwen3/qwen3_moe_dispatch.cpp
         qwen3/qwen3_moe_matmul_comp.cpp
+        qwen3/qwen3_moe_executor.cpp
     )
 endif()
 
