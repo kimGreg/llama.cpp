@@ -179,6 +179,22 @@ if (GGML_CUDA)
         PRIVATE streamllm_ext CUDA::cudart)
 endif()
 
+# streamllm-router-equiv-test: equivalence test for M1 cutover S3's
+# llm_build_moe_routing_softmax_topk helper. Builds the router
+# subgraph two ways (helper + hand-rolled reference emitting the
+# same raw ggml ops in the same order) into the same ggml_context,
+# computes on CUDA backend, and asserts ids byte-for-byte and
+# probs/weights bit-exact identical. Catches any drift between
+# the helper and its documented op sequence. Needs the llama-graph.h
+# declaration of the helper — include path widened for this target.
+if (GGML_CUDA)
+    add_executable(streamllm-router-equiv-test test_router_equiv.cpp)
+    target_include_directories(streamllm-router-equiv-test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_link_libraries(streamllm-router-equiv-test
+        PRIVATE streamllm_ext ggml ggml-cuda llama CUDA::cudart)
+endif()
+
 if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     # streamllm-gpu-test: end-to-end kernel check (GGUF → VramChunkPool
