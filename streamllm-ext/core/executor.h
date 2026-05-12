@@ -6,11 +6,11 @@
 // current-batch routing, chunk reserve/load/wait, fused kernel
 // launch, post-kernel release.  See SSOT §6.6.0.
 //
-// Today's invocation point: ggml-cuda's per-op hook for managed
-// mul_mat_id nodes forwards into ``forward_moe_block``.  The
-// executor is the canonical owner regardless of how it's reached;
-// future ggml custom-op or arch-builder patches replace the hook
-// without changing the executor surface.
+// Invocation point (Mode A M1): ggml-cuda's pre_op_hook matches on
+// the per-layer ``"streamllm.moe_layer_<L>"`` sentinel emitted by
+// the arch-builder helper ``llm_build_moe_sentinel`` and routes the
+// dispatch into ``forward_moe_layer``. No per-canonical interception
+// remains.
 
 #pragma once
 

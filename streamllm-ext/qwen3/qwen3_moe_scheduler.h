@@ -69,17 +69,10 @@ void scheduler_after_compute(
     const std::string & wid,
     StreamHandle        compute_stream);
 
-// Graph-instrumenter pre-dispatch visit. Called from the per-op
-// dispatch glue (qwen3_moe_dispatch.cpp) before any compute for a
-// managed node. The instrumenter uses the prewalk-built node→layer
-// map to detect layer transitions and fires
-// Scheduler::on_marker(LayerBegin/LayerEnd). No-op if the
-// instrumenter hasn't been seeded (graph_compute_begin not called
-// yet, or non-MoE scheduler active).
-void scheduler_on_managed_node_visit(
-    Scheduler &                sched,
-    const struct ggml_tensor * dst,
-    StreamHandle               compute_stream);
+// ``scheduler_on_managed_node_visit`` and the per-canonical graph
+// instrumenter (qwen3_graph_instrumenter.{h,cpp}) were retired in the
+// post-M1 cleanup pass. The sentinel name carries the per-layer
+// index directly; no per-node visit-marker is needed.
 
 // (P2★) The previous per-op extern-C shim forwarders
 // scheduler_handle_mul_mat / _id, scheduler_on_topk_moe_observed,

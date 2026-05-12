@@ -172,45 +172,29 @@ public:
     // ─── Per-node claim + dispatch (P2★) ───────────────────────────
     //
     // The two-virtual contract that ggml-cuda's per-op hooks delegate
-    // to. Concrete schedulers override one or both to claim cgraph
-    // nodes whose dispatch they want to handle, replacing the stock
-    // ggml-cuda op handler with their own kernel sequence.
+    // to. Concrete schedulers override these to identify the cgraph
+    // nodes whose execution they intend to claim (Mode A sentinels
+    // and, for the S10 clear-fail, managed canonicals surfacing as
+    // dense MUL_MAT).
     //
     // claims_node: cheap predicate, called by ggml-cuda's
-    //   user_node_claims hook before deciding whether to capture this
-    //   cgraph into a cuda-graph (a true return forces eager).
-    // dispatch_node: heavy dispatch, called from the per-op hooks
-    //   (streamllm_try_cuda_mul_mat[_id]) when ggml-cuda is about to
-    //   execute a node. Return true to mean "I handled this; skip
-    //   stock dispatch"; false to fall through.
-    // claims_tensor: legacy fusion-skip predicate. Asked of the
-    //   weight tensor whenever ggml-cuda is about to fold a mul_mat
-    //   into a fused subgraph — returning true keeps the mul_mat in
-    //   the regular dispatch path so the scheduler's per-op handler
-    //   can claim it. Defaults to consulting claims_node for the
-    //   adjacent mul_mat node would require synthetic ggml_tensors;
-    //   subclasses override directly.
-    // observe_topk_moe: notification fired before ggml-cuda's fused
-    //   topk_moe kernel runs, letting the scheduler stash the
-    //   (logits, weights, ids) handles for later use. No dispatch
-    //   replacement; the topk_moe op still runs.
+    //   user_node_claims hook before deciding whether to capture
+    //   this cgraph into a cuda-graph (a true return forces eager).
+    // claims_tensor: predicate over a weight tensor — used by the
+    //   S10 dense-managed clear-fail to detect managed canonicals
+    //   surfacing as dense MUL_MAT (which Mode A forbids).
     //
-    // All four default to "this scheduler doesn't care" so a
-    // non-overriding subclass works correctly.
+    // The legacy ``dispatch_node`` / ``observe_topk_moe`` virtuals
+    // were retired in the post-M1 cleanup pass along with the legacy
+    // per-op MUL_MAT_ID and fused-topk_moe hooks; sentinel dispatch
+    // runs through the executor (Qwen3MoEAnyBcqExecutor::
+    // forward_moe_layer), not through a scheduler virtual.
     virtual bool claims_node(const struct ggml_tensor * /*node*/) const {
-        return false;
-    }
-    virtual bool dispatch_node(StreamHandle               /*stream*/,
-                                const struct ggml_tensor * /*node*/) {
         return false;
     }
     virtual bool claims_tensor(const struct ggml_tensor * /*w*/) const {
         return false;
     }
-    virtual void observe_topk_moe(StreamHandle               /*stream*/,
-                                   const struct ggml_tensor * /*logits*/,
-                                   struct ggml_tensor *       /*weights*/,
-                                   struct ggml_tensor *       /*ids*/) {}
 
     // ─── Per-replay state (P2★) ────────────────────────────────────
     //

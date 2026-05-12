@@ -4,13 +4,14 @@
 // through the AnyBCQ chunk encoder.  Selected at llama_model_load
 // by ``streamllm.executor = "qwen3_moe_anybcq_v1"`` in the GGUF.
 //
-// ``forward_moe_block`` is invoked once per managed mul_mat_id
-// dispatch by qwen3_runtime_glue's hook surface (today's integration
-// point; a future ggml custom-op / arch-builder patch replaces the
-// hook entry point without changing the executor body — see
-// SSOT §6.4.2).  Inside the call, the scheduler runs with
-// current-batch routing, loads missing chunks, waits on copy_stream,
-// then launches the fused MoE kernel.
+// ``forward_moe_layer`` is invoked once per managed MoE layer by the
+// per-layer sentinel rail (qwen3_runtime_glue's ``streamllm_pre_op``
+// matches on the ``"streamllm.moe_layer_<L>"`` name set by the
+// arch-builder helper ``llm_build_moe_sentinel``).  Inside the call,
+// the executor runs three chunked matmuls (gate / up / down) with
+// current-batch routing — D2H ids/probs/weights, plan, reserve,
+// load, wait, validate, fused kernel — plus the in-place SwiGLU
+// elementwise and the final weighted reduce into ``layer_out``.
 
 #pragma once
 
@@ -101,12 +102,9 @@ public:
     static std::atomic<std::uint64_t> required_set_misses_;
 
 private:
-    // Walk one or two parents up from ``ids`` to find the F32 probs
-    // tensor produced by the router. Returns nullptr when the topology
-    // doesn't match (e.g. ids->src[0] is not the gate output).
-    // Topology is graph-stable so this probe is cheap on every call.
-    static const ggml_tensor * probe_probs_tensor_(const ggml_tensor * ids,
-                                                    int n_tokens);
+    // ``probe_probs_tensor_`` was retired with the legacy
+    // ``forward_moe_block`` body — the sentinel carries probs through
+    // ``src[2]`` directly.
 
     StreamllmRuntime * rt_ = nullptr;
 

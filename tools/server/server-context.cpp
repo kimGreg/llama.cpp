@@ -4163,13 +4163,35 @@ void server_routes::init_routes() {
     };
 
     // streamllm-ext: live precision dial. POST a JSON body
-    //   {"thresholds": [0.4, 0.3, 0.1, 0.05], "chunks": [8, 6, 4, 2]}
+    //   {"thresholds": [0.4, 0.3, 0.1, 0.05]}
     // to swap the active score table. Safe to call mid-generation —
-    // the in-flight forward pass keeps using the snapshot it took on
-    // entry, the next layer's mul_mat_id picks up the new table.
+    // the in-flight forward pass keeps using the snapshot it took
+    // at graph-compute-begin; the next decode picks up the new
+    // table.
+    //
+    // Policy-only contract (Mode A M1): this route may only update
+    // the score/dial table. It must NOT trigger loads, evictions,
+    // residency changes, execution-path selection, or any legacy
+    // fallback. When no StreamLLM runtime is active the route
+    // returns 404 (rather than failing silently or accepting a
+    // policy that nothing reads).
     this->post_streamllm_score_table = [this](const server_http_req & req) {
         auto res = create_response(true);  // bypass-sleep: no model needed
         bool ctx_server; GGML_UNUSED(ctx_server);
+        // Q4 gate: no runtime → 404 with a clear disabled message.
+        // ERROR_TYPE_NOT_FOUND maps to HTTP 404 in format_error_response.
+        {
+            std::vector<float> probe;
+            if (!streamllm_get_score_table(probe)) {
+                res->error(format_error_response(
+                    "streamllm runtime not active — no model with "
+                    "required_runtime=true is loaded. The score-dial "
+                    "route is policy-only and requires an active "
+                    "StreamLLM runtime.",
+                    ERROR_TYPE_NOT_FOUND));
+                return res;
+            }
+        }
         const json body = json::parse(req.body);
         if (!body.is_object() ||
             !body.contains("thresholds") || !body["thresholds"].is_array()) {
@@ -4200,7 +4222,14 @@ void server_routes::init_routes() {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
         std::vector<float> th;
-        streamllm_get_score_table(th);
+        // Q4 gate: no runtime → 404 with a clear disabled message.
+        if (!streamllm_get_score_table(th)) {
+            res->error(format_error_response(
+                "streamllm runtime not active — no model with "
+                "required_runtime=true is loaded.",
+                ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
         res->ok({{"thresholds", th}});
         return res;
     };

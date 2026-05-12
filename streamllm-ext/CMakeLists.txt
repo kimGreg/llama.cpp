@@ -154,31 +154,16 @@ target_link_libraries(streamllm-gguf-dump PRIVATE streamllm_ext ggml)
 add_executable(streamllm-loader-gate-test test_loader_gate.cpp)
 target_link_libraries(streamllm-loader-gate-test PRIVATE streamllm_ext ggml)
 
-# streamllm-sentinel-poc: throwaway exploratory test for Milestone 1
-# Step 7-POC. Verifies six sentinel-dispatch properties on a 3-node
-# cgraph (GGML_OP_DUP sentinel with manually-wired src[1..3] +
-# consumer node). Uses ggml_cuda_set_pre_op_hook. Pure CUDA backend
-# test; runs against a small synthetic graph with no real model.
-# Throwaway: keep alongside the gate test so future POC reruns can
-# rebuild it, but it ships nothing to production code.
+# streamllm-sentinel-compute-poc: reference POC kept under
+# tests/reference/ for re-validating sentinel mechanics against
+# future ggml-cuda hook-surface changes. Builds a synthetic
+# compute-fed sentinel cgraph (W*x → aux ops → sentinel →
+# consumer) and verifies the seven properties documented in
+# docs/MODE_A_MILESTONE1.md §Q3. Not part of the production
+# runtime; no production path links against it.
 if (GGML_CUDA)
-    add_executable(streamllm-sentinel-poc test_sentinel_poc.cpp)
-    target_link_libraries(streamllm-sentinel-poc
-        PRIVATE streamllm_ext ggml ggml-cuda CUDA::cudart)
-endif()
-
-# streamllm-sentinel-compute-poc: M1 cutover S5 HARD GATE. Decides
-# whether the sentinel design tolerates compute-node-fed src[1..3]
-# (the production case in S5) rather than only host-seeded leaves
-# (the original Step 7-POC case). Builds W * x + relu/scale/neg +
-# sentinel + consumer on the CUDA backend; verifies seven
-# properties including dependency ordering, sentinel claiming,
-# default-op suppression, dst write + downstream read, CUDA capture
-# disablement, CUDA backend behaviour, and legitimate src[1..3]
-# allocator plumbing. Production S5/S6 code MUST NOT be written
-# until this POC passes.
-if (GGML_CUDA)
-    add_executable(streamllm-sentinel-compute-poc test_sentinel_compute_poc.cpp)
+    add_executable(streamllm-sentinel-compute-poc
+        tests/reference/test_sentinel_compute_poc.cpp)
     target_link_libraries(streamllm-sentinel-compute-poc
         PRIVATE streamllm_ext ggml ggml-cuda CUDA::cudart)
 endif()
@@ -232,10 +217,5 @@ if (GGML_CUDA)
     # VramChunkPool::load across representative tensor shapes.
     add_executable(streamllm-microbench test_microbench.cpp)
     target_link_libraries(streamllm-microbench PRIVATE streamllm_ext ggml CUDA::cudart)
-
-    # streamllm-moe-hook-test: confirms ggml_cuda_set_mul_mat_id_hook
-    # accepts our function pointer and is null-safe.
-    add_executable(streamllm-moe-hook-test test_moe_hook.cpp)
-    target_link_libraries(streamllm-moe-hook-test PRIVATE streamllm_ext ggml ggml-cuda CUDA::cudart)
 endif()
 

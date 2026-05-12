@@ -164,26 +164,9 @@ bool Qwen3MoEAnyBcqExecutor::validate_required_set_(
 #endif
 }
 
-const ggml_tensor * Qwen3MoEAnyBcqExecutor::probe_probs_tensor_(
-    const ggml_tensor * ids, int n_tokens)
-{
-    if (ids == nullptr || ids->src[0] == nullptr) return nullptr;
-    const ggml_tensor * a = ids->src[0];
-    if (a->type == GGML_TYPE_F32 && a->data != nullptr &&
-        (int64_t)a->ne[1] == n_tokens) {
-        return a;
-    }
-    const ggml_tensor * b = a->src[0];
-    if (b != nullptr && b->type == GGML_TYPE_F32 && b->data != nullptr &&
-        (int64_t)b->ne[1] == n_tokens) {
-        return b;
-    }
-    return nullptr;
-}
-
-// S8 (Mode A): the per-canonical ``forward_moe_block`` body was
-// retired with the legacy MUL_MAT_ID rail. ``forward_moe_layer``
-// (below) is the sole managed-MoE dispatch path.
+// ``probe_probs_tensor_`` was retired with the legacy
+// ``forward_moe_block`` body — probs now arrive concretely through
+// the sentinel's ``src[2]``.
 
 // M1 cutover S6: per-canonical chunked matmul dispatch helper.
 // Replicates forward_moe_block's plan→reserve→load→wait→validate→

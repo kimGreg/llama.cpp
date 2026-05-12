@@ -102,19 +102,12 @@ extern "C" bool streamllm_try_cuda_mul_mat(
     const struct ggml_tensor * src1,
     struct ggml_tensor * dst);
 
-// Fusion-skip predicate: ggml-cuda calls this on the weight tensor
-// of a mul_mat that is a candidate for fusion (ffn_up + ffn_gate +
-// glu, mul_mat_vec + glu, etc.). When it returns true the fusion is
-// disabled, routing the mul_mat to the regular dispatch path so the
-// mul_mat hook above can claim it. No-op when the runtime has no
-// managed tensor with that name.
-extern "C" bool streamllm_claims_tensor(const struct ggml_tensor * w);
-
-// MoE dispatch hook. Registered with ``ggml_cuda_set_mul_mat_id_hook``;
-// fires at the top of ggml-cuda's MoE op handler. ``src0`` is the
-// S8 (Mode A): ``streamllm_try_cuda_mul_mat_id`` was retired with
-// the legacy ``mul_mat_id_hook`` install. Managed MoE dispatch
-// flows through ``streamllm_pre_op`` (sentinel rail) only.
+// streamllm_claims_tensor extern-C and streamllm_try_cuda_mul_mat_id
+// were retired together with the legacy fusion_skip / mul_mat_id hook
+// installs. Managed MoE dispatch flows through ``streamllm_pre_op``
+// (sentinel rail) only; the internal ``Scheduler::claims_tensor``
+// predicate survives as the S10 dense-managed clear-fail's
+// is-this-tensor-managed check.
 
 // Mode A milestone-1 generic pre-op claim hook registered via
 // ggml_cuda_set_pre_op_hook. Fires before every op's default
@@ -150,25 +143,25 @@ bool streamllm_get_score_table(
 // fused-topk_moe hook install. Sentinel ``src[2..3]`` carries probs
 // and renormalised weights directly.
 
-// Graph-walk pre/post hooks. Registered with
-// ``ggml_cuda_set_graph_compute_{begin,end}_hook``; fire at the top
-// and bottom of ggml_backend_cuda_graph_compute. Forward to the
-// active scheduler's on_graph_compute_begin / on_graph_compute_end
-// virtuals so concrete schedulers can prewalk the cgraph (managed-
-// tensor identification, prefetch, marker scan) before any node-
-// level dispatch starts.
-extern "C" void streamllm_graph_compute_begin(
+// Mode A M1 graph-compute callbacks. Registered with
+// ``ggml_cuda_set_graph_compute_{begin,end}_hook``. Strictly audit +
+// score-snapshot (begin) and replay-reservation cleanup (end). Must
+// not plan routing, reserve chunks, submit loads, dispatch managed
+// nodes, use prior-token routing, or select fallback paths — all
+// scheduling lives at the per-sentinel dispatch site.
+extern "C" void streamllm_on_graph_audit_and_score_snapshot(
     cudaStream_t                stream,
     const struct ggml_cgraph *  cgraph);
-extern "C" void streamllm_graph_compute_end(
+extern "C" void streamllm_on_graph_audit_and_score_snapshot_end(
     cudaStream_t                stream,
     const struct ggml_cgraph *  cgraph);
 
 // User-managed-node claim predicate. Registered with
 // ``ggml_cuda_set_user_node_claims_hook``; ggml-cuda calls this per
 // cgraph node to decide whether to disable cuda-graph capture for
-// that cgraph compute. Returns true for managed mul_mat / mul_mat_id
-// nodes so the streamllm LOAD walk runs eager on each invocation.
+// that cgraph compute. Returns true for streamllm sentinel nodes
+// (``"streamllm.moe_layer_<N>"``) so capture stays off for any
+// cgraph that carries managed MoE.
 extern "C" bool streamllm_user_node_claims(
     const struct ggml_tensor * node);
 

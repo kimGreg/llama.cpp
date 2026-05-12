@@ -230,8 +230,8 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     const int base_p   = base_precision_ > 0 ? base_precision_ : 1;
 
     // ── Score-table snapshot (taken once per replay in
-    // streamllm_graph_compute_begin; constant across all managed
-    // dispatches in this token).
+    // streamllm_on_graph_audit_and_score_snapshot; constant across
+    // all managed dispatches in this token).
     const std::vector<float> & sc_thresh =
         rt_->current_replay_score_table();
 

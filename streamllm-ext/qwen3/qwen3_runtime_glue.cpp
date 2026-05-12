@@ -48,36 +48,20 @@ std::unique_ptr<ModelExecutor>        g_executor;
 // design).  Defaults to false on cold start and after clear().
 bool                                  g_required_runtime_was_true = false;
 
-// Mode A milestone-1 S5+S6+S7 cutover — per-rail call counters.
-// The cutover acceptance gates (MODE_A_MILESTONE1.md) read these
-// counters to prove managed Qwen3-MoE dispatch flows entirely through
-// the per-layer sentinel rail, not the legacy per-op MUL_MAT_ID rail.
+// Mode A M1 routing counters (post-cleanup).
 //
-//   g_sentinel_claims              — streamllm_pre_op recognised a
-//                                    sentinel node and routed it to
-//                                    forward_moe_layer. Cutover
-//                                    expectation: > 0, equal to
-//                                    n_managed_moe_layers ×
-//                                    n_decode_graph_executions.
-//   g_managed_mul_mat_id_claims    — legacy backstop fired (managed
-//                                    MUL_MAT_ID claim from the
-//                                    pre_op_hook). Cutover
-//                                    expectation: == 0. Non-zero
-//                                    means S5 missed a layer or
-//                                    Mode A wasn't selected.
-//   g_forward_moe_block_calls      — legacy executor entry called.
-//                                    Cutover expectation: == 0.
-//   g_forward_moe_layer_calls      — new per-layer entry called.
-//                                    Cutover expectation: equal to
-//                                    g_sentinel_claims.
+//   g_sentinel_claims         — pre_op_hook claimed a sentinel and
+//                               routed it to forward_moe_layer.
+//   g_forward_moe_layer_calls — forward_moe_layer entered. Equals
+//                               g_sentinel_claims by construction.
 //
-// The cutover acceptance gate compares these four counters under
-// the verifier in F (task #34).
+// The legacy-rail counters (managed_mul_mat_id_claims,
+// forward_moe_block_calls, legacy_mul_mat_id_calls) were retired in
+// the post-M1 cleanup along with the rails themselves. The cgraph
+// audit (``STREAMLLM_CGRAPH_AUDIT=1``) now carries the "no managed
+// MUL_MAT_ID/MUL_MAT leaked" invariant.
 std::atomic<uint64_t>                 g_sentinel_claims{0};
-std::atomic<uint64_t>                 g_managed_mul_mat_id_claims{0};
-std::atomic<uint64_t>                 g_forward_moe_block_calls{0};
 std::atomic<uint64_t>                 g_forward_moe_layer_calls{0};
-std::atomic<uint64_t>                 g_legacy_mul_mat_id_calls{0};
 
 // Mode A milestone 1, S1 — bound model-slot set. Records every
 // model's streamllm_executor slot address that has been wired by the
@@ -261,9 +245,9 @@ bool install_for_gguf(const char * gguf_path) {
     ggml_cuda_set_pre_op_hook((void *) &streamllm_pre_op);
     ggml_cuda_set_mul_mat_hook((void *) &streamllm_try_cuda_mul_mat);
     ggml_cuda_set_graph_compute_begin_hook(
-        (void *) &streamllm_graph_compute_begin);
+        (void *) &streamllm_on_graph_audit_and_score_snapshot);
     ggml_cuda_set_graph_compute_end_hook(
-        (void *) &streamllm_graph_compute_end);
+        (void *) &streamllm_on_graph_audit_and_score_snapshot_end);
     ggml_cuda_set_user_node_claims_hook(
         (void *) &streamllm_user_node_claims);
     return true;
@@ -331,16 +315,10 @@ extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     return g_runtime->scheduler().claims_node(node);
 }
 
-extern "C" bool streamllm_claims_tensor(const struct ggml_tensor * w) {
-    // Fusion-skip predicate. Delegate to the scheduler — it decides
-    // which weight tensors must opt out of ggml-cuda's fused-subgraph
-    // paths so the streamllm per-op dispatch can claim the underlying
-    // mul_mat. Scheduler-agnostic.
-    if (w == nullptr) return false;
-    std::lock_guard<std::mutex> lk(g_runtime_mu);
-    if (!g_runtime) return false;
-    return g_runtime->scheduler().claims_tensor(w);
-}
+// streamllm_claims_tensor extern-C was retired with the fusion_skip
+// hook surface. The internal Scheduler::claims_tensor predicate
+// survives because the S10 dense-managed clear-fail
+// (streamllm_try_cuda_mul_mat) still reads it.
 
 // /streamllm/stats accessors — pool-tier counters always tracked
 // regardless of DIAG mode. Single atomic-load per call.
@@ -383,32 +361,12 @@ unsigned long long streamllm_stat_required_set_misses(void) {
             .load(std::memory_order_relaxed);
 }
 
-// Mode A milestone-1 S5+S6+S7 cutover: rail-routing counters. The
-// acceptance gates compare these to expected counts to prove managed
-// Qwen3-MoE flows through the per-layer sentinel rail.
+// Mode A M1 routing counters — only the sentinel rail exists.
 unsigned long long streamllm_stat_sentinel_claims(void) {
     return (unsigned long long) g_sentinel_claims.load(std::memory_order_relaxed);
 }
-unsigned long long streamllm_stat_managed_mul_mat_id_claims(void) {
-    return (unsigned long long) g_managed_mul_mat_id_claims.load(std::memory_order_relaxed);
-}
-unsigned long long streamllm_stat_forward_moe_block_calls(void) {
-    return (unsigned long long) g_forward_moe_block_calls.load(std::memory_order_relaxed);
-}
 unsigned long long streamllm_stat_forward_moe_layer_calls(void) {
     return (unsigned long long) g_forward_moe_layer_calls.load(std::memory_order_relaxed);
-}
-unsigned long long streamllm_stat_legacy_mul_mat_id_calls(void) {
-    return (unsigned long long) g_legacy_mul_mat_id_calls.load(std::memory_order_relaxed);
-}
-
-// Compatibility alias for the pre-cutover counter name.  Returns the
-// sum across the two new rails so dashboards expecting a single
-// "pre_op_claims" number still see all hook firings.
-unsigned long long streamllm_stat_pre_op_claims(void) {
-    return (unsigned long long) (
-        g_sentinel_claims.load(std::memory_order_relaxed) +
-        g_managed_mul_mat_id_claims.load(std::memory_order_relaxed));
 }
 
 // DIAG-off weak fallbacks: the real implementations live in
@@ -452,19 +410,12 @@ bool streamllm_get_score_table(
 
 void clear() {
     std::lock_guard<std::mutex> lk(g_runtime_mu);
-    // Mode A milestone-1 S5+S6+S7 routing summary — emitted at clear
-    // so the cutover acceptance verifier sees the rail-by-rail
-    // breakdown. After the cutover, managed_mul_mat_id_claims and
-    // forward_moe_block_calls MUST both be zero.
+    // Mode A M1 routing summary — sentinel-only rail.
     std::fprintf(stderr,
         "streamllm-ext routing: sentinel_claims=%llu "
-        "managed_mul_mat_id_claims=%llu forward_moe_block_calls=%llu "
-        "forward_moe_layer_calls=%llu legacy_mul_mat_id_calls=%llu\n",
+        "forward_moe_layer_calls=%llu\n",
         (unsigned long long) g_sentinel_claims.load(std::memory_order_relaxed),
-        (unsigned long long) g_managed_mul_mat_id_claims.load(std::memory_order_relaxed),
-        (unsigned long long) g_forward_moe_block_calls.load(std::memory_order_relaxed),
-        (unsigned long long) g_forward_moe_layer_calls.load(std::memory_order_relaxed),
-        (unsigned long long) g_legacy_mul_mat_id_calls.load(std::memory_order_relaxed));
+        (unsigned long long) g_forward_moe_layer_calls.load(std::memory_order_relaxed));
     if (g_runtime && getenv("STREAMLLM_STATS")) {
         const auto & p = g_runtime->pool();
         std::fprintf(stderr,
@@ -483,13 +434,9 @@ void clear() {
 
     ggml_cuda_set_pre_op_hook(nullptr);
     ggml_cuda_set_mul_mat_hook(nullptr);
-    ggml_cuda_set_fusion_skip_hook(nullptr);
     ggml_cuda_set_graph_compute_begin_hook(nullptr);
     ggml_cuda_set_graph_compute_end_hook(nullptr);
-    ggml_cuda_set_mul_mat_id_hook(nullptr);
-    ggml_cuda_set_topk_moe_hook(nullptr);
     ggml_cuda_set_user_node_claims_hook(nullptr);
-    moe_dispatch::clear_topk_weights();
 
     // Mode A milestone 1, S1: null every bound model's streamllm_executor
     // slot BEFORE g_executor.reset() runs. Otherwise a live model could
@@ -508,10 +455,7 @@ void clear() {
     g_runtime.reset();
     g_required_runtime_was_true = false;
     g_sentinel_claims.store(0, std::memory_order_relaxed);
-    g_managed_mul_mat_id_claims.store(0, std::memory_order_relaxed);
-    g_forward_moe_block_calls.store(0, std::memory_order_relaxed);
     g_forward_moe_layer_calls.store(0, std::memory_order_relaxed);
-    g_legacy_mul_mat_id_calls.store(0, std::memory_order_relaxed);
     moe_dispatch::free_scratch();
     batched_gemm_shutdown();
 }
@@ -622,12 +566,29 @@ extern "C" bool streamllm_pre_op(
         (StreamHandle) stream, cur, ids, probs, weights, dst, layer_idx);
 }
 
-// Graph-compute pre/post hooks. Fire at the top and bottom of
-// ggml_backend_cuda_graph_compute (see ggml/include/ggml-cuda.h).
-// Forward to the active scheduler so it can prewalk the cgraph
-// (managed-tensor identification, prefetch, marker scan) before any
-// node-level dispatch starts.
-extern "C" void streamllm_graph_compute_begin(
+// Mode A M1 graph-compute callback — AUDIT + SCORE-SNAPSHOT ONLY.
+//
+// Fires at the top of ``ggml_backend_cuda_graph_compute``. The body
+// must do only:
+//   (a) score-table snapshot for the score-dial side channel, and
+//   (b) the optional STREAMLLM_CGRAPH_AUDIT=1 cgraph walk that proves
+//       Mode A invariants (sentinels well-formed, no managed
+//       MUL_MAT_ID/MUL_MAT nodes leaked).
+//
+// Forbidden in this callback (all scheduling lives at the per-sentinel
+// dispatch site instead):
+//   - routing planning / prior-token routing
+//   - chunk reservations
+//   - load submission
+//   - managed-node dispatch
+//   - fallback-path selection
+//
+// The legacy name ``streamllm_graph_compute_begin`` was the entrypoint
+// when this callback also drove the per-canonical instrumenter prewalk;
+// after S8 retired that prewalk, the callback's role is strictly
+// audit+snapshot. Rename reflects the new scope so a future reader
+// can't mistake it for MoE scheduling semantics.
+extern "C" void streamllm_on_graph_audit_and_score_snapshot(
     cudaStream_t                stream,
     const struct ggml_cgraph *  cgraph)
 {
@@ -637,13 +598,12 @@ extern "C" void streamllm_graph_compute_begin(
         rt = g_runtime.get();
     }
     if (rt == nullptr) return;
-    // The scheduler owns its per-replay state — score-table
-    // snapshot, residency reservations, anything else routing-
-    // dependent — and seeds it from on_graph_compute_begin.
     rt->scheduler().on_graph_compute_begin((StreamHandle) stream, cgraph);
 }
 
-extern "C" void streamllm_graph_compute_end(
+// End-of-cgraph callback — drops replay-scoped chunk reservations.
+// Same forbidden-behavior contract as the begin callback above.
+extern "C" void streamllm_on_graph_audit_and_score_snapshot_end(
     cudaStream_t                stream,
     const struct ggml_cgraph *  cgraph)
 {

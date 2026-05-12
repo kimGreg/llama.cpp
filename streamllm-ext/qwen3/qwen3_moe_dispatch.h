@@ -51,15 +51,12 @@ size_t scratch_yb_bytes_total();
 size_t scratch_ids_bytes_total();
 int    scratch_batch_n_max();
 
-bool handle_mul_mat_impl(
-    cudaStream_t stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    struct ggml_tensor * dst);
-
-// S8 (Mode A): ``handle_mul_mat_id_impl``, ``on_topk_moe_observed_impl``
-// and ``topk_weights_lookup`` were retired with the legacy MUL_MAT_ID
-// dispatch surface and the topk_moe side channel.
+// Mode A M1 cleanup retired ``handle_mul_mat_impl`` (dense streaming
+// body), ``handle_mul_mat_id_impl``, ``on_topk_moe_observed_impl``,
+// ``topk_weights_lookup``, and ``clear_topk_weights`` — all part of
+// the legacy MUL_MAT_ID / dense interception rails. Sentinel
+// dispatch (qwen3_runtime_glue.cpp ``streamllm_pre_op`` →
+// ``forward_moe_layer``) is the only managed-MoE path.
 
 // Per-stream cast scratch sizing. Called once at install_for_gguf;
 // returns false on alloc failure (caller aborts install).
@@ -71,10 +68,6 @@ void free_scratch();
 // Dumps the MoE profiling counters when STREAMLLM_PROFILE=1. Called
 // from clear() before the runtime is torn down.
 void print_profile_if_enabled();
-
-// Drops any captured (ids, weights) handles from the topk_moe side
-// channel. Called from clear() so a future install starts fresh.
-void clear_topk_weights();
 
 // Step 3 (Milestone 1): increment the MoE dispatch entry counter. The
 // counter itself stays in qwen3_moe_dispatch.cpp alongside the rest of

@@ -777,43 +777,18 @@ public:
         return managed_names_.count(w->name) != 0;
     }
 
-    bool dispatch_node(StreamHandle stream,
-                        const struct ggml_tensor * node) override {
-        if (node == nullptr) return false;
-        const ggml_tensor * src0 = node->src[0];
-        const ggml_tensor * src1 = node->src[1];
-        // S8 (Mode A): the per-canonical MUL_MAT / MUL_MAT_ID
-        // dispatch surface was retired with the legacy hooks. The
-        // scheduler's ``dispatch_node`` and ``observe_topk_moe``
-        // overrides no longer have legitimate callers; bodies
-        // collapsed to bail-out paths so any accidental future
-        // caller surfaces as a false return rather than a silent
-        // legacy dispatch.
-        (void) stream;
-        (void) src0;
-        (void) src1;
-        (void) node;
-        return false;
-    }
-
     bool claims_tensor(const struct ggml_tensor * w) const override {
-        // S10 (Mode A): managed-canonical names still register as
-        // "claimed" so the dense ``mul_mat_hook`` clear-fail can
-        // distinguish managed dense from unmanaged dense ops. This
-        // predicate is no longer used by ggml-cuda fusion (the
-        // ``fusion_skip_hook`` install was retired in S8) but is
-        // still read by streamllm-ext's own diagnostics.
+        // S10 dense-managed clear-fail predicate: distinguish managed
+        // canonicals from unmanaged dense weights at the
+        // ``streamllm_try_cuda_mul_mat`` boundary so the abort
+        // message names the leaked tensor.
         if (w == nullptr || w->name[0] == '\0') return false;
         return managed_names_.count(w->name) != 0;
     }
 
-    void observe_topk_moe(StreamHandle               /*stream*/,
-                           const struct ggml_tensor * /*logits*/,
-                           struct ggml_tensor *       /*weights*/,
-                           struct ggml_tensor *       /*ids*/) override {
-        // S8 (Mode A): topk_moe side channel retired. Body is a no-op
-        // for any virtual-dispatch path that might still reach here.
-    }
+    // The legacy ``dispatch_node`` and ``observe_topk_moe``
+    // overrides were retired in the post-M1 cleanup pass — the
+    // base-class virtuals no longer exist.
 
     // ── Per-replay state (Scheduler virtuals) ─────────────────────
     // Replay reservations protect chunks against eviction across the
@@ -1246,17 +1221,9 @@ void scheduler_after_compute(
     // the marker callback).
 }
 
-void scheduler_on_managed_node_visit(
-    Scheduler &                /*sched*/,
-    const struct ggml_tensor * /*dst*/,
-    StreamHandle               /*compute_stream*/)
-{
-    // S8 (Mode A): retired with the graph instrumenter. Sentinel
-    // identity carries the per-layer index in its name; no per-node
-    // visit-marker is needed. Kept as a no-op signature for any
-    // surviving callers; safe to drop entirely once those callers
-    // are removed.
-}
+// scheduler_on_managed_node_visit was retired with the
+// qwen3_graph_instrumenter prewalk; sentinel naming carries the
+// per-layer index directly.
 
 std::vector<float> scheduler_score_thresholds_snapshot(const Scheduler & sched) {
     return static_cast<const MoEScheduler &>(sched).score_thresholds_snapshot();
