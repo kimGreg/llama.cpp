@@ -331,4 +331,72 @@ void refresh_q_bias_for_anyprec_launch(
         n);
 }
 
+// Mode A milestone 1, S4 — weighted reduce over the per-top-k slot axis.
+//
+// layer_out[t, m] = sum_{u=0..n_used} weights[t, u] * slot_out[t, u, m]
+//
+// One block per (t, M-tile). Threads in the block stride over the M-tile
+// (each thread owns a subset of m); for its m, each thread loops over u
+// in [0, n_used) accumulating the weighted sum.  Reads from slot_out are
+// strided by M across u — coalesced within a warp (consecutive threads
+// read consecutive m), serialised across u.  Reads from weights are
+// broadcast within a warp (all threads read the same u).
+//
+// Tunables — small for M1's typical shapes (Qwen3-30B-A3B: M = 768,
+// n_used = 8). M_TILE = 256 keeps each block manageable; threads = 256
+// gives one m per thread per iteration. The kernel handles M not
+// divisible by M_TILE via the boundary check.
+namespace {
+
+constexpr int kWRMTile  = 256;
+constexpr int kWRThreads = 256;
+
+__global__ void k_weighted_reduce_slots(
+    const float * __restrict__ slot_out,    // [n_tokens, n_used, M]
+    const float * __restrict__ weights,     // [n_tokens, n_used]
+    float       * __restrict__ layer_out,   // [n_tokens, M]
+    int                        n_tokens,
+    int                        n_used,
+    int                        M)
+{
+    const int t      = blockIdx.x;
+    const int m_base = blockIdx.y * kWRMTile;
+    if (t >= n_tokens) return;
+
+    const float * w_row = weights + (size_t) t * n_used;
+    const float * s_tok = slot_out + (size_t) t * n_used * M;
+    float       * y_row = layer_out + (size_t) t * M;
+
+    for (int m_off = threadIdx.x; m_off < kWRMTile; m_off += kWRThreads) {
+        const int m = m_base + m_off;
+        if (m >= M) break;
+        float acc = 0.f;
+        // Linear scan over u; broadcast-style read of weights.
+        for (int u = 0; u < n_used; ++u) {
+            acc += w_row[u] * s_tok[(size_t) u * M + m];
+        }
+        y_row[m] = acc;
+    }
+}
+
+}  // anon
+
+void launch_weighted_reduce_slots(
+    const float * slot_out,
+    const float * weights,
+    float       * layer_out,
+    int           n_tokens,
+    int           n_used,
+    int           M,
+    StreamHandle  stream)
+{
+    if (n_tokens <= 0 || n_used <= 0 || M <= 0) return;
+    if (slot_out == nullptr || weights == nullptr || layer_out == nullptr) return;
+    const int n_m_tiles = (M + kWRMTile - 1) / kWRMTile;
+    dim3 grid((unsigned) n_tokens, (unsigned) n_m_tiles, 1u);
+    dim3 block((unsigned) kWRThreads, 1u, 1u);
+    k_weighted_reduce_slots<<<grid, block, 0, (cudaStream_t) stream>>>(
+        slot_out, weights, layer_out, n_tokens, n_used, M);
+}
+
 }}  // namespace streamllm_ext::qwen3

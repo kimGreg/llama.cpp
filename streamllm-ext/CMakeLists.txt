@@ -168,6 +168,17 @@ if (GGML_CUDA)
         PRIVATE streamllm_ext ggml ggml-cuda CUDA::cudart)
 endif()
 
+# streamllm-weighted-reduce-test: correctness test for M1 cutover S4's
+# launch_weighted_reduce_slots kernel. CPU reference + GPU kernel +
+# max_abs_diff < 1e-5 across multiple shape cases (Qwen3-30B-A3B
+# decode shapes, M-not-multiple-of-tile boundary, n_used=1 edge,
+# n_used=16). Pure CUDA test; no model load.
+if (GGML_CUDA)
+    add_executable(streamllm-weighted-reduce-test test_weighted_reduce.cpp)
+    target_link_libraries(streamllm-weighted-reduce-test
+        PRIVATE streamllm_ext CUDA::cudart)
+endif()
+
 if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     # streamllm-gpu-test: end-to-end kernel check (GGUF → VramChunkPool

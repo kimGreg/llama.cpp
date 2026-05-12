@@ -93,5 +93,28 @@ void naver_gemv_moe_launch(
     int                    shared_x,
     StreamHandle           stream);
 
+// Mode A milestone 1, S4 — weighted reduce over the per-top-k slot axis.
+//
+//   slot_out  [n_tokens, n_used, M]  f32  — kernel output from the
+//                                           fused MoE op above; per-slot
+//                                           (per-(t,u)) M-dim activations
+//   weights   [n_tokens, n_used]     f32  — renormalised routing weights
+//   layer_out [n_tokens, M]          f32  — output: layer_out[t, m] =
+//                                           sum_u weights[t,u] * slot_out[t,u,m]
+//
+// All buffers device-resident, all operations on ``stream``. Used by
+// Qwen3MoEAnyBcqExecutor::forward_moe_layer (S6) to collapse the
+// per-slot intermediate into the final block output the post-MoE
+// dense subgraph consumes. Standalone — no production path calls
+// this until S6 lands the call site.
+void launch_weighted_reduce_slots(
+    const float *   slot_out,
+    const float *   weights,
+    float *         layer_out,
+    int             n_tokens,
+    int             n_used,
+    int             M,
+    StreamHandle    stream);
+
 }  // namespace qwen3
 }  // namespace streamllm_ext
