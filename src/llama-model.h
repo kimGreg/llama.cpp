@@ -577,6 +577,21 @@ struct llama_model {
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
+    // streamllm-ext Mode A (Milestone 1, S1): model-scoped executor binding.
+    // When non-null, this points at the active StreamLLM ModelExecutor —
+    // a raw, non-owning view; ownership stays with streamllm_ext::g_executor
+    // in qwen3_runtime_glue.cpp. Lifetime is bracketed by
+    // streamllm_ext::bind_model(this) at install_for_gguf success and
+    // streamllm_ext::unbind_model(this) at llama_model_free. Type-erased
+    // so this header doesn't include streamllm-ext/core/executor.h; the
+    // arch builder casts it back via the streamllm_ext namespace.
+    //
+    // M1 supports exactly one StreamLLM-managed model per process; a second
+    // install while a required_runtime model is live hard-fails at
+    // install_for_gguf (see qwen3_runtime_glue.cpp). Multi-model support
+    // is post-M1.
+    void * streamllm_executor = nullptr;
+
     explicit llama_model(const struct llama_model_params & params);
     ~llama_model();
 

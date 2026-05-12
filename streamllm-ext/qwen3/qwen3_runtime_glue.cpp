@@ -20,6 +20,7 @@
 #include <gguf.h>
 #include <ggml-cuda.h>
 
+#include <algorithm>              // std::find / std::remove
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace streamllm_ext {
 
@@ -53,6 +55,22 @@ bool                                  g_required_runtime_was_true = false;
 // zero for managed dispatches.
 std::atomic<uint64_t>                 g_pre_op_claims{0};
 std::atomic<uint64_t>                 g_legacy_mul_mat_id_calls{0};
+
+// Mode A milestone 1, S1 — bound model-slot set. Records every
+// model's streamllm_executor slot address that has been wired by the
+// install path. clear() walks this under g_runtime_mu and writes
+// nullptr through each slot BEFORE tearing down g_executor, so a
+// model's streamllm_executor view never dangles. Slot owners
+// (typically llama_model_free) remove their slot via
+// unbind_model_slot.
+//
+// Type-erased over void** to keep streamllm-ext self-contained — the
+// ext does not need llama-model.h.
+//
+// Capacity: M1 supports exactly one model (one-StreamLLM-model-per-
+// process); using vector here just to mirror the multi-model
+// post-M1 shape without committing to it now.
+std::vector<void **>                  g_bound_model_slots_;
 
 namespace {
 
@@ -243,6 +261,43 @@ bool install_for_gguf(const char * gguf_path) {
     return true;
 }
 
+// ---------------------------------------------------------------------
+// Mode A milestone 1, S1 — model-scoped executor binding APIs.
+// See qwen3_runtime_glue.h for the contract.
+
+ModelExecutor * current_executor() {
+    std::lock_guard<std::mutex> lk(g_runtime_mu);
+    return g_executor.get();
+}
+
+void bind_model_slot(void ** streamllm_executor_slot) {
+    if (streamllm_executor_slot == nullptr) return;
+    std::lock_guard<std::mutex> lk(g_runtime_mu);
+    // Idempotent — no duplicate insertion.
+    if (std::find(g_bound_model_slots_.begin(), g_bound_model_slots_.end(),
+                  streamllm_executor_slot) == g_bound_model_slots_.end()) {
+        g_bound_model_slots_.push_back(streamllm_executor_slot);
+    }
+}
+
+void unbind_model_slot(void ** streamllm_executor_slot) {
+    if (streamllm_executor_slot == nullptr) return;
+    std::lock_guard<std::mutex> lk(g_runtime_mu);
+    auto it = std::find(g_bound_model_slots_.begin(),
+                        g_bound_model_slots_.end(),
+                        streamllm_executor_slot);
+    if (it != g_bound_model_slots_.end()) {
+        g_bound_model_slots_.erase(it);
+    }
+    // Null the slot. Safe to do while the slot's owning model is still
+    // alive (canonical call site is llama_model_free, before the model
+    // is destroyed). After this returns, the slot owner is free to
+    // destroy itself; clear()'s walk will not find this slot.
+    *streamllm_executor_slot = nullptr;
+}
+
+// ---------------------------------------------------------------------
+
 extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     // Per-node claim predicate consulted by ggml-cuda before
     // deciding whether to capture the cgraph into a cuda-graph.
@@ -396,6 +451,20 @@ void clear() {
     ggml_cuda_set_topk_moe_hook(nullptr);
     ggml_cuda_set_user_node_claims_hook(nullptr);
     moe_dispatch::clear_topk_weights();
+
+    // Mode A milestone 1, S1: null every bound model's streamllm_executor
+    // slot BEFORE g_executor.reset() runs. Otherwise a live model could
+    // hold a dangling view into the freed executor. The slots are
+    // type-erased void** — we write nullptr through each, never
+    // dereferencing the owning model. Safe even if a caller misuses the
+    // API and calls clear() between bind_model_slot and
+    // unbind_model_slot (the slot must still be a writable address per
+    // the lifetime contract).
+    for (void ** slot : g_bound_model_slots_) {
+        if (slot != nullptr) *slot = nullptr;
+    }
+    g_bound_model_slots_.clear();
+
     g_executor.reset();
     g_runtime.reset();
     g_required_runtime_was_true = false;

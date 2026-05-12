@@ -9162,10 +9162,22 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
 #if defined(STREAMLLM_EXT_ENABLED)
+    // Mode A milestone 1, S1: unbind this model's streamllm_executor
+    // slot from the ext FIRST so streamllm_ext::clear()'s bound-slots
+    // walk never writes through a soon-to-be-freed address. The slot
+    // must still be a valid writable address at this point — true
+    // here, before `delete model` runs. unbind_model_slot is a no-op
+    // for models that were never bound (stock GGUF / model is null).
+    if (model != nullptr) {
+        streamllm_ext::unbind_model_slot(&model->streamllm_executor);
+    }
+
     // Unregister the mul_mat hook + tear down the VRAM pool before
     // the model itself goes away, so we release managed weights on
     // exactly the same device ``llama_model_load_from_file_impl``
-    // installed them on.
+    // installed them on. After the unbind above, g_bound_model_slots_
+    // is empty for M1's one-model-per-process contract, so the
+    // lookup-and-null walk inside clear() finds nothing to null.
     streamllm_ext::clear();
 #endif
     delete model;

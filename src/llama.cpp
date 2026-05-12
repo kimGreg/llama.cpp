@@ -387,9 +387,23 @@ static struct llama_model * llama_model_load_from_file_impl(
     // if this GGUF carries streamllm.* metadata. No-op on stock files.
     // Failures throw — caught here so a bad streamllm artifact doesn't
     // leave a half-torn-down model behind.
+    //
+    // Mode A milestone 1, S1: on success, bind the model into the ext's
+    // bound-models set and set its model-scoped executor view. The bind
+    // pairs with streamllm_ext::unbind_model in llama_model_free; the
+    // view stays valid for the model's entire lifetime.
     if (!path_model.empty()) {
         try {
-            streamllm_ext::install_for_gguf(path_model.c_str());
+            if (streamllm_ext::install_for_gguf(path_model.c_str())) {
+                // Bind the model's streamllm_executor slot, then write
+                // the active executor pointer into it. Order matters:
+                // the slot must be registered before the pointer is
+                // written, so a concurrent ext-side clear() can find
+                // and null it.
+                streamllm_ext::bind_model_slot(&model->streamllm_executor);
+                model->streamllm_executor =
+                    (void *) streamllm_ext::current_executor();
+            }
         } catch (const std::exception & e) {
             LLAMA_LOG_ERROR("%s: streamllm-ext install failed: %s\n",
                 __func__, e.what());

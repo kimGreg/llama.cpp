@@ -46,6 +46,42 @@ extern std::mutex                            g_runtime_mu;
 extern std::unique_ptr<StreamllmRuntime>     g_runtime;
 extern std::unique_ptr<ModelExecutor>        g_executor;
 
+// Mode A milestone 1, S1 — model-scoped executor binding.
+//
+// streamllm-ext does NOT depend on the llama_model layout. The
+// model-scoped binding API is type-erased over a ``void **`` slot
+// address — the caller (llama.cpp loader / llama_model_free) hands
+// in the address of the model's ``streamllm_executor`` field; the ext
+// reads/writes nullptr through that address but never dereferences
+// the model object beyond it. This keeps streamllm-ext self-
+// contained (no llama-model.h dependency in the lib).
+//
+// ``current_executor()`` returns the active ``ModelExecutor *`` (or
+// nullptr if no streamllm runtime is installed). Raw pointer; ownership
+// stays with ``g_executor``. Lifetime is valid from
+// ``install_for_gguf`` success until the next ``clear()``.
+//
+// ``bind_model_slot(slot)`` records the slot address in the bound-
+// slots set so ``clear()`` can null it before tearing down
+// ``g_executor``. Idempotent — calling twice with the same slot is a
+// no-op.
+//
+// ``unbind_model_slot(slot)`` removes ``slot`` from the bound-slots
+// set AND writes nullptr through it. MUST be called from
+// ``llama_model_free`` (or anywhere the slot's owning model is about
+// to be destroyed) so ``clear()`` never dereferences a freed slot.
+// Idempotent.
+//
+// Lifetime contract: a slot that's been ``bind_model_slot``ed must
+// remain a valid writable address until ``unbind_model_slot`` is
+// called. ``clear()`` walks the bound-slots set under ``g_runtime_mu``
+// and nulls each slot — it never calls into the model object beyond
+// the write, so the worst case is a single store into still-live
+// memory.
+ModelExecutor * current_executor();
+void            bind_model_slot(void ** streamllm_executor_slot);
+void            unbind_model_slot(void ** streamllm_executor_slot);
+
 // Build a global StreamllmRuntime from ``gguf_path`` if the file carries
 // streamllm.* metadata, and register the ggml-cuda hook. Idempotent on
 // stock GGUFs (silently does nothing). Aborts on partial streamllm
