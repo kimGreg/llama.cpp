@@ -210,17 +210,29 @@ bool install_for_gguf(const char * gguf_path) {
     // hook FIRST. Fires before every op's default dispatch — claims
     // managed MUL_MAT_ID nodes and routes them through the executor's
     // forward_moe_block. Returning true short-circuits the per-op
-    // switch including the embedded mul_mat_id_hook check below.
-    //
-    // The legacy per-op hooks (mul_mat / mul_mat_id / topk_moe /
-    // fusion_skip / graph_compute_*) stay installed for now as
-    // redundant fallback insurance. Step 9 retires them once 7+8 are
-    // proven correct end-to-end.
+    // switch.
     ggml_cuda_set_pre_op_hook((void *) &streamllm_pre_op);
 
     ggml_cuda_set_mul_mat_hook((void *) &streamllm_try_cuda_mul_mat);
     ggml_cuda_set_fusion_skip_hook((void *) &streamllm_claims_tensor);
-    ggml_cuda_set_mul_mat_id_hook((void *) &streamllm_try_cuda_mul_mat_id);
+
+    // Mode A milestone-1 Step 9: the legacy per-op mul_mat_id_hook
+    // install is retired. Step 7+8 verification confirmed
+    // legacy_mul_mat_id_calls=0 across the full decode — managed
+    // dispatches all route through pre_op_hook above. Keep the
+    // streamllm_try_cuda_mul_mat_id function alive for the
+    // STREAMLLM_LEGACY_PEROP_HOOKS=1 bring-up escape hatch and for
+    // any future post-M1 work that needs to A/B test the legacy
+    // routing against the pre-op surface.
+    if (getenv("STREAMLLM_LEGACY_PEROP_HOOKS")) {
+        std::fprintf(stderr,
+            "streamllm-ext: STREAMLLM_LEGACY_PEROP_HOOKS=1 — re-installing "
+            "legacy mul_mat_id_hook as redundant insurance (pre_op_hook "
+            "claims first; legacy never sees managed dispatches under "
+            "normal operation)\n");
+        ggml_cuda_set_mul_mat_id_hook((void *) &streamllm_try_cuda_mul_mat_id);
+    }
+
     ggml_cuda_set_topk_moe_hook((void *) &streamllm_topk_moe_observed);
     ggml_cuda_set_graph_compute_begin_hook(
         (void *) &streamllm_graph_compute_begin);
