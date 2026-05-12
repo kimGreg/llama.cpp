@@ -58,17 +58,9 @@ public:
                         const StreamReader & reader,
                         const std::string &  gguf_path) override;
 
-    bool forward_moe_block(StreamHandle               stream,
-                            const ggml_tensor *        src0,
-                            const ggml_tensor *        src1,
-                            const ggml_tensor *        ids,
-                            ggml_tensor *              dst) override;
+    // S8 (Mode A): forward_moe_block override retired with the
+    // legacy MUL_MAT_ID rail. Only forward_moe_layer remains.
 
-    // M1 cutover S2: per-layer entry point (criterion 3). Stub
-    // implementation lands here in S2; the body lands in S6 along
-    // with the sentinel call site (S5+S6+S7 inseparable cutover).
-    // Until S6, this returns false unconditionally — no production
-    // path calls it yet.
     bool forward_moe_layer(StreamHandle               stream,
                             const ggml_tensor *        layer_in,
                             const ggml_tensor *        ids,

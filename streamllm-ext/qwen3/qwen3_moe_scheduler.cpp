@@ -13,10 +13,11 @@
 #include "qwen3_moe_matmul_comp.h"  // MoEMatMulComp (registered at install)
 #include "qwen3_moe_residency.h"
 #include "qwen3_moe_dispatch.h"
-#include "qwen3_graph_instrumenter.h"
+// S8 (Mode A): qwen3_graph_instrumenter retired with the legacy
+// MUL_MAT_ID dispatch surface; the include is gone.
 #include "tensor.h"   // anybcq::AnyBCQFamilyTensor (per-tensor pointer-table accessors)
 
-namespace streamllm_ext { using qwen3::GraphInstrumenter; }
+// (using-decl for qwen3::GraphInstrumenter retired in S8.)
 
 #include <ggml.h>          // ggml_tensor field access for claims_tensor
 #include <cuda_runtime.h>
@@ -781,38 +782,37 @@ public:
         if (node == nullptr) return false;
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
-        if (src0 == nullptr || src0->name[0] == '\0') return false;
-        if (managed_names_.count(src0->name) == 0) return false;
-        // ``node`` is the destination tensor (the op's output). The
-        // legacy per-op impls take the operands plus dst by name; we
-        // rebuild that signature here.  ggml stores the operands at
-        // src[0..N]; the dst is the node itself (= ``node``).
-        ggml_tensor * dst = const_cast<ggml_tensor *>(node);
-        if (node->op == GGML_OP_MUL_MAT) {
-            return moe_dispatch::handle_mul_mat_impl(
-                (cudaStream_t) stream, src0, src1, dst);
-        }
-        if (node->op == GGML_OP_MUL_MAT_ID) {
-            const ggml_tensor * ids = node->src[2];
-            return moe_dispatch::handle_mul_mat_id_impl(
-                (cudaStream_t) stream, src0, src1, ids, dst);
-        }
+        // S8 (Mode A): the per-canonical MUL_MAT / MUL_MAT_ID
+        // dispatch surface was retired with the legacy hooks. The
+        // scheduler's ``dispatch_node`` and ``observe_topk_moe``
+        // overrides no longer have legitimate callers; bodies
+        // collapsed to bail-out paths so any accidental future
+        // caller surfaces as a false return rather than a silent
+        // legacy dispatch.
+        (void) stream;
+        (void) src0;
+        (void) src1;
+        (void) node;
         return false;
     }
 
     bool claims_tensor(const struct ggml_tensor * w) const override {
-        // Fusion-skip: opt every managed weight out of ggml-cuda's
-        // fused-subgraph paths so the per-op dispatch can claim them.
+        // S10 (Mode A): managed-canonical names still register as
+        // "claimed" so the dense ``mul_mat_hook`` clear-fail can
+        // distinguish managed dense from unmanaged dense ops. This
+        // predicate is no longer used by ggml-cuda fusion (the
+        // ``fusion_skip_hook`` install was retired in S8) but is
+        // still read by streamllm-ext's own diagnostics.
         if (w == nullptr || w->name[0] == '\0') return false;
         return managed_names_.count(w->name) != 0;
     }
 
-    void observe_topk_moe(StreamHandle               stream,
-                           const struct ggml_tensor * logits,
-                           struct ggml_tensor *       weights,
-                           struct ggml_tensor *       ids) override {
-        moe_dispatch::on_topk_moe_observed_impl(
-            (cudaStream_t) stream, logits, weights, ids);
+    void observe_topk_moe(StreamHandle               /*stream*/,
+                           const struct ggml_tensor * /*logits*/,
+                           struct ggml_tensor *       /*weights*/,
+                           struct ggml_tensor *       /*ids*/) override {
+        // S8 (Mode A): topk_moe side channel retired. Body is a no-op
+        // for any virtual-dispatch path that might still reach here.
     }
 
     // ── Per-replay state (Scheduler virtuals) ─────────────────────
@@ -858,37 +858,80 @@ public:
         // even if a live ``set_score_table`` call lands mid-token.
         rt_->set_replay_score_table(score_thresholds_snapshot());
 
-        instr_.on_graph_begin(cgraph);
-
-        if (const char * dbg = getenv("STREAMLLM_DEBUG_GRAPH_WALK")) {
-            if (dbg[0] && dbg[0] != '0') {
+        // S8 (Mode A): cgraph audit. STREAMLLM_CGRAPH_AUDIT=1 walks
+        // the cgraph and proves the two post-cutover invariants:
+        //   (a) every node named ``"streamllm.moe_layer_<N>"`` is an
+        //       op with all four srcs wired (cb() didn't rename it
+        //       away — that bug was the cause of the first
+        //       end-to-end failure during S5+S6+S7 verification);
+        //   (b) zero managed MUL_MAT_ID nodes remain in the cgraph.
+        // Violations abort with a concrete report; the audit runs
+        // each replay so a regression that introduces managed ops
+        // mid-decode is caught immediately.
+        if (const char * a = getenv("STREAMLLM_CGRAPH_AUDIT")) {
+            if (a[0] && a[0] != '0') {
                 const int n_nodes = ggml_graph_n_nodes(
                     const_cast<ggml_cgraph *>(cgraph));
-                int n_mul_mat = 0, n_mul_mat_id = 0;
-                int n_managed_mm = 0, n_managed_mmid = 0;
+                int n_sentinels      = 0;
+                int n_managed_mmid   = 0;
+                int n_managed_mm     = 0;
+                int n_renamed        = 0;
                 for (int i = 0; i < n_nodes; ++i) {
                     const ggml_tensor * node = ggml_graph_node(
                         const_cast<ggml_cgraph *>(cgraph), i);
                     if (node == nullptr) continue;
-                    if (node->op == GGML_OP_MUL_MAT) {
-                        ++n_mul_mat;
-                        const ggml_tensor * w = node->src[0];
-                        if (w && w->name[0] && managed_names_.count(w->name)) {
-                            ++n_managed_mm;
+                    const bool is_sentinel = (std::strncmp(
+                        node->name, "streamllm.moe_layer_", 20) == 0);
+                    if (is_sentinel) {
+                        ++n_sentinels;
+                        if (node->src[0] == nullptr ||
+                            node->src[1] == nullptr ||
+                            node->src[2] == nullptr ||
+                            node->src[3] == nullptr) {
+                            ++n_renamed; // structurally broken sentinel
+                            std::fprintf(stderr,
+                                "[streamllm-audit] sentinel '%s' missing "
+                                "src[0..3]: [%p, %p, %p, %p]\n",
+                                node->name,
+                                (void*)node->src[0], (void*)node->src[1],
+                                (void*)node->src[2], (void*)node->src[3]);
                         }
-                    } else if (node->op == GGML_OP_MUL_MAT_ID) {
-                        ++n_mul_mat_id;
+                    }
+                    if (node->op == GGML_OP_MUL_MAT_ID) {
                         const ggml_tensor * w = node->src[0];
                         if (w && w->name[0] && managed_names_.count(w->name)) {
                             ++n_managed_mmid;
+                            std::fprintf(stderr,
+                                "[streamllm-audit] managed MUL_MAT_ID "
+                                "leaked into cgraph: src0='%s' node='%s'\n",
+                                w->name, node->name);
+                        }
+                    }
+                    if (node->op == GGML_OP_MUL_MAT) {
+                        const ggml_tensor * w = node->src[0];
+                        if (w && w->name[0] && managed_names_.count(w->name)) {
+                            ++n_managed_mm;
+                            std::fprintf(stderr,
+                                "[streamllm-audit] managed MUL_MAT (dense) "
+                                "leaked into cgraph: src0='%s' node='%s'\n",
+                                w->name, node->name);
                         }
                     }
                 }
                 std::fprintf(stderr,
-                    "streamllm-graph-walk: nodes=%d mul_mat=%d (managed=%d) "
-                    "mul_mat_id=%d (managed=%d) layers=%d\n",
-                    n_nodes, n_mul_mat, n_managed_mm,
-                    n_mul_mat_id, n_managed_mmid, instr_.total_layers());
+                    "[streamllm-audit] nodes=%d sentinels=%d "
+                    "managed_mul_mat_id=%d managed_mul_mat=%d "
+                    "broken_sentinels=%d\n",
+                    n_nodes, n_sentinels,
+                    n_managed_mmid, n_managed_mm, n_renamed);
+                if (n_managed_mmid > 0 || n_managed_mm > 0 || n_renamed > 0) {
+                    GGML_ABORT(
+                        "streamllm-ext: cgraph audit failed — "
+                        "managed_mul_mat_id=%d managed_mul_mat=%d "
+                        "broken_sentinels=%d. Mode A cutover invariants "
+                        "violated.",
+                        n_managed_mmid, n_managed_mm, n_renamed);
+                }
             }
         }
 
@@ -898,11 +941,13 @@ public:
         on_marker(ev);
     }
 
-    // Symmetric end-of-graph callback. Flushes the final LayerEnd
-    // marker (if a layer was active) and fires GraphEnd.
+    // Symmetric end-of-graph callback. Fires GraphEnd. The
+    // qwen3_graph_instrumenter prewalk (S5+) and its per-layer
+    // marker emission were retired in S8 — sentinel-based dispatch
+    // has no need for the per-canonical layer_begin / layer_end
+    // tracking.
     void on_graph_compute_end(StreamHandle compute_stream,
                                const struct ggml_cgraph * /*cgraph*/) override {
-        instr_.on_graph_end(*this, (void *) compute_stream);
         MarkerEvent ev;
         ev.kind           = MarkerKind::GraphEnd;
         ev.compute_stream = compute_stream;
@@ -931,8 +976,6 @@ public:
             "streamllm-marker: kind=%s layer=%d\n",
             kind_name, ev.layer_index);
     }
-
-    GraphInstrumenter & instrumenter() { return instr_; }
 
     // Score-table snapshot.  The dispatch reads this length-N
     // ascending vector and uses chunks_loaded(g) = (largest k where
@@ -1106,11 +1149,12 @@ private:
     std::unordered_map<std::string, std::unique_ptr<qwen3::MoEMatMulComp>>
         moe_comps_;
 
-    // Step-4b graph instrumenter. Built per-cgraph-compute by
-    // on_graph_compute_begin (node→layer map); read by
-    // on_managed_node_visit on each per-op hook firing to detect
-    // layer transitions and fire LayerBegin/LayerEnd markers.
-    GraphInstrumenter instr_;
+    // S5+S6+S7+S8 (Mode A): the per-canonical graph instrumenter was
+    // retired alongside the legacy MUL_MAT_ID dispatch surface. The
+    // sentinel rail carries its own per-layer identity via the
+    // ``"streamllm.moe_layer_<L>"`` name; the cgraph audit
+    // (STREAMLLM_CGRAPH_AUDIT=1) is the only walk that still touches
+    // every node.
 };
 
 } // anonymous
@@ -1203,13 +1247,15 @@ void scheduler_after_compute(
 }
 
 void scheduler_on_managed_node_visit(
-    Scheduler &                sched,
-    const struct ggml_tensor * dst,
-    StreamHandle               compute_stream)
+    Scheduler &                /*sched*/,
+    const struct ggml_tensor * /*dst*/,
+    StreamHandle               /*compute_stream*/)
 {
-    auto & m = as_moe(sched);
-    if (!m.instrumenter().is_ready()) return;
-    m.instrumenter().on_managed_node_visit(dst, sched, (void *) compute_stream);
+    // S8 (Mode A): retired with the graph instrumenter. Sentinel
+    // identity carries the per-layer index in its name; no per-node
+    // visit-marker is needed. Kept as a no-op signature for any
+    // surviving callers; safe to drop entirely once those callers
+    // are removed.
 }
 
 std::vector<float> scheduler_score_thresholds_snapshot(const Scheduler & sched) {

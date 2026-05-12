@@ -85,12 +85,10 @@ MoEProfile g_moe_profile;
 // weights instead of the bypassed softmax buffer. Keyed by the ids
 // tensor's data pointer — stable for the lifetime of one forward
 // pass.
-struct WeightsHandle {
-    const ggml_tensor * weights = nullptr;
-    int                 n_used  = 0;
-};
-std::mutex                                       g_topk_weights_mu;
-std::unordered_map<const void *, WeightsHandle>  g_topk_weights;
+// S8 (Mode A): the renormalised-weights topk side channel
+// (``g_topk_weights`` / ``WeightsHandle`` / ``g_topk_weights_mu``) was
+// retired with the legacy MUL_MAT_ID dispatch surface. The sentinel
+// carries weights through ``src[3]`` directly.
 
 // Per-stream scratch for F32↔F16 cast bridges + ids/precision device
 // buffers used by the fused MoE kernel.  ``StreamScratch`` itself is
@@ -154,35 +152,10 @@ unsigned long long streamllm_stat_mc_pread_ns(void) {
 
 namespace moe_dispatch {
 
-void on_topk_moe_observed_impl(
-    cudaStream_t /*stream*/,
-    const ggml_tensor * /*logits*/,
-    ggml_tensor *       weights,
-    ggml_tensor *       ids)
-{
-    if (ids == nullptr || weights == nullptr || ids->data == nullptr) {
-        return;
-    }
-    int n_used = (int)weights->ne[0];
-    if (n_used == 1) n_used = (int)weights->ne[1];
-    std::lock_guard<std::mutex> lk(g_topk_weights_mu);
-    g_topk_weights[ids->data] = WeightsHandle{weights, n_used};
-}
-
-bool topk_weights_lookup(
-    const void *               ids_data,
-    const struct ggml_tensor ** out_weights,
-    int *                       out_n_used)
-{
-    if (ids_data == nullptr) return false;
-    std::lock_guard<std::mutex> lk(g_topk_weights_mu);
-    auto it = g_topk_weights.find(ids_data);
-    if (it == g_topk_weights.end()) return false;
-    if (it->second.weights == nullptr) return false;
-    if (out_weights) *out_weights = it->second.weights;
-    if (out_n_used)  *out_n_used  = it->second.n_used;
-    return true;
-}
+// S8 (Mode A): ``on_topk_moe_observed_impl`` and
+// ``topk_weights_lookup`` were retired together with the
+// ``topk_moe_hook`` install — the sentinel rail carries probs and
+// renormalised weights through ``src[2..3]`` directly.
 
 StreamScratch * scratch_for_stream(cudaStream_t stream) {
     std::lock_guard<std::mutex> lk(g_scratch_mu);
@@ -259,8 +232,8 @@ void free_scratch() {
 }
 
 void clear_topk_weights() {
-    std::lock_guard<std::mutex> lk(g_topk_weights_mu);
-    g_topk_weights.clear();
+    // S8 (Mode A): topk side channel retired; the function survives as
+    // a no-op so callers in clear() don't need to be edited.
 }
 
 void print_profile_if_enabled() {
@@ -610,38 +583,11 @@ bool handle_mul_mat_impl(
 }
 
 
-// ---- MoE mul_mat_id dispatch ------------------------------------------
-//
-// Step 3 (Milestone 1) — the dispatch body lives on the executor now
-// (Qwen3MoEAnyBcqExecutor::forward_moe_block). This symbol is a thin
-// shim that survives so the legacy scheduler ``dispatch_node`` path
-// (qwen3_moe_scheduler.cpp:797) keeps working without being rewired.
-// Step 9 retires the shim entirely once the per-op hook installs are
-// gone for managed installs.
-//
-// **Lock discipline**: the previous implementation held g_runtime_mu
-// across the *entire* dispatch, which serialised every concurrent
-// invocation against any unrelated install/clear and risked deadlock
-// against the worker pool. The new shim copies the executor pointer
-// under the lock, releases the lock immediately, and only then calls
-// into the forward — matching the pattern at
-// qwen3_runtime_glue.cpp::streamllm_try_cuda_mul_mat_id.
-bool handle_mul_mat_id_impl(
-    cudaStream_t stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * ids,
-    struct ggml_tensor * dst)
-{
-    ModelExecutor * exec = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_runtime_mu);
-        exec = g_executor.get();
-    }
-    if (exec == nullptr) return false;
-    return exec->forward_moe_block(
-        (StreamHandle) stream, src0, src1, ids, dst);
-}
+// S8 (Mode A): ``handle_mul_mat_id_impl`` was retired together with
+// the per-canonical ``forward_moe_block`` virtual it called and the
+// scheduler ``dispatch_node`` rail that called it. Managed MoE
+// dispatch lives entirely on the sentinel rail (qwen3_runtime_glue.cpp
+// ``streamllm_pre_op`` → ``forward_moe_layer``).
 
 // Step 3 (Milestone 1): counter shim — the executor's forward_moe_block
 // calls this on every managed dispatch. The counter lives in

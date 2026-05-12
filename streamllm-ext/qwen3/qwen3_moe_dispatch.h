@@ -57,28 +57,9 @@ bool handle_mul_mat_impl(
     const struct ggml_tensor * src1,
     struct ggml_tensor * dst);
 
-bool handle_mul_mat_id_impl(
-    cudaStream_t stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * ids,
-    struct ggml_tensor * dst);
-
-void on_topk_moe_observed_impl(
-    cudaStream_t stream,
-    const struct ggml_tensor * logits,
-    struct ggml_tensor *       weights,
-    struct ggml_tensor *       ids);
-
-// Topk-weights side channel.  ggml-cuda's fused topk_moe captures
-// (ids, weights) here so the dispatch path can later read the post-
-// norm routing weights.  Returns true if a weights tensor is
-// associated with ``ids_data`` (stable for the lifetime of one
-// forward pass / cuda-graph capture session).
-bool topk_weights_lookup(
-    const void *               ids_data,
-    const struct ggml_tensor ** out_weights,
-    int *                       out_n_used);
+// S8 (Mode A): ``handle_mul_mat_id_impl``, ``on_topk_moe_observed_impl``
+// and ``topk_weights_lookup`` were retired with the legacy MUL_MAT_ID
+// dispatch surface and the topk_moe side channel.
 
 // Per-stream cast scratch sizing. Called once at install_for_gguf;
 // returns false on alloc failure (caller aborts install).

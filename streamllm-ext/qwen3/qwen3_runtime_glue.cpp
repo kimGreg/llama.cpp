@@ -202,35 +202,23 @@ bool install_for_gguf(const char * gguf_path) {
     const std::string exec_name = resolve_executor_name(reader.global());
     g_executor = make_executor(exec_name.c_str());
     if (g_executor == nullptr) {
+        // S9 (Mode A): required_runtime=true with no resolvable
+        // executor is an unconditional hard-fail — no escape hatch.
+        // Falling through here would leave the model with a managed-
+        // MoE artifact and no executor, which would mean either a
+        // null deref at bind time or — worse — silent legacy
+        // dispatch on managed MoE producing wrong output.
+        g_runtime.reset();
         if (reader.global().required_runtime) {
-            // Bring-up escape hatch: STREAMLLM_REQUIRED_RUNTIME_IGNORE=1
-            // downgrades the throw to a warning so operators can run a
-            // mismatched binary against a required_runtime artifact for
-            // diagnosis. The default behaviour (no env var) is the safe
-            // refuse-to-load.
-            if (getenv("STREAMLLM_REQUIRED_RUNTIME_IGNORE")) {
-                std::fprintf(stderr,
-                    "streamllm-ext: WARNING — required_runtime=true but "
-                    "executor '%s' is not registered. Continuing because "
-                    "STREAMLLM_REQUIRED_RUNTIME_IGNORE is set; managed "
-                    "dispatch will fall back to legacy paths and may "
-                    "produce wrong output.\n", exec_name.c_str());
-            } else {
-                g_runtime.reset();
-                throw std::runtime_error(
-                    "streamllm-ext: required_runtime=true but executor '"
-                    + exec_name + "' is not registered (build mismatch?)");
-            }
-        } else {
-            // Legacy soft-fail: pre-gate artifacts (no required_runtime
-            // key) still expect the hardcoded default to resolve. If we
-            // somehow got here with the default name unregistered,
-            // surface a clear error so the operator knows the build is
-            // broken.
-            g_runtime.reset();
             throw std::runtime_error(
-                "streamllm-ext: executor '" + exec_name + "' not registered");
+                "streamllm-ext: required_runtime=true but executor '"
+                + exec_name + "' is not registered (build mismatch?)");
         }
+        // Pre-gate artifacts (no required_runtime key) still expect
+        // the resolved name to be in the registry. Surface a clear
+        // error so the operator knows the build is broken.
+        throw std::runtime_error(
+            "streamllm-ext: executor '" + exec_name + "' not registered");
     }
     g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
     g_required_runtime_was_true = reader.global().required_runtime;
@@ -247,34 +235,31 @@ bool install_for_gguf(const char * gguf_path) {
         g_runtime->pool().reset_stats();
     }
 
-    // Mode A milestone-1 Step 7+8: install the generic pre-op claim
-    // hook FIRST. Fires before every op's default dispatch — claims
-    // managed MUL_MAT_ID nodes and routes them through the executor's
-    // forward_moe_block. Returning true short-circuits the per-op
-    // switch.
+    // Mode A milestone-1 hook surface — sentinel rail only (post-S8).
+    //
+    //   pre_op_hook           — claims sentinel nodes, routes to
+    //                            forward_moe_layer.
+    //   user_node_claims_hook — disables CUDA-graph capture for any
+    //                            cgraph carrying a sentinel.
+    //   mul_mat_hook          — survives only as the criterion-10
+    //                            hard-fail point for managed-dense
+    //                            tensors (S10). Body aborts loudly
+    //                            on a managed-canonical match.
+    //   graph_compute_begin   — score-table snapshot for the score-
+    //                            dial side channel + (when
+    //                            STREAMLLM_CGRAPH_AUDIT=1) the
+    //                            audit walk that verifies sentinel
+    //                            identity survived cb callbacks and
+    //                            zero managed MUL_MAT_IDs remain.
+    //   graph_compute_end     — replay-reservation cleanup. No
+    //                            instrumenter walk.
+    //
+    // The legacy installs — topk_moe_hook, fusion_skip_hook,
+    // mul_mat_id_hook — were retired in S8 along with the legacy
+    // backstop rail in pre_op_hook. No managed-MoE runtime path
+    // remains reachable through them.
     ggml_cuda_set_pre_op_hook((void *) &streamllm_pre_op);
-
     ggml_cuda_set_mul_mat_hook((void *) &streamllm_try_cuda_mul_mat);
-    ggml_cuda_set_fusion_skip_hook((void *) &streamllm_claims_tensor);
-
-    // Mode A milestone-1 Step 9: the legacy per-op mul_mat_id_hook
-    // install is retired. Step 7+8 verification confirmed
-    // legacy_mul_mat_id_calls=0 across the full decode — managed
-    // dispatches all route through pre_op_hook above. Keep the
-    // streamllm_try_cuda_mul_mat_id function alive for the
-    // STREAMLLM_LEGACY_PEROP_HOOKS=1 bring-up escape hatch and for
-    // any future post-M1 work that needs to A/B test the legacy
-    // routing against the pre-op surface.
-    if (getenv("STREAMLLM_LEGACY_PEROP_HOOKS")) {
-        std::fprintf(stderr,
-            "streamllm-ext: STREAMLLM_LEGACY_PEROP_HOOKS=1 — re-installing "
-            "legacy mul_mat_id_hook as redundant insurance (pre_op_hook "
-            "claims first; legacy never sees managed dispatches under "
-            "normal operation)\n");
-        ggml_cuda_set_mul_mat_id_hook((void *) &streamllm_try_cuda_mul_mat_id);
-    }
-
-    ggml_cuda_set_topk_moe_hook((void *) &streamllm_topk_moe_observed);
     ggml_cuda_set_graph_compute_begin_hook(
         (void *) &streamllm_graph_compute_begin);
     ggml_cuda_set_graph_compute_end_hook(
@@ -542,86 +527,71 @@ void clear() {
 // info is reachable via node->src[]).
 
 extern "C" bool streamllm_try_cuda_mul_mat(
-    cudaStream_t stream,
-    const struct ggml_tensor * /*src0*/,
-    const struct ggml_tensor * /*src1*/,
-    struct ggml_tensor * dst)
+    cudaStream_t                /*stream*/,
+    const struct ggml_tensor *  src0,
+    const struct ggml_tensor *  /*src1*/,
+    struct ggml_tensor *        /*dst*/)
 {
+    // S10 (Mode A) — managed-dense clear-fail (M1 criterion 10).
+    //
+    // Mode A reserves every managed canonical for the MoE sentinel
+    // rail. A managed canonical surfacing as a dense GGML_OP_MUL_MAT
+    // means either:
+    //   - an arch builder change introduced a non-MoE managed path
+    //     (regression), or
+    //   - a pruned-MoE artifact bypassed the loader's chunked-rail
+    //     setup and the dense weights point at the placeholder
+    //     storage we deliberately skip on the backend buffer.
+    // Either way, stock dense matmul would read uninitialised bytes
+    // for the streamllm-skipped tensor and silently produce wrong
+    // output. Refuse loudly instead.
+    if (src0 == nullptr || src0->name[0] == '\0') return false;
+
     StreamllmRuntime * rt = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_runtime_mu);
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return rt->scheduler().dispatch_node((StreamHandle) stream, dst);
+
+    if (rt->scheduler().claims_tensor(src0)) {
+        GGML_ABORT(
+            "streamllm-ext: criterion 10 violation — managed canonical "
+            "'%s' surfaced as GGML_OP_MUL_MAT. Mode A reserves managed "
+            "tensors for the per-layer MoE sentinel rail; dense matmul "
+            "fallback is forbidden. Most likely cause: a future arch "
+            "builder introduced a non-MoE path over managed tensors, "
+            "or a pruned-MoE artifact was loaded without sentinels.",
+            src0->name);
+    }
+    return false;
 }
 
-extern "C" void streamllm_topk_moe_observed(
-    cudaStream_t stream,
-    const struct ggml_tensor * logits,
-    struct ggml_tensor *       weights,
-    struct ggml_tensor *       ids)
-{
-    StreamllmRuntime * rt = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_runtime_mu);
-        rt = g_runtime.get();
-    }
-    if (rt == nullptr) return;
-    rt->scheduler().observe_topk_moe(
-        (StreamHandle) stream, logits, weights, ids);
-}
-
-extern "C" bool streamllm_try_cuda_mul_mat_id(
-    cudaStream_t stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * ids,
-    struct ggml_tensor *       dst)
-{
-    ModelExecutor *    exec = nullptr;
-    StreamllmRuntime * rt   = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_runtime_mu);
-        rt   = g_runtime.get();
-        exec = g_executor.get();
-    }
-    if (rt == nullptr) return false;
-    // Mode A: managed MoE dispatches route through the model
-    // executor (SSOT §6.4.2).  The executor wraps the current
-    // scheduler + plan + load + kernel flow; the per-op hook is the
-    // integration boundary, the executor is the canonical owner.
-    if (exec != nullptr) {
-        g_legacy_mul_mat_id_calls.fetch_add(1, std::memory_order_relaxed);
-        return exec->forward_moe_block(
-            (StreamHandle) stream, src0, src1, ids, dst);
-    }
-    // Fallback for legacy installs that pre-date the executor.
-    return rt->scheduler().dispatch_node((StreamHandle) stream, dst);
-}
+// S8 (Mode A): ``streamllm_try_cuda_mul_mat_id`` and
+// ``streamllm_topk_moe_observed`` were retired together with the
+// ``mul_mat_id_hook`` and ``topk_moe_hook`` installs. Managed MoE
+// dispatch flows exclusively through ``streamllm_pre_op`` below.
 
 extern "C" bool streamllm_pre_op(
     cudaStream_t stream,
     struct ggml_tensor * dst)
 {
-    // Mode A milestone-1 S5+S6+S7 cutover entry.
+    // Mode A milestone-1 (S5+S6+S7 + S8) — sentinel-only dispatch.
     //
-    // Two rails. The cutover gates require the legacy rail to stay
-    // at zero firings — managed Qwen3-MoE must flow entirely through
-    // the per-layer sentinel rail emitted by qwen3moe.cpp's Mode A
-    // branch (S5).
-    //
-    //   Rail 1 (sentinel) — dst is an op node named
-    //                       "streamllm.moe_layer_<L>". src[0]=cur,
-    //                       src[1..3]={ids, probs, weights} from the
-    //                       cgraph builder. Route to forward_moe_layer.
-    //
-    //   Rail 2 (legacy backstop) — dst is GGML_OP_MUL_MAT_ID over a
-    //                       managed canonical (src0 in the scheduler's
-    //                       claim set). Route to forward_moe_block.
-    //                       After S5 this rail SHOULD never fire — the
-    //                       counter exists to detect a regression.
+    // Managed Qwen3-MoE flows entirely through the per-layer sentinel
+    // rail emitted by qwen3moe.cpp's Mode A branch. The legacy
+    // MUL_MAT_ID backstop was retired in S8 — if a managed MUL_MAT_ID
+    // node ever surfaces in a cgraph again, the cgraph audit
+    // (STREAMLLM_CGRAPH_AUDIT=1) catches it at build time, and the
+    // pre_op_hook deliberately does NOT claim it at compute time.
+    // No silent legacy path remains reachable.
     if (dst == nullptr) return false;
+
+    static constexpr const char * kSentinelPrefix = "streamllm.moe_layer_";
+    constexpr size_t kSentinelPrefixLen = 20; // strlen("streamllm.moe_layer_")
+    if (std::strncmp(dst->name, kSentinelPrefix, kSentinelPrefixLen) != 0) {
+        return false;
+    }
 
     ModelExecutor *    exec = nullptr;
     StreamllmRuntime * rt   = nullptr;
@@ -632,47 +602,24 @@ extern "C" bool streamllm_pre_op(
     }
     if (rt == nullptr || exec == nullptr) return false;
 
-    // ── Rail 1: sentinel ────────────────────────────────────────────
-    // Name match is the only authoritative predicate. ggml_dup is the
-    // op the cgraph builder emits; we don't pre-filter on op so a
-    // future shape (e.g. GGML_OP_CUSTOM) doesn't slip past.
-    static constexpr const char * kSentinelPrefix = "streamllm.moe_layer_";
-    constexpr size_t kSentinelPrefixLen = 20; // strlen("streamllm.moe_layer_")
-    if (std::strncmp(dst->name, kSentinelPrefix, kSentinelPrefixLen) == 0) {
-        const struct ggml_tensor * cur    = dst->src[0];
-        const struct ggml_tensor * ids    = dst->src[1];
-        const struct ggml_tensor * probs  = dst->src[2];
-        const struct ggml_tensor * weights = dst->src[3];
-        if (cur == nullptr || ids == nullptr ||
-            probs == nullptr || weights == nullptr) {
-            std::fprintf(stderr,
-                "streamllm-ext: sentinel '%s' missing src[0..3] "
-                "(src=[%p, %p, %p, %p]) — refusing to dispatch\n",
-                dst->name, (void*)cur, (void*)ids,
-                (void*)probs, (void*)weights);
-            return false;
-        }
-        const int layer_idx = std::atoi(dst->name + kSentinelPrefixLen);
-        g_sentinel_claims.fetch_add(1, std::memory_order_relaxed);
-        g_forward_moe_layer_calls.fetch_add(1, std::memory_order_relaxed);
-        return exec->forward_moe_layer(
-            (StreamHandle) stream, cur, ids, probs, weights, dst, layer_idx);
+    const struct ggml_tensor * cur     = dst->src[0];
+    const struct ggml_tensor * ids     = dst->src[1];
+    const struct ggml_tensor * probs   = dst->src[2];
+    const struct ggml_tensor * weights = dst->src[3];
+    if (cur == nullptr || ids == nullptr ||
+        probs == nullptr || weights == nullptr) {
+        std::fprintf(stderr,
+            "streamllm-ext: sentinel '%s' missing src[0..3] "
+            "(src=[%p, %p, %p, %p]) — refusing to dispatch\n",
+            dst->name, (void*)cur, (void*)ids,
+            (void*)probs, (void*)weights);
+        return false;
     }
-
-    // ── Rail 2: legacy MUL_MAT_ID backstop ─────────────────────────
-    if (dst->op != GGML_OP_MUL_MAT_ID) return false;
-
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-    const struct ggml_tensor * ids  = dst->src[2];
-    if (src0 == nullptr || src1 == nullptr || ids == nullptr) return false;
-    if (src0->name[0] == '\0') return false;
-    if (!rt->scheduler().claims_tensor(src0)) return false;
-
-    g_managed_mul_mat_id_claims.fetch_add(1, std::memory_order_relaxed);
-    g_forward_moe_block_calls.fetch_add(1, std::memory_order_relaxed);
-    return exec->forward_moe_block(
-        (StreamHandle) stream, src0, src1, ids, dst);
+    const int layer_idx = std::atoi(dst->name + kSentinelPrefixLen);
+    g_sentinel_claims.fetch_add(1, std::memory_order_relaxed);
+    g_forward_moe_layer_calls.fetch_add(1, std::memory_order_relaxed);
+    return exec->forward_moe_layer(
+        (StreamHandle) stream, cur, ids, probs, weights, dst, layer_idx);
 }
 
 // Graph-compute pre/post hooks. Fire at the top and bottom of

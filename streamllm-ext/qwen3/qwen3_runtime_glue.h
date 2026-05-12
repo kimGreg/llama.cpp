@@ -112,29 +112,16 @@ extern "C" bool streamllm_claims_tensor(const struct ggml_tensor * w);
 
 // MoE dispatch hook. Registered with ``ggml_cuda_set_mul_mat_id_hook``;
 // fires at the top of ggml-cuda's MoE op handler. ``src0`` is the
-// stacked expert weight tensor [K, M, n_experts]; ``src1`` is the
-// routed activations; ``ids`` is the int32 expert-id tensor selected
-// by the router. Returns true when the hook computes the op (Strategy
-// A: loop chunk_matmul over (token, expert)); false to fall through to
-// upstream's batched MoE GEMM. No-op when src0 isn't a managed
-// expert-stack tensor.
-extern "C" bool streamllm_try_cuda_mul_mat_id(
-    cudaStream_t stream,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * ids,
-    struct ggml_tensor * dst);
+// S8 (Mode A): ``streamllm_try_cuda_mul_mat_id`` was retired with
+// the legacy ``mul_mat_id_hook`` install. Managed MoE dispatch
+// flows through ``streamllm_pre_op`` (sentinel rail) only.
 
-// Mode A milestone-1 Step 7+8: generic pre-op claim hook registered
-// via ggml_cuda_set_pre_op_hook. Fires before every op's default
-// dispatch. Routes managed MUL_MAT_ID nodes (src0 a managed
-// canonical) through Qwen3MoEAnyBcqExecutor::forward_moe_block — the
-// same body the legacy mul_mat_id_hook reaches. Returning true short-
-// circuits ggml_cuda_compute_forward; the default kernel + the
-// embedded per-op mul_mat_id_hook never run for claimed ops.
-//
-// Pin order: this is the new canonical entry. Step 9 retires the
-// install of the legacy mul_mat_id_hook once 7+8 prove correct.
+// Mode A milestone-1 generic pre-op claim hook registered via
+// ggml_cuda_set_pre_op_hook. Fires before every op's default
+// dispatch. Claims nodes whose name starts with
+// ``"streamllm.moe_layer_"`` and routes them to
+// Qwen3MoEAnyBcqExecutor::forward_moe_layer. Returning true short-
+// circuits ggml_cuda_compute_forward.
 extern "C" bool streamllm_pre_op(
     cudaStream_t stream,
     struct ggml_tensor * dst);
@@ -159,17 +146,9 @@ extern "C" bool streamllm_set_score_table(
 bool streamllm_get_score_table(
     std::vector<float> & out_thresholds);
 
-// Notification before ggml-cuda's fused topk_moe kernel. We stash
-// the (ids, weights) pair so streamllm_try_cuda_mul_mat_id can later
-// look up the renormalized routing weights (sum=1 over K) by ids
-// pointer — without that, the per-(t, u) gate-score path falls back
-// to whatever's in the selection-probs buffer, which the fused
-// kernel never wrote (in-register softmax).
-extern "C" void streamllm_topk_moe_observed(
-    cudaStream_t stream,
-    const struct ggml_tensor * logits,
-    struct ggml_tensor * weights,
-    struct ggml_tensor * ids);
+// S8 (Mode A): ``streamllm_topk_moe_observed`` was retired with the
+// fused-topk_moe hook install. Sentinel ``src[2..3]`` carries probs
+// and renormalised weights directly.
 
 // Graph-walk pre/post hooks. Registered with
 // ``ggml_cuda_set_graph_compute_{begin,end}_hook``; fire at the top

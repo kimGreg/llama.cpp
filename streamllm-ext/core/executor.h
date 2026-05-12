@@ -50,19 +50,9 @@ public:
     // false to fall through to stock dispatch (unmanaged tensor,
     // shape mismatch, etc.).
     //
-    // **Transition surface.**  This per-op-shaped virtual is reached
-    // today via the pre_op_hook claiming managed MUL_MAT_ID nodes —
-    // i.e. the M1 *preparation* dispatch. The M1 cutover (S5+S6+S7)
-    // replaces it with ``forward_moe_layer`` per-layer dispatch via
-    // a sentinel cgraph node. Once the cutover lands and verifies,
-    // this virtual is retired in S8 along with the legacy hook
-    // surface. For S2 it stays — concrete executors are still
-    // required to implement it.
-    virtual bool forward_moe_block(StreamHandle               stream,
-                                    const ggml_tensor *        src0,
-                                    const ggml_tensor *        src1,
-                                    const ggml_tensor *        ids,
-                                    ggml_tensor *              dst) = 0;
+    // The per-op-shaped ``forward_moe_block`` virtual was retired in
+    // S8 along with the legacy MUL_MAT_ID dispatch surface. Managed
+    // MoE now flows exclusively through ``forward_moe_layer`` below.
 
     // Per-layer MoE dispatch (Mode A milestone 1, criterion 3).
     // Execution-time entry point — invoked once per managed MoE

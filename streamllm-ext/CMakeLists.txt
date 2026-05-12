@@ -22,7 +22,6 @@ set(STREAMLLM_EXT_SOURCES
     core/runtime.cpp
     core/executor.cpp
     qwen3/qwen3_moe_scheduler.cpp
-    qwen3/qwen3_graph_instrumenter.cpp
     decoder/anybcq/upstream_layout.cpp
     decoder/anybcq/tensor.cpp
     decoder/shortcut_anybcq/upstream_layout.cpp
