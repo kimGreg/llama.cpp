@@ -104,6 +104,38 @@ llm_moe_router_output llm_build_moe_routing_softmax_topk(
     int64_t        n_expert_used,
     bool           norm_w);
 
+// StreamLLM Mode A sentinel — single source of truth for the per-layer
+// MoE boundary in the cgraph. Emits the router/topk via the helper
+// above, then a ``ggml_dup(cur)`` node renamed to
+// ``"streamllm.moe_layer_<il>"`` with ``src[1..3] = {ids, probs,
+// weights}`` manually wired. The runtime's ``pre_op_hook`` matches on
+// that exact name prefix and routes the dst to
+// ``Qwen3MoEAnyBcqExecutor::forward_moe_layer``; the residual + cvec
+// after this consumes the returned tensor as the final MoE block
+// output.
+//
+// Returns the sentinel tensor (== final layer_out). Shape F32 [n_embd,
+// n_tokens] — same shape as ``cur``.
+//
+// **Do not call ``cb()`` on the returned tensor.** ``cb()`` calls
+// ``ggml_format_name`` which would silently rename the sentinel away
+// from the ``"streamllm.moe_layer_*"`` prefix that the dispatch rail
+// matches on. The cgraph audit (``STREAMLLM_CGRAPH_AUDIT=1``) will
+// catch the breakage, but it's faster to avoid the rename in the
+// first place — keep the caller's branch ``cb()``-free for the
+// sentinel.
+//
+// ``norm_w`` controls weight renormalisation in the router (Qwen3-MoE
+// uses ``true``).
+ggml_tensor * llm_build_moe_sentinel(
+    ggml_context * ctx,
+    ggml_tensor *  cur,
+    ggml_tensor *  logits,
+    int64_t        n_expert,
+    int64_t        n_expert_used,
+    int            il,
+    bool           norm_w = true);
+
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
     // the output embeddings from the encoder as a ggml tensor

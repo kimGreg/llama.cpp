@@ -77,67 +77,30 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
 
         ggml_tensor * moe_out = nullptr;
         if (model.streamllm_executor != nullptr) {
-            // ─── Mode A (StreamLLM milestone 1, S5).
-            //
-            // Bypass build_moe_ffn entirely: emit the router/topk via
-            // the shared helper, then a single per-layer sentinel
-            // node that the runtime's pre_op_hook routes to
+            // Mode A (StreamLLM M1) — emit a single per-layer sentinel
+            // via the shared helper; runtime's pre_op_hook routes it to
             // forward_moe_layer. Managed Qwen3-MoE no longer surfaces
-            // as `MUL_MAT_ID` in the cgraph for these layers.
+            // as MUL_MAT_ID in the cgraph for these layers.
             //
-            // Per-expert scale tensors (the `_s` siblings) aren't
-            // handled by forward_moe_layer in M1 — Qwen3-30B-A3B
-            // AnyBCQ doesn't carry them, but a future variant might.
-            // Fail loudly rather than silently dropping the scale.
+            // Per-expert scale tensors (`_s` siblings) aren't honoured
+            // by forward_moe_layer in M1. Refuse loudly so a variant
+            // artifact that carries them doesn't silently drop the
+            // scale.
             if (model.layers[il].ffn_up_exps_s   != nullptr ||
                 model.layers[il].ffn_gate_exps_s != nullptr ||
                 model.layers[il].ffn_down_exps_s != nullptr) {
                 GGML_ABORT(
                     "streamllm-ext / Qwen3-MoE Mode A (L=%d): per-expert "
-                    "scale tensors (`_s`) are not supported by "
-                    "forward_moe_layer in M1. Either remove the scales "
-                    "from the artifact or extend the executor to honour "
-                    "them.", il);
+                    "scale tensors unsupported in M1.", il);
             }
-
-            // logits = build_lora_mm(gate_inp, cur). Matches what
-            // build_moe_ffn does internally for the simple-routing
-            // path (Qwen3-MoE: SOFTMAX, no exp_probs_b, no LLAMA4
-            // quirks, no expert groups).
             ggml_tensor * logits =
                 build_lora_mm(model.layers[il].ffn_gate_inp, cur);
             cb(logits, "ffn_moe_logits", il);
-
-            auto router = llm_build_moe_routing_softmax_topk(
-                ctx0, logits,
-                /*n_expert=*/      (int64_t) n_expert,
-                /*n_expert_used=*/ (int64_t) n_expert_used,
-                /*norm_w=*/        true);
-
-            // Sentinel: ggml_dup(cur) gives an F32 [n_embd, n_tokens]
-            // op node whose default backend executor would memcpy
-            // src[0] → dst. The runtime's pre_op_hook claims this
-            // node by name and writes layer_out into dst from
-            // forward_moe_layer instead. src[1..3] are manually
-            // wired so the graph allocator schedules ids/probs/
-            // weights ahead of the sentinel — by the time the hook
-            // fires, all three are resident on the compute stream.
-            ggml_tensor * sentinel = ggml_dup(ctx0, cur);
-            sentinel->src[1] = router.ids;
-            sentinel->src[2] = router.probs;
-            sentinel->src[3] = router.weights;
-            {
-                char name[64];
-                std::snprintf(name, sizeof(name),
-                              "streamllm.moe_layer_%d", il);
-                ggml_set_name(sentinel, name);
-            }
-            moe_out = sentinel;
-            // Deliberately do NOT call `cb(moe_out, "ffn_moe_out", il)`
-            // here. cb() renames the tensor via ggml_format_name and
-            // would overwrite the "streamllm.moe_layer_<il>" sentinel
-            // name that the pre_op_hook matches on. The sentinel's
-            // semantic role IS the moe_out — keep its identifying name.
+            // Sentinel construction is intentionally `cb()`-free; see
+            // the helper's banner for the rename-regression rationale.
+            moe_out = llm_build_moe_sentinel(
+                ctx0, cur, logits,
+                (int64_t) n_expert, (int64_t) n_expert_used, il);
         } else {
             moe_out = build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
