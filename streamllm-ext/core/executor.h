@@ -49,11 +49,72 @@ public:
     // ``stream``.  Returns true when the executor handled this op;
     // false to fall through to stock dispatch (unmanaged tensor,
     // shape mismatch, etc.).
+    //
+    // **Transition surface.**  This per-op-shaped virtual is reached
+    // today via the pre_op_hook claiming managed MUL_MAT_ID nodes —
+    // i.e. the M1 *preparation* dispatch. The M1 cutover (S5+S6+S7)
+    // replaces it with ``forward_moe_layer`` per-layer dispatch via
+    // a sentinel cgraph node. Once the cutover lands and verifies,
+    // this virtual is retired in S8 along with the legacy hook
+    // surface. For S2 it stays — concrete executors are still
+    // required to implement it.
     virtual bool forward_moe_block(StreamHandle               stream,
                                     const ggml_tensor *        src0,
                                     const ggml_tensor *        src1,
                                     const ggml_tensor *        ids,
                                     ggml_tensor *              dst) = 0;
+
+    // Per-layer MoE dispatch (Mode A milestone 1, criterion 3).
+    // Execution-time entry point — invoked once per managed MoE
+    // layer from the arch-builder's sentinel dispatch (S5+S6+S7).
+    // The router/topk computation has already produced concrete
+    // ids/probs/weights tensors at the call site; this entry point
+    // owns scheduling, load, wait, validate, fused kernel launch,
+    // weighted reduce, and release.
+    //
+    //   layer_in     [n_tokens, hidden_dim]  — post-ffn-norm input
+    //   ids          [n_expert_used, n_tokens]  int32  expert ids
+    //   probs        [n_expert, n_tokens]       f32    full router probs
+    //   weights      [n_expert_used, n_tokens]  f32    renormalised topk weights
+    //   layer_out    [n_tokens, hidden_dim]  — F32; the executor's
+    //                weighted reduce writes the final block output
+    //                consumed by the post-MoE residual.
+    //   layer_idx    arch-relative layer index (used for per-layer
+    //                MoEMatMulComp lookup).
+    //
+    // Returns true when the executor handled this layer; false to
+    // surface a dispatch error (the call site is expected to fail
+    // hard rather than fall back — see criterion 9). For S2 this is
+    // a pure virtual with a stub override; the real body lands in
+    // S6 along with the call site in S5.
+    virtual bool forward_moe_layer(StreamHandle               stream,
+                                    const ggml_tensor *        layer_in,
+                                    const ggml_tensor *        ids,
+                                    const ggml_tensor *        probs,
+                                    const ggml_tensor *        weights,
+                                    ggml_tensor *              layer_out,
+                                    int                        layer_idx) = 0;
+
+    // Optional model-tensor binding (Mode A milestone 1, criterion 5).
+    // Future-proof plumbing — M1 correctness does NOT depend on it
+    // being exercised. The arch builder in S5 owns router/topk
+    // construction via the shared helper factored in S3; the
+    // executor receives concrete ids/probs/weights and never needs
+    // direct access to ffn_gate_inp for M1.
+    //
+    // ``ffn_gate_inp_per_layer`` is an array of ``n_layer``
+    // ``ggml_tensor *`` pointers, indexed by layer.  Lifetime of
+    // the array itself is one call; the executor caches what it
+    // wants. Lifetime of each tensor pointer is the model's
+    // lifetime — they remain valid until ``llama_model_free``.
+    //
+    // Default no-op: most executors won't need router gates. Qwen3
+    // overrides to cache the pointers for a post-M1 move that
+    // relocates router/topk construction into the executor at
+    // execute time.
+    virtual void attach_router_gates(
+        const struct ggml_tensor * const * /*ffn_gate_inp_per_layer*/,
+        int /*n_layer*/) {}
 };
 
 // Registry.  Executors register their factory at process init via

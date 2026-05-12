@@ -331,6 +331,41 @@ bool Qwen3MoEAnyBcqExecutor::forward_moe_block(
     return true;
 }
 
+// M1 cutover S2: per-layer entry point stub. The real body lands
+// in S6 along with the sentinel call site (S5+S6+S7 inseparable
+// cutover). Until then this returns false unconditionally — no
+// production path calls it yet, and returning false from a
+// hypothetical caller would surface a hard error per criterion 9.
+bool Qwen3MoEAnyBcqExecutor::forward_moe_layer(
+    StreamHandle        /*stream*/,
+    const ggml_tensor * /*layer_in*/,
+    const ggml_tensor * /*ids*/,
+    const ggml_tensor * /*probs*/,
+    const ggml_tensor * /*weights*/,
+    ggml_tensor *       /*layer_out*/,
+    int                 /*layer_idx*/)
+{
+    // S2 stub — body implemented in S6. Until then, no call site
+    // exists; a non-zero call count here is a bug.
+    return false;
+}
+
+// M1 cutover S2: router-gate binding (criterion 5). Caches the
+// per-layer ffn_gate_inp pointers for a post-M1 move; M1 does not
+// read from this cache (router/topk is built by the arch builder
+// in S5 using the shared helper).
+void Qwen3MoEAnyBcqExecutor::attach_router_gates(
+    const struct ggml_tensor * const * ffn_gate_inp_per_layer,
+    int                                n_layer)
+{
+    ffn_gate_inp_.clear();
+    if (ffn_gate_inp_per_layer == nullptr || n_layer <= 0) return;
+    ffn_gate_inp_.reserve((size_t) n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        ffn_gate_inp_.push_back(ffn_gate_inp_per_layer[il]);
+    }
+}
+
 void register_qwen3_moe_anybcq_executor() {
     static bool once = false;
     if (once) return;

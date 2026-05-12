@@ -44,6 +44,30 @@ public:
                             const ggml_tensor *        ids,
                             ggml_tensor *              dst) override;
 
+    // M1 cutover S2: per-layer entry point (criterion 3). Stub
+    // implementation lands here in S2; the body lands in S6 along
+    // with the sentinel call site (S5+S6+S7 inseparable cutover).
+    // Until S6, this returns false unconditionally — no production
+    // path calls it yet.
+    bool forward_moe_layer(StreamHandle               stream,
+                            const ggml_tensor *        layer_in,
+                            const ggml_tensor *        ids,
+                            const ggml_tensor *        probs,
+                            const ggml_tensor *        weights,
+                            ggml_tensor *              layer_out,
+                            int                        layer_idx) override;
+
+    // M1 cutover S2: router-gate binding (criterion 5). Future-proof
+    // plumbing — M1 correctness does NOT depend on the executor
+    // having direct access to ffn_gate_inp (the arch-builder Mode A
+    // branch in S5 emits router/topk via the shared helper). This
+    // override caches the pointers for a post-M1 move that
+    // relocates router/topk construction into the executor at
+    // execute time.
+    void attach_router_gates(
+        const struct ggml_tensor * const * ffn_gate_inp_per_layer,
+        int                                n_layer) override;
+
     // Step 6 (Milestone 1): pre-launch host-side validation.
     // Walks ``plan.required_set`` and asserts every chunk is at
     // ChunkState::POINTER_TABLE_READY before the fused MoE kernel
@@ -73,6 +97,13 @@ private:
                                                     int n_tokens);
 
     StreamllmRuntime * rt_ = nullptr;
+
+    // M1 cutover S2: cached per-layer ffn_gate_inp pointers from
+    // attach_router_gates. Empty until S5 wires the install path
+    // to call attach_router_gates with the model's layers; the
+    // attach is optional and M1 doesn't read from this vector
+    // (router/topk is built by the arch builder in S5).
+    std::vector<const struct ggml_tensor *> ffn_gate_inp_;
 };
 
 // Static-init registration.  Called from qwen3_runtime_glue's
