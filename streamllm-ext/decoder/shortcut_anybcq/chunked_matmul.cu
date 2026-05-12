@@ -1,5 +1,11 @@
 // streamllm-ext / decoder / shortcut_anybcq — chunked-matmul impl.
 //
+// FUTURE: DenseExecutor — no runtime caller in M1. See the banner on
+// ``chunked_matmul.h`` for the contract. This TU is kept on disk
+// because the next dense-streaming work (DenseExecutor, future
+// milestone) will reuse it as a per-tile compute back-end; no Mode A
+// production path links against the symbols here.
+//
 // Shortcut layout: each chunk packs [signs | α-scalar]. β is in a
 // separate kCidQBias chunk pinned at install. Decode = naver_gemv per
 // token; prefill = dequant + cuBLAS GEMM (or fused chunked LUT-GEMM).

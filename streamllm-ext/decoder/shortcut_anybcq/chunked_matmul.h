@@ -1,5 +1,21 @@
 // streamllm-ext / decoder / shortcut_anybcq — chunked-matmul dispatch.
 //
+// ────────────────────────────────────────────────────────────────────
+// FUTURE: DenseExecutor — no runtime caller in M1.
+// ────────────────────────────────────────────────────────────────────
+// Mode A M1 retired the dense-managed runtime path entirely. The
+// ``streamllm_try_cuda_mul_mat`` hook now aborts loudly (criterion
+// 10) on any managed canonical that surfaces as a dense MUL_MAT. The
+// kernel + per-encoder pointer staging in this TU is kept on disk
+// because future dense streaming will land as a separate
+// ``DenseExecutor`` riding the same Runtime / Scheduler /
+// ChunkedTensor framework — at that point THIS kernel is the natural
+// per-tile compute back-end. Until then, no production code calls
+// into it. Do not re-enable a dense fallback by routing
+// ``streamllm_try_cuda_mul_mat`` through here — DenseExecutor is the
+// approved future path.
+// ────────────────────────────────────────────────────────────────────
+//
 // Shortcut layout: each chunk packs ONE plane's signs + that plane's α
 // scalar inline ([signs | α]); β is in a tensor-wide kCidQBias chunk
 // pinned at install. Decode is one naver_gemv_launch per token across
