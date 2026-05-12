@@ -89,6 +89,20 @@ extern "C" bool streamllm_try_cuda_mul_mat_id(
     const struct ggml_tensor * ids,
     struct ggml_tensor * dst);
 
+// Mode A milestone-1 Step 7+8: generic pre-op claim hook registered
+// via ggml_cuda_set_pre_op_hook. Fires before every op's default
+// dispatch. Routes managed MUL_MAT_ID nodes (src0 a managed
+// canonical) through Qwen3MoEAnyBcqExecutor::forward_moe_block — the
+// same body the legacy mul_mat_id_hook reaches. Returning true short-
+// circuits ggml_cuda_compute_forward; the default kernel + the
+// embedded per-op mul_mat_id_hook never run for claimed ops.
+//
+// Pin order: this is the new canonical entry. Step 9 retires the
+// install of the legacy mul_mat_id_hook once 7+8 prove correct.
+extern "C" bool streamllm_pre_op(
+    cudaStream_t stream,
+    struct ggml_tensor * dst);
+
 // Live-tunable precision dial. ``thresholds`` (length n_thresh,
 // descending) and ``chunks`` (length n_chunks, same length) replace the
 // active scheduler's score-threshold table.  ``thresholds`` is a
