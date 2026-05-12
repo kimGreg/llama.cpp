@@ -168,6 +168,22 @@ if (GGML_CUDA)
         PRIVATE streamllm_ext ggml ggml-cuda CUDA::cudart)
 endif()
 
+# streamllm-sentinel-compute-poc: M1 cutover S5 HARD GATE. Decides
+# whether the sentinel design tolerates compute-node-fed src[1..3]
+# (the production case in S5) rather than only host-seeded leaves
+# (the original Step 7-POC case). Builds W * x + relu/scale/neg +
+# sentinel + consumer on the CUDA backend; verifies seven
+# properties including dependency ordering, sentinel claiming,
+# default-op suppression, dst write + downstream read, CUDA capture
+# disablement, CUDA backend behaviour, and legitimate src[1..3]
+# allocator plumbing. Production S5/S6 code MUST NOT be written
+# until this POC passes.
+if (GGML_CUDA)
+    add_executable(streamllm-sentinel-compute-poc test_sentinel_compute_poc.cpp)
+    target_link_libraries(streamllm-sentinel-compute-poc
+        PRIVATE streamllm_ext ggml ggml-cuda CUDA::cudart)
+endif()
+
 # streamllm-weighted-reduce-test: correctness test for M1 cutover S4's
 # launch_weighted_reduce_slots kernel. CPU reference + GPU kernel +
 # max_abs_diff < 1e-5 across multiple shape cases (Qwen3-30B-A3B
