@@ -2233,22 +2233,10 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
-// streamllm-ext fusion-skip hook: returns true if the given weight
-// tensor is runtime-managed (src0 data is a placeholder) and must be
-// dispatched via the regular mul_mat path so the streamllm hook gets
-// a chance to claim it. Used by the ffn_up + ffn_gate + glu fusion
-// predicate and the mul_mat_vec fusion predicates. Definition is
-// early so the predicates below can refer to it.
-typedef bool (*ggml_cuda_fusion_skip_hook_t)(const ggml_tensor *);
-static ggml_cuda_fusion_skip_hook_t g_cuda_fusion_skip_hook = nullptr;
-
-extern "C" void ggml_cuda_set_fusion_skip_hook(void * hook_fn) {
-    g_cuda_fusion_skip_hook = (ggml_cuda_fusion_skip_hook_t) hook_fn;
-}
-
-static inline bool ggml_cuda_fusion_is_blocked(const ggml_tensor * w) {
-    return g_cuda_fusion_skip_hook != nullptr && g_cuda_fusion_skip_hook(w);
-}
+// streamllm-ext fusion-skip hook was retired in the Mode A M1 cleanup —
+// managed canonicals no longer surface as dense MUL_MAT in the cgraph
+// (the per-layer sentinel rail owns managed MoE), so fusion decisions
+// no longer need streamllm-aware overrides.
 
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
@@ -2267,14 +2255,6 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
-        return false;
-    }
-
-    // streamllm-ext: skip fusion if either weight is runtime-managed.
-    // The mul_mat must go through the regular dispatch so the hook can
-    // claim it; otherwise the fused kernel would dereference a placeholder.
-    if (ggml_cuda_fusion_is_blocked(ffn_up->src[0]) ||
-        ggml_cuda_fusion_is_blocked(ffn_gate->src[0])) {
         return false;
     }
 
@@ -2348,11 +2328,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    // streamllm-ext: skip fusion if the weight is runtime-managed.
-    if (ggml_cuda_fusion_is_blocked(src0)) {
-        return false;
-    }
-
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -2387,11 +2362,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
-
-    // streamllm-ext: skip fusion if the weight is runtime-managed.
-    if (ggml_cuda_fusion_is_blocked(src0)) {
-        return false;
-    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2445,33 +2415,10 @@ extern "C" void ggml_cuda_set_mul_mat_hook(void * hook_fn) {
     g_cuda_mul_mat_hook = (ggml_cuda_mul_mat_hook_t) hook_fn;
 }
 
-// streamllm-ext mul_mat_id hook. Same pattern as the dense hook but for
-// GGML_OP_MUL_MAT_ID (MoE expert dispatch).
-typedef bool (*ggml_cuda_mul_mat_id_hook_t)(
-    cudaStream_t stream,
-    const ggml_tensor * src0,
-    const ggml_tensor * src1,
-    const ggml_tensor * ids,
-    ggml_tensor * dst);
-
-static ggml_cuda_mul_mat_id_hook_t g_cuda_mul_mat_id_hook = nullptr;
-
-extern "C" void ggml_cuda_set_mul_mat_id_hook(void * hook_fn) {
-    g_cuda_mul_mat_id_hook = (ggml_cuda_mul_mat_id_hook_t) hook_fn;
-}
-
-// streamllm-ext: notification before ggml_cuda_op_topk_moe. See header.
-typedef void (*ggml_cuda_topk_moe_hook_t)(
-    cudaStream_t stream,
-    const ggml_tensor * logits,
-    ggml_tensor *       weights,
-    ggml_tensor *       ids);
-
-static ggml_cuda_topk_moe_hook_t g_cuda_topk_moe_hook = nullptr;
-
-extern "C" void ggml_cuda_set_topk_moe_hook(void * hook_fn) {
-    g_cuda_topk_moe_hook = (ggml_cuda_topk_moe_hook_t) hook_fn;
-}
+// streamllm-ext mul_mat_id hook and topk_moe hook were retired in the
+// Mode A M1 cleanup. Managed MoE flows through the per-layer sentinel
+// rail claimed by the generic pre_op_hook (below); no per-canonical
+// MUL_MAT_ID interception or fused-topk_moe side channel remains.
 
 // streamllm-ext: graph-compute pre/post hooks. Fire at the top and
 // bottom of ggml_backend_cuda_graph_compute. See header.
@@ -2631,13 +2578,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    // streamllm-ext override path. Mirrors the dense ggml_cuda_mul_mat
-    // hook protocol: returning true means "op handled", false falls
-    // through to the normal MoE dispatch below.
-    if (g_cuda_mul_mat_id_hook != nullptr &&
-        g_cuda_mul_mat_id_hook(ctx.stream(), src0, src1, ids, dst)) {
-        return;
-    }
+    // streamllm-ext Mode A claims managed MoE through the generic
+    // pre_op_hook on a per-layer sentinel node, NOT through this
+    // per-canonical MUL_MAT_ID interception (which was retired in
+    // the M1 cleanup pass). Stock MoE dispatch continues unchanged.
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -3280,9 +3224,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // when registered + the env is on, our hook handles the op without
     // a stream sync, and the F16 mul_mat_id guard at the bottom of this
     // function gets bypassed too.
-    const bool stream_llm_hook =
-        (g_cuda_mul_mat_hook    != nullptr) ||
-        (g_cuda_mul_mat_id_hook != nullptr);
+    // streamllm-ext: the mul_mat hook now serves only as the M1
+    // dense-managed clear-fail; managed MoE flows through the
+    // sentinel rail claimed via the generic pre_op_hook (and
+    // user_node_claims_hook already disables capture for those
+    // cgraphs). The dense hook being installed is still enough of a
+    // signal that streamllm is active to gate capture off unless the
+    // operator explicitly opts in.
+    const bool stream_llm_hook = (g_cuda_mul_mat_hook != nullptr);
     if (stream_llm_hook) {
         const char * enable = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
         const bool allow = enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
@@ -4014,9 +3963,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
-                                    if (g_cuda_topk_moe_hook != nullptr) {
-                                        g_cuda_topk_moe_hook(cuda_ctx->stream(), logits, weights, ids);
-                                    }
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
@@ -4033,9 +3979,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
-                                    if (g_cuda_topk_moe_hook != nullptr) {
-                                        g_cuda_topk_moe_hook(cuda_ctx->stream(), logits, weights, ids);
-                                    }
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
