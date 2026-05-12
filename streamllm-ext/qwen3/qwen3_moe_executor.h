@@ -18,7 +18,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace streamllm_ext {
@@ -27,10 +29,28 @@ struct ChunkKey;        // core/vram_pool.h
 struct ChunkPlan;       // core/computation.h
 
 namespace qwen3 {
+class MoEMatMulComp;    // qwen3/qwen3_moe_matmul_comp.h
+
+// Per-stream slot scratch consumed by forward_moe_layer (S6). One
+// pair of F32 device buffers per compute stream: ``slot_a`` is the
+// gate output AND, after the down matmul, the per-slot M=hidden_dim
+// output that the weighted reduce consumes; ``slot_b`` is the up
+// output and, after SwiGLU writes in-place, the per-slot M=n_ff f32
+// down input. Sizes are upper bounds (max_n_tokens × max_n_used ×
+// max-M). Both are F32 because the comp's execute() does the F32→F16
+// cast of src1 internally — keeping the SwiGLU+swap dance in F32
+// avoids a separate gated_f16 buffer.
+struct SlotScratch {
+    void *  slot_a       = nullptr;
+    void *  slot_b       = nullptr;
+    size_t  slot_a_bytes = 0;
+    size_t  slot_b_bytes = 0;
+};
 
 class Qwen3MoEAnyBcqExecutor : public ModelExecutor {
 public:
     Qwen3MoEAnyBcqExecutor() = default;
+    ~Qwen3MoEAnyBcqExecutor() override;
 
     const char * name() const override { return "qwen3_moe_anybcq_v1"; }
 
@@ -104,6 +124,41 @@ private:
     // attach is optional and M1 doesn't read from this vector
     // (router/topk is built by the arch builder in S5).
     std::vector<const struct ggml_tensor *> ffn_gate_inp_;
+
+    // M1 cutover S6: per-layer slot scratch. One pair of F32 device
+    // buffers per compute stream. Allocated lazily on the first
+    // forward_moe_layer call for a given stream (we need observed
+    // n_tokens / n_used to size them) and never freed until the
+    // executor is destroyed. Sized as upper bounds — a later call
+    // with a larger shape reallocates.
+    std::unordered_map<unsigned long long, SlotScratch> slot_scratch_;
+    std::mutex                                          slot_scratch_mu_;
+
+    SlotScratch * acquire_slot_scratch_(unsigned long long stream_key,
+                                         int                n_tokens,
+                                         int                n_used,
+                                         int                M_gate_up,
+                                         int                M_down);
+
+    // Dispatch one canonical's chunked matmul into a synthesized dst
+    // backed by a slot scratch pointer. Replicates forward_moe_block's
+    // plan/reserve/load/wait/validate/execute/release sequence in a
+    // form that reuses the existing MoEMatMulComp pipeline. Returns
+    // false on bail-out (logged); true on success.
+    bool dispatch_one_canonical_(
+        qwen3::MoEMatMulComp & comp,
+        const std::string &    canonical,
+        StreamHandle           stream,
+        const struct ggml_tensor * src1_synth,
+        const struct ggml_tensor * ids,
+        const struct ggml_tensor * probs,
+        const struct ggml_tensor * weights,
+        void *                     dst_data_f32,
+        int                        n_tokens,
+        int                        n_used,
+        int                        n_expert_in_probs,
+        bool                       shared_x,
+        int                        layer_idx);
 };
 
 // Static-init registration.  Called from qwen3_runtime_glue's

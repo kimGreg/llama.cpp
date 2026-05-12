@@ -342,6 +342,59 @@ void refresh_q_bias_for_anyprec_launch(
 // read consecutive m), serialised across u.  Reads from weights are
 // broadcast within a warp (all threads read the same u).
 //
+// ────────────────────────────────────────────────────────────────────
+// SwiGLU * up — element-wise silu(gate) * up. M1 cutover S6.
+// ────────────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr int kSwigluThreads = 256;
+constexpr int kSwigluPerThread = 4;
+
+__global__ void k_swiglu_mul(
+    const float * __restrict__ slot_gate,
+    const float * __restrict__ slot_up,
+    float       * __restrict__ slot_out,
+    std::size_t                N)
+{
+    const std::size_t base =
+        (std::size_t) blockIdx.x * kSwigluThreads * kSwigluPerThread
+        + threadIdx.x;
+    #pragma unroll
+    for (int i = 0; i < kSwigluPerThread; ++i) {
+        const std::size_t idx = base + (std::size_t) i * kSwigluThreads;
+        if (idx >= N) return;
+        const float g = slot_gate[idx];
+        const float u = slot_up[idx];
+        // silu(g) = g * sigmoid(g) = g / (1 + exp(-g)).
+        // Use the standard form; CUDA's __expf is fast-path single-precision.
+        const float sig = 1.0f / (1.0f + __expf(-g));
+        slot_out[idx]   = g * sig * u;
+    }
+}
+
+}  // anon
+
+void launch_swiglu_mul(
+    const float * slot_gate,
+    const float * slot_up,
+    float       * slot_out,
+    std::size_t   N,
+    StreamHandle  stream)
+{
+    if (N == 0 || slot_gate == nullptr || slot_up == nullptr || slot_out == nullptr) return;
+    const std::size_t elems_per_block =
+        (std::size_t) kSwigluThreads * kSwigluPerThread;
+    const std::size_t n_blocks = (N + elems_per_block - 1) / elems_per_block;
+    k_swiglu_mul<<<(unsigned) n_blocks, (unsigned) kSwigluThreads,
+                   0, (cudaStream_t) stream>>>(
+        slot_gate, slot_up, slot_out, N);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Weighted reduce over the per-top-k slot axis. M1 cutover S4.
+// ────────────────────────────────────────────────────────────────────
+//
 // Tunables — small for M1's typical shapes (Qwen3-30B-A3B: M = 768,
 // n_used = 8). M_TILE = 256 keeps each block manageable; threads = 256
 // gives one m per thread per iteration. The kernel handles M not

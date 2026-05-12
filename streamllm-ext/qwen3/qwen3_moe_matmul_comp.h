@@ -90,6 +90,15 @@ public:
 
     bool valid() const { return fuse_table_ != nullptr && any_layout_ != nullptr; }
 
+    // Public read-only views of the canonical's static shape. The
+    // executor's per-layer entry point (forward_moe_layer) queries
+    // these on the three canonicals (gate/up/down) for a layer so it
+    // can size the per-slot scratch and shape the synthesized
+    // src1/dst views without exposing the per-comp internals.
+    int K() const { return K_; }
+    int M() const { return M_; }
+    int n_experts() const { return n_experts_; }
+
 private:
     StreamllmRuntime *           rt_         = nullptr;
     Scheduler *                  sched_      = nullptr;

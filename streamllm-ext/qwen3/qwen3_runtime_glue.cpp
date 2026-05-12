@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>                // strncmp for sentinel name match
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -47,13 +48,35 @@ std::unique_ptr<ModelExecutor>        g_executor;
 // design).  Defaults to false on cold start and after clear().
 bool                                  g_required_runtime_was_true = false;
 
-// Mode A milestone-1 Step 7+8 — per-hook call counters.  Used by
-// the bit-exact verification to prove that managed dispatch routes
-// through ``streamllm_pre_op`` and NOT through the legacy
-// ``streamllm_try_cuda_mul_mat_id``.  When Step 9 retires the
-// legacy mul_mat_id_hook install, this counter must still report
-// zero for managed dispatches.
-std::atomic<uint64_t>                 g_pre_op_claims{0};
+// Mode A milestone-1 S5+S6+S7 cutover — per-rail call counters.
+// The cutover acceptance gates (MODE_A_MILESTONE1.md) read these
+// counters to prove managed Qwen3-MoE dispatch flows entirely through
+// the per-layer sentinel rail, not the legacy per-op MUL_MAT_ID rail.
+//
+//   g_sentinel_claims              — streamllm_pre_op recognised a
+//                                    sentinel node and routed it to
+//                                    forward_moe_layer. Cutover
+//                                    expectation: > 0, equal to
+//                                    n_managed_moe_layers ×
+//                                    n_decode_graph_executions.
+//   g_managed_mul_mat_id_claims    — legacy backstop fired (managed
+//                                    MUL_MAT_ID claim from the
+//                                    pre_op_hook). Cutover
+//                                    expectation: == 0. Non-zero
+//                                    means S5 missed a layer or
+//                                    Mode A wasn't selected.
+//   g_forward_moe_block_calls      — legacy executor entry called.
+//                                    Cutover expectation: == 0.
+//   g_forward_moe_layer_calls      — new per-layer entry called.
+//                                    Cutover expectation: equal to
+//                                    g_sentinel_claims.
+//
+// The cutover acceptance gate compares these four counters under
+// the verifier in F (task #34).
+std::atomic<uint64_t>                 g_sentinel_claims{0};
+std::atomic<uint64_t>                 g_managed_mul_mat_id_claims{0};
+std::atomic<uint64_t>                 g_forward_moe_block_calls{0};
+std::atomic<uint64_t>                 g_forward_moe_layer_calls{0};
 std::atomic<uint64_t>                 g_legacy_mul_mat_id_calls{0};
 
 // Mode A milestone 1, S1 — bound model-slot set. Records every
@@ -310,6 +333,14 @@ extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     // missing capture speedup doesn't matter for streamllm's use
     // case.
     if (node == nullptr) return false;
+    // Sentinel nodes (Mode A S5) are unambiguously claimed by name
+    // and don't need a scheduler hop. Recognising them here keeps
+    // the user-node-claims contract tight even if the scheduler's
+    // claim set lags behind the cgraph (e.g. a brand-new layer
+    // not yet seen by the scheduler).
+    if (std::strncmp(node->name, "streamllm.moe_layer_", 20) == 0) {
+        return true;
+    }
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return false;
     return g_runtime->scheduler().claims_node(node);
@@ -367,14 +398,32 @@ unsigned long long streamllm_stat_required_set_misses(void) {
             .load(std::memory_order_relaxed);
 }
 
-// Mode A milestone-1 Step 7+8: hook-routing counters. Confirm the
-// dispatch goes through the pre-op hook and NOT the legacy
-// mul_mat_id_hook. Post-Step-9 the legacy counter must remain 0.
-unsigned long long streamllm_stat_pre_op_claims(void) {
-    return (unsigned long long) g_pre_op_claims.load(std::memory_order_relaxed);
+// Mode A milestone-1 S5+S6+S7 cutover: rail-routing counters. The
+// acceptance gates compare these to expected counts to prove managed
+// Qwen3-MoE flows through the per-layer sentinel rail.
+unsigned long long streamllm_stat_sentinel_claims(void) {
+    return (unsigned long long) g_sentinel_claims.load(std::memory_order_relaxed);
+}
+unsigned long long streamllm_stat_managed_mul_mat_id_claims(void) {
+    return (unsigned long long) g_managed_mul_mat_id_claims.load(std::memory_order_relaxed);
+}
+unsigned long long streamllm_stat_forward_moe_block_calls(void) {
+    return (unsigned long long) g_forward_moe_block_calls.load(std::memory_order_relaxed);
+}
+unsigned long long streamllm_stat_forward_moe_layer_calls(void) {
+    return (unsigned long long) g_forward_moe_layer_calls.load(std::memory_order_relaxed);
 }
 unsigned long long streamllm_stat_legacy_mul_mat_id_calls(void) {
     return (unsigned long long) g_legacy_mul_mat_id_calls.load(std::memory_order_relaxed);
+}
+
+// Compatibility alias for the pre-cutover counter name.  Returns the
+// sum across the two new rails so dashboards expecting a single
+// "pre_op_claims" number still see all hook firings.
+unsigned long long streamllm_stat_pre_op_claims(void) {
+    return (unsigned long long) (
+        g_sentinel_claims.load(std::memory_order_relaxed) +
+        g_managed_mul_mat_id_claims.load(std::memory_order_relaxed));
 }
 
 // DIAG-off weak fallbacks: the real implementations live in
@@ -418,13 +467,18 @@ bool streamllm_get_score_table(
 
 void clear() {
     std::lock_guard<std::mutex> lk(g_runtime_mu);
-    // Mode A milestone-1 Step 7+8 routing summary — always emitted so
-    // the bit-exact verification can confirm pre_op_hook is the
-    // canonical entry. Step 9 retires the legacy install once
-    // pre_op_claims is the only non-zero counter.
+    // Mode A milestone-1 S5+S6+S7 routing summary — emitted at clear
+    // so the cutover acceptance verifier sees the rail-by-rail
+    // breakdown. After the cutover, managed_mul_mat_id_claims and
+    // forward_moe_block_calls MUST both be zero.
     std::fprintf(stderr,
-        "streamllm-ext routing: pre_op_claims=%llu legacy_mul_mat_id_calls=%llu\n",
-        (unsigned long long) g_pre_op_claims.load(std::memory_order_relaxed),
+        "streamllm-ext routing: sentinel_claims=%llu "
+        "managed_mul_mat_id_claims=%llu forward_moe_block_calls=%llu "
+        "forward_moe_layer_calls=%llu legacy_mul_mat_id_calls=%llu\n",
+        (unsigned long long) g_sentinel_claims.load(std::memory_order_relaxed),
+        (unsigned long long) g_managed_mul_mat_id_claims.load(std::memory_order_relaxed),
+        (unsigned long long) g_forward_moe_block_calls.load(std::memory_order_relaxed),
+        (unsigned long long) g_forward_moe_layer_calls.load(std::memory_order_relaxed),
         (unsigned long long) g_legacy_mul_mat_id_calls.load(std::memory_order_relaxed));
     if (g_runtime && getenv("STREAMLLM_STATS")) {
         const auto & p = g_runtime->pool();
@@ -468,7 +522,10 @@ void clear() {
     g_executor.reset();
     g_runtime.reset();
     g_required_runtime_was_true = false;
-    g_pre_op_claims.store(0, std::memory_order_relaxed);
+    g_sentinel_claims.store(0, std::memory_order_relaxed);
+    g_managed_mul_mat_id_claims.store(0, std::memory_order_relaxed);
+    g_forward_moe_block_calls.store(0, std::memory_order_relaxed);
+    g_forward_moe_layer_calls.store(0, std::memory_order_relaxed);
     g_legacy_mul_mat_id_calls.store(0, std::memory_order_relaxed);
     moe_dispatch::free_scratch();
     batched_gemm_shutdown();
@@ -547,27 +604,24 @@ extern "C" bool streamllm_pre_op(
     cudaStream_t stream,
     struct ggml_tensor * dst)
 {
-    // Mode A milestone-1 Step 7+8: generic pre-op claim hook.
+    // Mode A milestone-1 S5+S6+S7 cutover entry.
     //
-    // Today this hook only claims managed MoE MUL_MAT_ID nodes — the
-    // dispatch surface that Step 7+8 migrates off the legacy
-    // ggml_cuda_set_mul_mat_id_hook. Routing the existing dispatch
-    // body through the pre-op surface lets Step 9 cleanly retire the
-    // legacy hook installs without changing the executor body.
+    // Two rails. The cutover gates require the legacy rail to stay
+    // at zero firings — managed Qwen3-MoE must flow entirely through
+    // the per-layer sentinel rail emitted by qwen3moe.cpp's Mode A
+    // branch (S5).
     //
-    // Fuller sentinel decomposition (renaming managed MUL_MAT_ID
-    // nodes as ggml_dup sentinels named "streamllm.moe_layer_<L>" and
-    // emitting router/topk from the executor TU) is deferred as a
-    // post-M1 follow-up tracked in docs/MODE_A_MILESTONE1.md. The
-    // minimum-viable Step 7+8 ships here.
+    //   Rail 1 (sentinel) — dst is an op node named
+    //                       "streamllm.moe_layer_<L>". src[0]=cur,
+    //                       src[1..3]={ids, probs, weights} from the
+    //                       cgraph builder. Route to forward_moe_layer.
+    //
+    //   Rail 2 (legacy backstop) — dst is GGML_OP_MUL_MAT_ID over a
+    //                       managed canonical (src0 in the scheduler's
+    //                       claim set). Route to forward_moe_block.
+    //                       After S5 this rail SHOULD never fire — the
+    //                       counter exists to detect a regression.
     if (dst == nullptr) return false;
-    if (dst->op != GGML_OP_MUL_MAT_ID) return false;
-
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-    const struct ggml_tensor * ids  = dst->src[2];
-    if (src0 == nullptr || src1 == nullptr || ids == nullptr) return false;
-    if (src0->name[0] == '\0') return false;
 
     ModelExecutor *    exec = nullptr;
     StreamllmRuntime * rt   = nullptr;
@@ -577,13 +631,46 @@ extern "C" bool streamllm_pre_op(
         exec = g_executor.get();
     }
     if (rt == nullptr || exec == nullptr) return false;
-    // Only claim nodes whose src0 is a managed canonical. The
-    // scheduler is the authoritative predicate — same call the
-    // legacy mul_mat_id_hook chain uses (via
-    // MoEMatMulComp + scheduler_lookup_moe_comp).
+
+    // ── Rail 1: sentinel ────────────────────────────────────────────
+    // Name match is the only authoritative predicate. ggml_dup is the
+    // op the cgraph builder emits; we don't pre-filter on op so a
+    // future shape (e.g. GGML_OP_CUSTOM) doesn't slip past.
+    static constexpr const char * kSentinelPrefix = "streamllm.moe_layer_";
+    constexpr size_t kSentinelPrefixLen = 20; // strlen("streamllm.moe_layer_")
+    if (std::strncmp(dst->name, kSentinelPrefix, kSentinelPrefixLen) == 0) {
+        const struct ggml_tensor * cur    = dst->src[0];
+        const struct ggml_tensor * ids    = dst->src[1];
+        const struct ggml_tensor * probs  = dst->src[2];
+        const struct ggml_tensor * weights = dst->src[3];
+        if (cur == nullptr || ids == nullptr ||
+            probs == nullptr || weights == nullptr) {
+            std::fprintf(stderr,
+                "streamllm-ext: sentinel '%s' missing src[0..3] "
+                "(src=[%p, %p, %p, %p]) — refusing to dispatch\n",
+                dst->name, (void*)cur, (void*)ids,
+                (void*)probs, (void*)weights);
+            return false;
+        }
+        const int layer_idx = std::atoi(dst->name + kSentinelPrefixLen);
+        g_sentinel_claims.fetch_add(1, std::memory_order_relaxed);
+        g_forward_moe_layer_calls.fetch_add(1, std::memory_order_relaxed);
+        return exec->forward_moe_layer(
+            (StreamHandle) stream, cur, ids, probs, weights, dst, layer_idx);
+    }
+
+    // ── Rail 2: legacy MUL_MAT_ID backstop ─────────────────────────
+    if (dst->op != GGML_OP_MUL_MAT_ID) return false;
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * ids  = dst->src[2];
+    if (src0 == nullptr || src1 == nullptr || ids == nullptr) return false;
+    if (src0->name[0] == '\0') return false;
     if (!rt->scheduler().claims_tensor(src0)) return false;
 
-    g_pre_op_claims.fetch_add(1, std::memory_order_relaxed);
+    g_managed_mul_mat_id_claims.fetch_add(1, std::memory_order_relaxed);
+    g_forward_moe_block_calls.fetch_add(1, std::memory_order_relaxed);
     return exec->forward_moe_block(
         (StreamHandle) stream, src0, src1, ids, dst);
 }

@@ -195,6 +195,17 @@ if (GGML_CUDA)
         PRIVATE streamllm_ext CUDA::cudart)
 endif()
 
+# streamllm-swiglu-mul-test: correctness test for M1 cutover S6's
+# launch_swiglu_mul kernel. CPU reference + GPU kernel + max_abs_diff
+# tolerance check across Qwen3-30B-A3B decode shapes plus a small
+# known-answer block (silu(0)=0, silu(±10)≈{0,10}, silu(1)≈0.731...).
+# Pure CUDA test; no model load.
+if (GGML_CUDA)
+    add_executable(streamllm-swiglu-mul-test test_swiglu_mul.cpp)
+    target_link_libraries(streamllm-swiglu-mul-test
+        PRIVATE streamllm_ext CUDA::cudart)
+endif()
+
 # streamllm-router-equiv-test: equivalence test for M1 cutover S3's
 # llm_build_moe_routing_softmax_topk helper. Builds the router
 # subgraph two ways (helper + hand-rolled reference emitting the

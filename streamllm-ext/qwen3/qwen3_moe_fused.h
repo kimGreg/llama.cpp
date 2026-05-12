@@ -93,6 +93,24 @@ void naver_gemv_moe_launch(
     int                    shared_x,
     StreamHandle           stream);
 
+// Mode A milestone 1, S6 — element-wise SwiGLU * up gate.
+//
+//   slot_gate [N] f32 — gate matmul output (per-slot, flattened)
+//   slot_up   [N] f32 — up   matmul output (per-slot, flattened)
+//   slot_out  [N] f32 — output: silu(slot_gate) * slot_up
+//
+// Where silu(x) = x / (1 + exp(-x)). Element-wise, no shape dependence;
+// flatten the [n_tokens, n_used, n_ff] tensors to N = n_tokens*n_used*n_ff.
+// slot_out may alias slot_gate or slot_up. All device-resident, on
+// ``stream``. Used by Qwen3MoEAnyBcqExecutor::forward_moe_layer between
+// the gate/up chunked matmuls and the down chunked matmul.
+void launch_swiglu_mul(
+    const float * slot_gate,
+    const float * slot_up,
+    float *       slot_out,
+    std::size_t   N,
+    StreamHandle  stream);
+
 // Mode A milestone 1, S4 — weighted reduce over the per-top-k slot axis.
 //
 //   slot_out  [n_tokens, n_used, M]  f32  — kernel output from the
