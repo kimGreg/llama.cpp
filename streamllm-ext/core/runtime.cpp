@@ -302,9 +302,10 @@ void StreamllmRuntime::register_layout(const std::string & wid,
         d.n_chunks           = h.n_chunks;
         d.K_groups           = h.K_groups;
         d.group_size         = h.group_size;
-        d.qw_bytes_per_chunk = h.qw_bytes_per_chunk;
-        d.any_precision      = h.any_precision;
-        d.base_precision     = h.base_precision;
+        d.qw_bytes_per_chunk    = h.qw_bytes_per_chunk;
+        d.alpha_bytes_per_chunk = h.alpha_bytes_per_chunk;
+        d.any_precision         = h.any_precision;
+        d.base_precision        = h.base_precision;
     }
 
     // Slice the per-tensor pointer arrays out of the pre-allocated
@@ -427,6 +428,32 @@ void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid,
     auto it = entries_.find(wid);
     if (it == entries_.end()) return;
     int p = cid_chunk_index(cid);
+
+    // CROSS-STREAM EVICTION SAFETY.
+    //
+    // ``after_evict`` writes nulls into the per-plane d_qw / d_alpha
+    // pointer table (device memory).  The fused MoE kernel reads the
+    // same memory on the compute stream.  Without a wait, the
+    // null-clear on copy_stream can land mid-kernel and turn a
+    // resident-but-no-longer-reserved chunk's plane pointer into
+    // null — silent corruption if the kernel had already read the
+    // pre-null value (slot still valid) OR a kernel trap if it
+    // reads post-null (we'd see violations, but at varying-
+    // precision dial points the kernel may have moved past that
+    // plane index already so neither outcome is detected).
+    //
+    // ``launch_copy_`` already serialises new H2Ds behind
+    // ``latest_compute_event_`` for the same reason — see
+    // VramChunkPool::launch_copy_.  Mirror the same guard here so
+    // eviction-side writes also wait out the in-flight kernel
+    // before mutating the pointer table.  Cost: eviction blocks
+    // until the current compute kernel completes, but eviction
+    // already serialises with H2Ds via io_stream_mu_, so this is
+    // a wash on critical-path latency.
+    if (pool_) {
+        pool_->wait_compute_on(stream);
+    }
+
     // ChunkedTensor::after_evict knows the encoder's chunk_idx →
     // plane_idx mapping (shortcut: identity; any-prec: plane_idx_first
     // off chunk_planes). Routes to the registered encoder callback

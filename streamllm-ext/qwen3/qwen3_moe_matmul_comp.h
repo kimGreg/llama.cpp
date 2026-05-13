@@ -10,15 +10,25 @@
 //   plan()       — pure host.  Reads the pinned input buffers,
 //                  computes per-expert max gate score, asks the
 //                  scheduler for a per-expert chunk plan, fills the
-//                  ``host_prec_per_expert_`` array (size n_experts —
-//                  SSOT §6.9 M1).  Returns the load_set the loader
-//                  thread should bring resident.
-//   execute()    — kernel launches: F32→F16 cast of src1, ids D2D
-//                  into the per-stream scratch, dst zero, H2D of
-//                  host_prec_per_expert_ → prec_per_eid_d_,
-//                  ``refresh_q_bias_for_anyprec_launch``, and the
-//                  fused ``naver_gemv_moe_launch``.  Kernel traps
-//                  on null required plane (M1).
+//                  ``host_n_chunks_per_expert_`` array (size n_experts).
+//                  Returns the chunk-indexed load_set and required_set.
+//   execute()    — F32→F16 cast of src1, ids D2D into the per-stream
+//                  scratch, zero dst, then delegates the H2D-prec-array
+//                  + kernel launch to ``anybcq::moe_chunk_matmul``,
+//                  which owns the chunks→planes translation and the
+//                  fused MoE GEMV launch.
+//
+// Layer boundary (SSOT §6.1.5 ideal flow; constraints 1 + 5):
+//
+//   * This TU is in the **model** layer (``qwen3/``) and works in
+//     CHUNKS only.  It never names planes, never reads base_p, and
+//     never owns the kernel-facing per-expert precision array's
+//     contents — that array is decoder-fillable scratch, opaque
+//     here.
+//
+//   * The plane↔chunk translation, the H2D of the kernel-facing
+//     precision array, the any-prec q_bias refresh, and the fused
+//     MoE GEMV launch all live in ``decoder/anybcq/chunked_matmul.cu``.
 
 #pragma once
 
@@ -108,27 +118,31 @@ private:
     const MoeExpertTable *       fuse_table_ = nullptr;
     const UpstreamLayoutDevice * any_layout_ = nullptr;
 
-    // Cached canonical config (constant for this comp).
+    // Cached canonical config (constant for this comp).  Only
+    // chunk-side metadata is kept here; plane-side fields (base_p,
+    // any_precision flag) belong to the decoder and are pulled from
+    // ``rt_->layout(canonical_)`` inside ``decoder/anybcq``.
     int  n_experts_         = 0;
     int  K_                 = 0;
     int  M_                 = 0;
-    int  n_chunks_          = 0;
+    int  n_chunks_          = 0;  // encoder max chunks; clamps score_lookup
     int  group_size_        = 0;
-    int  base_precision_    = 0;
-    bool any_precision_     = false;
-    // Static fallback uniform_precision passed to the fused kernel
-    // launcher.  When ``prec_per_eid_d_`` is non-null (always, in
-    // this path) the kernel ignores ``uniform_precision``; we still
-    // pass a valid value so the launcher's [1, 8] range check is
-    // satisfied.
-    int  uniform_precision_static_ = 0;
 
     // Pinned host buffers.  Sized at construction; never reallocated.
-    int32_t * ids_pinned_           = nullptr;  // [max_n_tokens × max_n_used] int32
-    float   * probs_pinned_         = nullptr;  // [max_n_tokens × n_experts] float
-    float   * weights_pinned_       = nullptr;  // [max_n_tokens × max_n_used] float
-    int     * host_prec_per_expert_ = nullptr;  // [n_experts] int (SSOT §6.9 M1)
-    void    * prec_per_eid_d_       = nullptr;  // device, [n_experts × int]
+    int32_t * ids_pinned_              = nullptr;  // [max_n_tokens × max_n_used] int32
+    float   * probs_pinned_            = nullptr;  // [max_n_tokens × n_experts] float
+    float   * weights_pinned_          = nullptr;  // [max_n_tokens × max_n_used] float
+
+    // Per-expert chunk count the dispatch will require resident
+    // (constraint 1 rename).  plan() writes one entry per routed
+    // expert; execute() passes this to anybcq::moe_chunk_matmul.
+    int     * host_n_chunks_per_expert_ = nullptr;  // [n_experts] int
+
+    // Device scratch the decoder fills with kernel-facing per-expert
+    // precision (planes).  Opaque to the model — the decoder owns
+    // both the H2D and the chunks→planes conversion that populates
+    // it.  Allocated here so it lives for the comp's lifetime.
+    void    * prec_per_eid_d_           = nullptr;  // device, [n_experts × int]
 
     int max_n_tokens_ = 0;
     int max_n_used_   = 0;

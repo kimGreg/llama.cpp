@@ -15,6 +15,8 @@
 #include "qwen3_moe_dispatch.h"
 #include "qwen3_moe_scheduler.h"  // qwen3::scheduler_* free-fn shims
 #include "qwen3_moe_executor.h"   // Qwen3MoEAnyBcqExecutor + registration
+#include "decoder/anybcq/chunked_matmul.h"  // anybcq counters (constraint 7)
+#include "qwen3_moe_residency.h"  // MoEResidencyTracker eviction counters
 
 #include <ggml.h>
 #include <gguf.h>
@@ -416,6 +418,31 @@ void clear() {
         "forward_moe_layer_calls=%llu\n",
         (unsigned long long) g_sentinel_claims.load(std::memory_order_relaxed),
         (unsigned long long) g_forward_moe_layer_calls.load(std::memory_order_relaxed));
+
+    // Correctness counters (constraint 7).  Healthy run has
+    // validation_failures=0 and oob=0; comp_execute and kernel_launch
+    // should both be > 0 if the MoE layer fired at all.
+    {
+        const unsigned long long val_misses =
+            (unsigned long long)
+            qwen3::Qwen3MoEAnyBcqExecutor::required_set_misses_
+                .load(std::memory_order_relaxed);
+        const unsigned long long comp_calls =
+            anybcq::counter_chunk_matmul_calls();
+        const unsigned long long kern_calls =
+            anybcq::counter_kernel_launch_calls();
+        const unsigned long long oob =
+            anybcq::counter_n_chunks_oob();
+        std::fprintf(stderr,
+            "streamllm-ext correctness: required_set_misses=%llu "
+            "comp_execute=%llu kernel_launch=%llu n_chunks_oob=%llu\n",
+            val_misses, comp_calls, kern_calls, oob);
+        std::fprintf(stderr,
+            "streamllm-ext eviction: total=%llu during_dispatch=%llu\n",
+            MoEResidencyTracker::evictions_total(),
+            MoEResidencyTracker::evictions_during_dispatch());
+    }
+
     if (g_runtime && getenv("STREAMLLM_STATS")) {
         const auto & p = g_runtime->pool();
         std::fprintf(stderr,
@@ -456,6 +483,8 @@ void clear() {
     g_required_runtime_was_true = false;
     g_sentinel_claims.store(0, std::memory_order_relaxed);
     g_forward_moe_layer_calls.store(0, std::memory_order_relaxed);
+    anybcq::reset_counters();
+    MoEResidencyTracker::reset_eviction_counters();
     moe_dispatch::free_scratch();
     batched_gemm_shutdown();
 }

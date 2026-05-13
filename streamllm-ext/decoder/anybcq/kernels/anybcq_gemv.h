@@ -132,15 +132,25 @@ void update_per_plane_after_load_async(void ** d_qw, void ** d_alpha,
                                        size_t qw_bytes_per_chunk,
                                        StreamHandle stream);
 
-// Zero a freed slot after pool eviction so the kernel doesn't read a
-// stale pointer (the slot may have been reused by another chunk).
+// Zero a freed slot's per-plane pointers after pool eviction so the
+// kernel doesn't read a stale pointer (the slot may be reused by
+// another chunk under tight VRAM caps).
+//
+// IMPORTANT: this is the inverse of ``update_per_plane_after_load`` /
+// ``update_anyprec_after_load`` — it MUST clear every plane those
+// writers populated. For shortcut, that is one plane per chunk
+// (chunk_idx == plane). For any-prec chunk 0, ``base_p`` planes
+// ([0, base_p)) — leaving planes 1..base_p-1 dangling makes a
+// freed-and-reused slot readable through a stale d_qw[plane>=1]
+// entry and corrupts kernel output (the T5 race bug, 2026-05-13).
+//
 // The async variant runs as a 1-thread kernel on the pool's
-// copy_stream — preferred mid-run.  The sync variant is for install
+// copy_stream — preferred mid-run. The sync variant is for install
 // teardown where no copy_stream is available.
 void clear_per_plane_after_evict(void ** d_qw, void ** d_alpha,
-                                 int plane);
+                                 int plane_first, int n_planes);
 void clear_per_plane_after_evict_async(void ** d_qw, void ** d_alpha,
-                                       int plane,
+                                       int plane_first, int n_planes,
                                        StreamHandle stream);
 
 // Any-prec layout: chunk i packs [n_planes signs | precision_at_chunk α

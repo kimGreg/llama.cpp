@@ -67,6 +67,37 @@ void refresh_q_bias_for_anyprec_launch(
     const MoeExpertTable & table,
     StreamHandle stream);
 
+// Re-point ``d_alpha_planes_per_expert[eid][0..P-1]`` to the α section
+// of the *top resident chunk* for expert ``eid``, where
+// ``P = prec_per_eid_d[eid]``.
+//
+// Any-prec α is precision-dependent: chunk c packs the optimal
+// precision-(base_p+c-1) α values for ALL planes [0, base_p+c-1).  At
+// load time those α pointers got written into d_alpha by
+// ``update_anyprec_after_load``, but the values reflect the precision
+// AT LOAD TIME, which may not match what THIS dispatch needs.  Worse,
+// if chunk c is evicted but d_alpha still points into the freed slot,
+// the kernel reads slot-reuse garbage.
+//
+// This kernel runs once per MoE dispatch (right before
+// ``naver_gemv_moe_launch``) and recomputes d_alpha entries from the
+// d_qw pointer of the top resident chunk: alpha_base = d_qw[top_plane]
+// + n_planes_signs(top) × qw_bytes_per_chunk, then
+// d_alpha[p] = alpha_base + p × alpha_bytes_per_chunk for p in [0, P).
+//
+//   table             — per-canonical expert table (any-prec only).
+//   prec_per_eid_d    — per-expert plane count for this dispatch (PLANES).
+//   base_p            — encoder's base_precision (planes in chunk 0).
+//   qw_bytes_per_chunk, alpha_bytes_per_chunk
+//                     — per-plane strides from UpstreamLayoutDevice.
+void refresh_alpha_for_anyprec_launch(
+    const MoeExpertTable & table,
+    const int *  prec_per_eid_d,
+    int          base_p,
+    size_t       qw_bytes_per_chunk,
+    size_t       alpha_bytes_per_chunk,
+    StreamHandle stream);
+
 // Fused MoE LUT-GEMV launcher.
 //   X_fp16        : shared_x=1 → [n_tokens, K], else [n_tokens, n_used, K]
 //   Y_dst_f32     : [n_tokens, n_used, M], must be pre-zeroed

@@ -38,6 +38,7 @@
 #include "vram_pool.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -134,6 +135,23 @@ public:
         ChunkKey victim = *best_it;
         buckets_[best_p].erase(best_it);
         index_.erase(victim);
+        // Eviction-debug counters (constraint-violation gate).
+        g_evictions_total_.fetch_add(1, std::memory_order_relaxed);
+        // Dispatch-active counter: any chunk pinned in reserved_
+        // means a dispatch is in flight. (Crude proxy — if reserved_
+        // is non-empty we're inside someone's reserve+release window.)
+        bool dispatch_active = false;
+        size_t reserved_count;
+        {
+            // We're already holding mu_ from the caller's lock_guard
+            // — these are unlocked reads inside that scope.
+            reserved_count = reserved_.size();
+            dispatch_active = reserved_count > 0;
+        }
+        if (dispatch_active) {
+            g_evictions_during_dispatch_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         pool.evict(victim.wid, victim.cid);
         // Clear the per-plane device pointer-table slot async on the
         // pool's copy_stream (SSOT §6.1.6 step 6).  The worker is
@@ -144,6 +162,18 @@ public:
         rt.clear_chunk_device_ptr(victim.wid, victim.cid,
                                    pool.copy_stream());
         return true;
+    }
+
+    // Debug counters for T5/cap-pressure investigation.
+    static unsigned long long evictions_total() {
+        return g_evictions_total_.load(std::memory_order_relaxed);
+    }
+    static unsigned long long evictions_during_dispatch() {
+        return g_evictions_during_dispatch_.load(std::memory_order_relaxed);
+    }
+    static void reset_eviction_counters() {
+        g_evictions_total_.store(0, std::memory_order_relaxed);
+        g_evictions_during_dispatch_.store(0, std::memory_order_relaxed);
     }
 
     size_t size() const {
@@ -166,6 +196,10 @@ private:
     double   age_weight_;
     double   freq_weight_;
     mutable std::mutex mu_;
+
+    // Static atomic counters (process-wide, all trackers share).
+    static inline std::atomic<unsigned long long> g_evictions_total_{0};
+    static inline std::atomic<unsigned long long> g_evictions_during_dispatch_{0};
 };
 
 }  // namespace streamllm_ext

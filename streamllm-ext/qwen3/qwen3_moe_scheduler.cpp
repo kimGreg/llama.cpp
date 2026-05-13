@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cassert>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -446,27 +447,22 @@ public:
         return &it->second;
     }
 
-    // Direct-precision entry point used by the score policy: hook
-    // already decided desired_precision for this (canonical, expert).
-    const Plan * plan_for_expert_with_precision(
+    // Direct chunk-count entry point.  The model layer
+    // (MoEMatMulComp::plan) has already decided how many chunks this
+    // expert needs from the score-table dial; we just emit a Plan
+    // whose chunks list matches.  Plane semantics never appear here;
+    // any plane↔chunk translation lives in decoder/anybcq.
+    const Plan * plan_for_expert_with_chunks(
         const std::string & canonical_wid,
         int expert_id,
-        int desired_precision,
+        int n_chunks_requested,
         StreamHandle /*compute_stream*/) {
         const std::string synthetic =
             canonical_wid + ":e" + std::to_string(expert_id);
         if (any_prec_wids_.count(synthetic)) {
-            // Any-prec MoE — score policy supplies ``desired_precision``
-            // in PLANES (bits). For any-prec the planes loaded by the
-            // first n_chunks chunks is base_precision + (n_chunks − 1),
-            // so reaching a target plane count P_t needs
-            //   n_chunks = max(1, P_t − base_precision + 1)
-            // clamped to the encoded chunk count.
             auto it_pa = P_of_.find(synthetic);
             const int Pa = it_pa == P_of_.end() ? 0 : it_pa->second;
-            const auto * dev = rt_->layout(synthetic);
-            const int base_p = dev ? (int)dev->base_precision : 1;
-            int n_chunks = desired_precision - base_p + 1;
+            int n_chunks = n_chunks_requested;
             if (n_chunks < 1)  n_chunks = 1;
             if (n_chunks > Pa) n_chunks = Pa;
             return build_plan_for_anyprec(synthetic, n_chunks);
@@ -474,8 +470,8 @@ public:
         auto it_p = P_of_.find(synthetic);
         if (it_p == P_of_.end()) return nullptr;
         const int P = it_p->second;
-        const int desired = std::max(1, std::min(desired_precision, P));
-        return build_plan_for(synthetic, desired);
+        const int n_chunks = std::max(1, std::min(n_chunks_requested, P));
+        return build_plan_for(synthetic, n_chunks);
     }
 
   private:
@@ -533,13 +529,15 @@ public:
             }
         }
 
-        const uint64_t key = ((uint64_t)reinterpret_cast<uintptr_t>(&it_p->second))
-                              ^ 0xA17C0DECu
-                              ^ ((uint64_t)desired << 16);
+        const std::string key = synthetic + "#" + std::to_string(desired);
         auto it_plan = expert_plan_cache_.find(key);
-        if (it_plan != expert_plan_cache_.end() &&
-            it_plan->second.synthetic_wid == synthetic &&
-            it_plan->second.desired == desired) {
+        if (it_plan != expert_plan_cache_.end()) {
+            // Cache-content sanity check: cannot fail with a string
+            // key, but keep the assert so a future refactor (e.g.
+            // resurrecting the integer key) trips loudly instead of
+            // silently returning the wrong plan.
+            assert(it_plan->second.synthetic_wid == synthetic);
+            assert(it_plan->second.desired       == desired);
             return &it_plan->second.plan;
         }
 
@@ -621,12 +619,13 @@ public:
         }
 
         // Cache: per (synthetic_wid, desired) → Plan.
-        const uint64_t key = ((uint64_t)reinterpret_cast<uintptr_t>(&it_p->second))
-                              ^ (uint64_t)desired;
+        // String key — see comment on expert_plan_cache_ for the
+        // uint64-key collision bug this avoids.
+        const std::string key = synthetic + "#" + std::to_string(desired);
         auto it_plan = expert_plan_cache_.find(key);
-        if (it_plan != expert_plan_cache_.end() &&
-            it_plan->second.synthetic_wid == synthetic &&
-            it_plan->second.desired == desired) {
+        if (it_plan != expert_plan_cache_.end()) {
+            assert(it_plan->second.synthetic_wid == synthetic);
+            assert(it_plan->second.desired       == desired);
             return &it_plan->second.plan;
         }
 
@@ -1087,12 +1086,24 @@ private:
         read_float_env("STREAMLLM_MOE_EVICT_FREQ_WEIGHT",  0.0f),
     };
 
+    // Per-(synthetic_wid, desired_chunks) plan cache.
+    //
+    // History: this map was previously keyed on a uint64_t built by
+    // XOR-folding the address of P_of_[synthetic] with the desired
+    // count.  Two distinct (synthetic, desired) pairs can land on the
+    // same uint64_t, and ``emplace(key, …)`` is a no-op on key
+    // collision — so the function would silently return the colliding
+    // entry's plan (built for a different expert), giving the
+    // dispatch a load_set that doesn't match its required_set.  That
+    // was the root cause of the T5 residency violations after the
+    // chunk/plane refactor.  The cache now uses a string key
+    // (synthetic + "#" + desired) so collisions cannot occur.
     struct CachedExpertPlan {
         std::string synthetic_wid;
         int         desired;
         Plan        plan;
     };
-    std::unordered_map<uint64_t, CachedExpertPlan> expert_plan_cache_;
+    std::unordered_map<std::string, CachedExpertPlan> expert_plan_cache_;
 
     // Per-canonical-wid expert table for the fused MoE kernel. Built
     // lazily on first moe_expert_table() call; cached thereafter.
@@ -1174,15 +1185,15 @@ const Plan * scheduler_plan_dense(
     return as_moe(sched).plan_for(wid, compute_stream);
 }
 
-const Plan * scheduler_plan_for_expert_with_precision(
+const Plan * scheduler_plan_for_expert_with_chunks(
     Scheduler &         sched,
     const std::string & canonical_wid,
     int                 expert_id,
-    int                 desired_precision,
+    int                 n_chunks_requested,
     StreamHandle        compute_stream)
 {
-    return as_moe(sched).plan_for_expert_with_precision(
-        canonical_wid, expert_id, desired_precision, compute_stream);
+    return as_moe(sched).plan_for_expert_with_chunks(
+        canonical_wid, expert_id, n_chunks_requested, compute_stream);
 }
 
 const MoeExpertTable * scheduler_moe_expert_table(

@@ -49,6 +49,7 @@ if (GGML_CUDA)
         core/vram_pool.cu
         decoder/anybcq/kernels/chunked_matmul_gemv.cu
         decoder/anybcq/kernels/chunked_matmul_gemm.cu
+        decoder/anybcq/chunked_matmul.cu
         decoder/shortcut_anybcq/chunked_matmul.cu
         qwen3/qwen3_moe_fused.cu
     )

@@ -410,4 +410,24 @@ void VramChunkPool::record_compute_event(StreamHandle stream) {
         "cudaEventRecord(compute)");
 }
 
+
+void VramChunkPool::wait_compute_on(StreamHandle stream) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (latest_compute_event_ == nullptr) return;
+    if (stream == nullptr) return;
+    auto s = (cudaStream_t) stream;
+    // Skip under capture for the same reason record_compute_event does
+    // (the event is captured-graph-scoped from outside the capture and
+    // waiting on it here would tie an uncaptured launch to a captured
+    // event handle).
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &status) == cudaSuccess &&
+        status == cudaStreamCaptureStatusActive) {
+        return;
+    }
+    check_cuda(
+        cudaStreamWaitEvent(s, (cudaEvent_t) latest_compute_event_, 0),
+        "cudaStreamWaitEvent(compute, evict)");
+}
+
 } // namespace streamllm_ext

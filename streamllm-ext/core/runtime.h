@@ -82,6 +82,10 @@ struct UpstreamLayoutDevice {
     int          K_groups    = 0;
     int          group_size  = 0;
     size_t       qw_bytes_per_chunk = 0;  // offset to α inside a chunk
+    size_t       alpha_bytes_per_chunk = 0;  // per-plane α stride (any-prec
+                                              // refresh_alpha kernel uses
+                                              // this to walk α inside the
+                                              // top resident chunk)
     // Any-prec: tells the dispatch layer to skip the host-side
     // ``chunk_ptrs[p]`` walk in ``build_plane_ptrs`` and go directly
     // through the device-side per-plane pointer table (which carries

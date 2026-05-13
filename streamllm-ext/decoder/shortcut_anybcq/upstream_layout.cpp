@@ -173,15 +173,20 @@ UpstreamLayoutHost build_upstream_layout_shortcut(
         }
     };
     out.after_evict_fn = +[](
-        void ** d_qw_ptrs, void ** d_alpha_ptrs, int plane_idx,
+        void ** d_qw_ptrs, void ** d_alpha_ptrs,
+        int plane_first, int n_planes,
         StreamHandle stream)
     {
+        // Shortcut: 1 plane per chunk by construction; the caller
+        // (AnyBCQFamilyTensor::after_evict) already passes n_planes=1.
         if (stream != nullptr) {
             anybcq::clear_per_plane_after_evict_async(
-                d_qw_ptrs, d_alpha_ptrs, plane_idx, stream);
+                d_qw_ptrs, d_alpha_ptrs,
+                plane_first, n_planes, stream);
         } else {
             anybcq::clear_per_plane_after_evict(
-                d_qw_ptrs, d_alpha_ptrs, plane_idx);
+                d_qw_ptrs, d_alpha_ptrs,
+                plane_first, n_planes);
         }
     };
 

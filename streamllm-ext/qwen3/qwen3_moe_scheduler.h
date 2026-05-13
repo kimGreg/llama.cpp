@@ -33,13 +33,20 @@ const Plan * scheduler_plan_dense(
     StreamHandle        compute_stream);
 
 // MoE per-expert plan.  Dispatch has already looked up the per-expert
-// max-gate score in the score table and resolved that to a precision
-// (in planes); we just emit a Plan whose chunks list matches.
-const Plan * scheduler_plan_for_expert_with_precision(
+// max-gate score in the score table and resolved that to a chunk count;
+// we just emit a Plan whose chunks list matches.
+//
+// ``n_chunks_requested`` is in the model layer's unit (CHUNKS).
+// Internally the scheduler routes any-prec wids through
+// build_plan_for_anyprec(synthetic, n_chunks) and shortcut wids
+// through build_plan_for(synthetic, n_chunks) — both interpret the
+// argument as a chunk count.  Plane semantics live entirely inside
+// decoder/anybcq (SSOT §6.1.5 layering).
+const Plan * scheduler_plan_for_expert_with_chunks(
     Scheduler &         sched,
     const std::string & canonical_wid,
     int                 expert_id,
-    int                 desired_precision,
+    int                 n_chunks_requested,
     StreamHandle        compute_stream);
 
 // Per-canonical-tensor expert table for the fused MoE LUT-GEMV kernel.

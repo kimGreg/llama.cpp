@@ -165,6 +165,15 @@ public:
     // about to read.
     void record_compute_event(StreamHandle stream = nullptr);
 
+    // Make ``stream`` (typically copy_stream) wait on the latest
+    // compute event before issuing further work.  Used by the
+    // eviction path so an ``after_evict`` kernel that nulls per-plane
+    // pointers doesn't race a still-running compute kernel reading
+    // through the same pointer table.  No-op if no compute event has
+    // been recorded yet or if ``stream`` is in active CUDA-graph
+    // capture (the launch path handles that separately).
+    void wait_compute_on(StreamHandle stream);
+
     // Total capacity / current usage.
     size_t capacity_bytes() const { return capacity_bytes_; }
     size_t used_bytes()     const { return used_bytes_; }

@@ -1,20 +1,27 @@
 // streamllm-ext / qwen3 — MoEMatMulComp implementation.
 //
-// Lifts the LOAD walk and kernel-launch blocks from
+// Lifts the LOAD walk and kernel-launch glue from
 // ``qwen3_moe_dispatch.cpp`` into the three ChunkedComputation
 // virtuals.  ``Runtime::run`` orchestrates the captured sequence of
 // (D2H pre_inputs → host-fn that calls plan → cudaStreamWaitEvent →
 // captured kernels in execute) — same code under cuda-graph capture
 // and under eager dispatch, with the planner running on every replay
 // so freshly-routed chunks land before the captured kernel reads them.
+//
+// Layer boundary (constraints 1 + 5): this TU is in the **model**
+// layer.  It works in CHUNKS only.  The plane↔chunk translation, H2D
+// of the kernel-facing per-expert precision array, the any-prec
+// q_bias refresh, and the fused MoE GEMV launch all live in
+// ``decoder/anybcq/chunked_matmul.cu``.
 
 #include "qwen3_moe_matmul_comp.h"
 
-#include "qwen3_moe_dispatch.h"   // moe_dispatch::scratch_for_stream / topk_weights_lookup
-#include "qwen3_moe_scheduler.h"  // qwen3::scheduler_plan_for_expert_with_precision
+#include "qwen3_moe_dispatch.h"   // moe_dispatch::scratch_for_stream
+#include "qwen3_moe_scheduler.h"  // qwen3::scheduler_plan_for_expert_with_chunks
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "anybcq_gemm.h"          // launch_f32_to_f16
+#include "decoder/anybcq/chunked_matmul.h"  // anybcq::moe_chunk_matmul
 
 #include <ggml.h>
 #include <cuda_fp16.h>
@@ -28,14 +35,6 @@
 
 namespace streamllm_ext {
 namespace qwen3 {
-
-namespace {
-
-// Bounds the per-(t, u) precision the kernel reads. Matches the
-// kMaxChunksPerTensor limit imposed by the AnyBCQ kernel.
-constexpr int kCompMaxPlanes = kMaxChunksPerTensor;
-
-}  // anonymous namespace
 
 
 MoEMatMulComp::MoEMatMulComp(
@@ -59,15 +58,10 @@ MoEMatMulComp::MoEMatMulComp(
         M_              = any_layout_->M;
         n_chunks_       = any_layout_->n_chunks;
         group_size_     = any_layout_->group_size;
-        base_precision_ = any_layout_->base_precision;
-        any_precision_  = any_layout_->any_precision;
-        uniform_precision_static_ = any_precision_
-            ? base_precision_ + n_chunks_ - 1
-            : n_chunks_;
-        if (uniform_precision_static_ < 1)
-            uniform_precision_static_ = 1;
-        if (uniform_precision_static_ > kCompMaxPlanes)
-            uniform_precision_static_ = kCompMaxPlanes;
+    }
+    if (n_chunks_ < 1) n_chunks_ = 1;
+    if (n_chunks_ > (int) kMaxChunksPerTensor) {
+        n_chunks_ = (int) kMaxChunksPerTensor;
     }
 
     // Layer index parsed from the canonical's ``blk.<L>.…`` prefix.
@@ -96,23 +90,26 @@ MoEMatMulComp::MoEMatMulComp(
     const size_t tx_count =
         (size_t) max_n_tokens_ * (size_t) std::max(n_experts_, 1);
 
-    ids_pinned_           = (int32_t *) host_alloc(tu_count * sizeof(int32_t));
-    weights_pinned_       = (float *)   host_alloc(tu_count * sizeof(float));
-    probs_pinned_         = (float *)   host_alloc(tx_count * sizeof(float));
+    ids_pinned_     = (int32_t *) host_alloc(tu_count * sizeof(int32_t));
+    weights_pinned_ = (float *)   host_alloc(tu_count * sizeof(float));
+    probs_pinned_   = (float *)   host_alloc(tx_count * sizeof(float));
 
-    // Per-expert precision buffer (SSOT §6.9 M1 / row 9).  Sized
-    // n_experts × int.  plan() writes target_planes[e] per expert;
-    // execute() H2Ds to ``prec_per_eid_d_`` for the kernel.  Both
-    // expert id (from ids[tu]) and precision boundary come from
-    // current-batch routing, so no per-(t, u) broadcast is needed.
-    const size_t prec_bytes = (size_t) std::max(n_experts_, 1) * sizeof(int);
-    host_prec_per_expert_ = (int *) host_alloc(prec_bytes);
-    if (prec_bytes > 0) {
-        cudaError_t err = cudaMalloc(&prec_per_eid_d_, prec_bytes);
+    // Per-expert CHUNK COUNT buffer (constraint 1).  Model-side unit.
+    // plan() writes ``n_chunks_per_eid[e]`` per routed expert;
+    // execute() passes this to anybcq::moe_chunk_matmul, which
+    // translates to planes internally before H2D + kernel launch.
+    const size_t n_chunks_bytes = (size_t) std::max(n_experts_, 1) * sizeof(int);
+    host_n_chunks_per_expert_ = (int *) host_alloc(n_chunks_bytes);
+
+    // Device scratch the decoder fills with kernel-facing per-expert
+    // precision.  We allocate it (model owns lifetime) but never read
+    // or write its contents from this layer.
+    if (n_chunks_bytes > 0) {
+        cudaError_t err = cudaMalloc(&prec_per_eid_d_, n_chunks_bytes);
         if (err != cudaSuccess) {
             std::fprintf(stderr,
                 "streamllm-ext: MoEMatMulComp(%s): cudaMalloc(prec_per_eid_d, %zuB) failed: %s\n",
-                canonical_.c_str(), prec_bytes, cudaGetErrorString(err));
+                canonical_.c_str(), n_chunks_bytes, cudaGetErrorString(err));
             prec_per_eid_d_ = nullptr;
         }
     }
@@ -120,11 +117,11 @@ MoEMatMulComp::MoEMatMulComp(
 
 
 MoEMatMulComp::~MoEMatMulComp() {
-    if (ids_pinned_)           cudaFreeHost(ids_pinned_);
-    if (weights_pinned_)       cudaFreeHost(weights_pinned_);
-    if (host_prec_per_expert_) cudaFreeHost(host_prec_per_expert_);
-    if (probs_pinned_)         cudaFreeHost(probs_pinned_);
-    if (prec_per_eid_d_)       cudaFree(prec_per_eid_d_);
+    if (ids_pinned_)               cudaFreeHost(ids_pinned_);
+    if (weights_pinned_)           cudaFreeHost(weights_pinned_);
+    if (host_n_chunks_per_expert_) cudaFreeHost(host_n_chunks_per_expert_);
+    if (probs_pinned_)             cudaFreeHost(probs_pinned_);
+    if (prec_per_eid_d_)           cudaFree(prec_per_eid_d_);
 }
 
 
@@ -140,15 +137,14 @@ std::vector<MemcpySpec> MoEMatMulComp::pre_inputs(
     have_real_scores_   = false;
     have_renorm_weights_ = false;
 
-    // Pre-fill host_prec_per_expert_ with the canonical's max precision
-    // as a safe default.  plan() overwrites per-expert entries below.
-    // Defending against a code path that calls execute() without first
-    // calling plan(): the kernel reads a valid uniform precision
-    // rather than zero.
-    if (host_prec_per_expert_ != nullptr && n_experts_ > 0) {
-        const int fill = uniform_precision_static_ > 0
-            ? uniform_precision_static_ : 8;
-        std::fill_n(host_prec_per_expert_, (size_t) n_experts_, fill);
+    // Pre-fill host_n_chunks_per_expert_ with the encoder's max
+    // chunk count as a safe default.  plan() overwrites per-expert
+    // entries below.  Defends against a code path that calls
+    // execute() without first calling plan(): the decoder gets a
+    // valid in-range chunk count rather than zero.
+    if (host_n_chunks_per_expert_ != nullptr && n_experts_ > 0) {
+        const int fill = n_chunks_ > 0 ? n_chunks_ : 1;
+        std::fill_n(host_n_chunks_per_expert_, (size_t) n_experts_, fill);
     }
 
     std::vector<MemcpySpec> out;
@@ -179,10 +175,7 @@ std::vector<MemcpySpec> MoEMatMulComp::pre_inputs(
         out.push_back(m);
     }
 
-    // probs (optional): contiguous [n_tokens × n_expert] floats.  The
-    // existing dispatch found this tensor by walking ``ids->src[0]``
-    // (or its child); the shim does the walk and forwards via
-    // ``MoEInput::probs``.
+    // probs (optional): contiguous [n_tokens × n_expert] floats.
     if (in.probs != nullptr && in.probs->data != nullptr &&
         cur_n_expert_ > 0 && probs_pinned_ != nullptr &&
         cur_n_expert_ <= n_experts_)
@@ -224,10 +217,10 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
         return out_plan;
     }
 
-    const int n_tokens = cur_n_tokens_;
-    const int n_used   = cur_n_used_;
-    const int n_expert = cur_n_expert_;
-    const int base_p   = base_precision_ > 0 ? base_precision_ : 1;
+    const int n_tokens   = cur_n_tokens_;
+    const int n_used     = cur_n_used_;
+    const int n_expert   = cur_n_expert_;
+    const int n_chunks_max = n_chunks_;
 
     // ── Score-table snapshot (taken once per replay in
     // streamllm_on_graph_audit_and_score_snapshot; constant across
@@ -235,55 +228,39 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     const std::vector<float> & sc_thresh =
         rt_->current_replay_score_table();
 
-    auto score_lookup = [&](float g) -> int {
+    // Score → CHUNKS (constraint 1: model layer's unit is chunks).
+    // The score table has ``n_tiers`` entries (typically equal to
+    // n_chunks_max).  ``chunks_for_gate(g) = 1 + (largest k where
+    // thresholds[k] ≤ g)``, clamped to [1, n_chunks_max].  k+1 is
+    // the count of chunks (cids 0..k) the kernel needs resident
+    // for this expert.
+    auto chunks_for_gate = [&](float g) -> int {
         int k = -1;
         for (int i = (int) sc_thresh.size() - 1; i >= 0; --i) {
             if (g >= sc_thresh[i]) { k = i; break; }
         }
+        int required_chunks;
         if (k < 0) {
             // Below every threshold — happens when the gate signal is
-            // raw logits (negative) instead of post-softmax probs
-            // (Qwen3 case).  Fall back to MAX planes for quality —
-            // returning base_p drops every expert to its precision
-            // floor and the model goes garbled.
-            if (!sc_thresh.empty()) {
-                int planes = base_p + (int) sc_thresh.size() - 1;
-                if (planes > kCompMaxPlanes) planes = kCompMaxPlanes;
-                return planes;
-            }
-            return kCompMaxPlanes;
+            // raw logits (negative) instead of post-softmax probs.
+            // Fall back to MAX chunks for quality (constraint:
+            // unmappable scores must never silently drop precision).
+            required_chunks = n_chunks_max;
+        } else {
+            required_chunks = k + 1;
         }
-        int planes = base_p + k;
-        if (planes < 1)              planes = 1;
-        if (planes > kCompMaxPlanes) planes = kCompMaxPlanes;
-        return planes;
-    };
-
-    // For any-prec wids, ``desired_precision`` is in PLANES (bits) but
-    // chunks store [base_p planes][+1 plane]×(Pa−1).  Reaching plane
-    // count P_t needs n_chunks = max(1, P_t − base_p + 1) clamped to
-    // Pa, yielding planes_served = base_p + n_chunks − 1.  The
-    // per-expert precision written into host_prec_per_expert_ must
-    // equal planes_served to avoid reading past the last loaded
-    // plane pointer.
-    auto translate_planes = [&](int target) -> int {
-        if (any_precision_) {
-            const int Pa = n_chunks_;
-            int n_chunks = target - base_p + 1;
-            if (n_chunks < 1)  n_chunks = 1;
-            if (n_chunks > Pa) n_chunks = Pa;
-            return base_p + n_chunks - 1;
-        }
-        return target;
+        if (required_chunks < 1)              required_chunks = 1;
+        if (required_chunks > n_chunks_max)   required_chunks = n_chunks_max;
+        return required_chunks;
     };
 
     // ── Pass 1: per-expert max gate score across the minibatch.
     std::unordered_map<int, float> max_gate_by_expert;
-    std::unordered_map<int, int>   max_prec_by_expert;
+    std::unordered_map<int, int>   chunks_by_expert;
     std::vector<int>               unique_experts;
     const size_t reserve_n = (size_t) n_used * 4;
     max_gate_by_expert.reserve(reserve_n);
-    max_prec_by_expert.reserve(reserve_n);
+    chunks_by_expert.reserve(reserve_n);
     unique_experts.reserve(reserve_n);
 
     std::vector<float> g_per_tu((size_t) n_tokens * n_used, 0.0f);
@@ -312,56 +289,62 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
         }
     }
 
-    // ── Pass 2: per-expert target precision.  Write directly into
-    // host_prec_per_expert_[eid] (size n_experts).  Kernel reads
-    // ``P = prec_per_eid_d[ids[tu]]`` so both expert id and precision
-    // boundary come from current-batch routing (§6.9 M1 / row 9).
+    // ── Pass 2: per-expert CHUNK count.  Writes directly into
+    // host_n_chunks_per_expert_[eid] (size n_experts).
     for (int eid : unique_experts) {
-        const int desired =
-            translate_planes(score_lookup(max_gate_by_expert[eid]));
-        max_prec_by_expert[eid] = desired;
-        if (host_prec_per_expert_ != nullptr &&
+        const int required_chunks =
+            chunks_for_gate(max_gate_by_expert[eid]);
+        chunks_by_expert[eid] = required_chunks;
+        if (host_n_chunks_per_expert_ != nullptr &&
             eid >= 0 && eid < n_experts_) {
-            host_prec_per_expert_[eid] = desired;
+            host_n_chunks_per_expert_[eid] = required_chunks;
         }
     }
     for (int t = 0; t < n_tokens; ++t) {
         for (int u = 0; u < n_used; ++u) {
             const int eid = ids_pinned_[(size_t) t * n_used + u];
-            const int desired = max_prec_by_expert[eid];
+            const int n_c = chunks_by_expert[eid];
             const float g = g_per_tu[(size_t) t * n_used + u];
             diag::record_gate_event(layer_index_, t, u, eid,
-                                     g, /*cum_before=*/0.0f, desired);
+                                     g, /*cum_before=*/0.0f, n_c);
             const std::string synthetic =
                 canonical_ + ":e" + std::to_string(eid);
-            for (int pp = 0; pp < desired; ++pp) {
-                diag::record_chunk(*rt_, synthetic, u, pp, cid_chunk(pp));
+            for (int c = 0; c < n_c; ++c) {
+                diag::record_chunk(*rt_, synthetic, u, c, cid_chunk(c));
             }
         }
     }
 
-
     // ── Pass 3: per-expert plan → load_set (deduplicated) +
-    //            full required_set (every (eid, plane) the kernel
-    //            will read).  Step 6 (Milestone 1) walks required_set
-    //            pre-launch to verify each chunk reached
-    //            POINTER_TABLE_READY — catches a missed load or a
-    //            stale keep_set entry before the kernel trap fires.
+    //            required_set (every CHUNK the kernel will read).
+    //            BOTH are derived from the same chunks_by_expert
+    //            (constraint 3: single source of chunk count).
     std::unordered_set<std::string> issued_keys;
     issued_keys.reserve(unique_experts.size() * 8);
     out_plan.load_set.reserve(unique_experts.size() * 8);
     out_plan.required_set.reserve(unique_experts.size() * 8);
 
     for (int eid : unique_experts) {
-        const int desired = max_prec_by_expert[eid];
+        const int n_c = chunks_by_expert[eid];   // CHUNKS, constraint 2
         const std::string synthetic =
             canonical_ + ":e" + std::to_string(eid);
-        for (int p = 0; p < desired; ++p) {
-            out_plan.required_set.push_back(ChunkKey{synthetic, cid_chunk(p)});
+
+        // Required set: every chunk the kernel reads, cid-indexed.
+        // c is a CHUNK INDEX in [0, n_chunks_max].  cid_chunk(c)
+        // never escapes this range because n_c ≤ n_chunks_max.
+        for (int c = 0; c < n_c; ++c) {
+            out_plan.required_set.push_back(
+                ChunkKey{synthetic, cid_chunk(c)});
         }
+
+        // Load set: scheduler emits cid-indexed chunk moves for the
+        // same n_c.  Both load_set and required_set derive from this
+        // single chunk count (constraint 3).  The scheduler entry
+        // point is chunks-direct — no plane translation between
+        // model and scheduler.
         const Plan * exp_plan =
-            qwen3::scheduler_plan_for_expert_with_precision(
-                *sched_, canonical_, eid, desired,
+            qwen3::scheduler_plan_for_expert_with_chunks(
+                *sched_, canonical_, eid, n_c,
                 /*compute_stream=*/nullptr);
         if (exp_plan == nullptr) continue;
         for (const auto & mv : exp_plan->moves) {
@@ -463,33 +446,23 @@ void MoEMatMulComp::execute(const ComputationInput & in_base,
         cudaMemsetAsync(out.dst->data, 0, dst_bytes, stream);
     }
 
-    // ── 4. H2D host_prec_per_expert_ → prec_per_eid_d_ (SSOT §6.9
-    // M1).  Per-expert precision buffer, size n_experts × int.  plan()
-    // wrote target_planes[e] for every routed expert; the kernel reads
-    // ``P = prec_per_eid_d[ids[tu]]`` so both expert id and precision
-    // boundary come from current-batch routing.
-    const int * prec_per_eid_d = nullptr;
-    if (prec_per_eid_d_ != nullptr && host_prec_per_expert_ != nullptr &&
-        n_experts_ > 0) {
-        const size_t bytes = (size_t) n_experts_ * sizeof(int);
-        cudaMemcpyAsync(prec_per_eid_d_, host_prec_per_expert_,
-                        bytes, cudaMemcpyHostToDevice, stream);
-        prec_per_eid_d = (const int *) prec_per_eid_d_;
-    }
-
-    // ── 5. Refresh per-expert q_bias pointers (any-prec only no-op for
-    // shortcut canonicals).  Captured kernel that scatters d_qbias_slot
-    // into the table.
-    qwen3::refresh_q_bias_for_anyprec_launch(*fuse_table_, stream_h);
-
-    // ── 6. Fused MoE GEMV.  Required planes [0, prec_per_eid_d[eid])
-    // MUST be non-null at this point (SSOT §6.9 M1).  The kernel
-    // ``__trap()``s on null required pointer.
-    qwen3::naver_gemv_moe_launch(
-        sc->xb_f16, out.dst->data, (const int32_t *) sc->ids_d,
+    // ── 4. Hand off to the decoder.  anybcq::moe_chunk_matmul owns
+    //      chunks→planes conversion, H2D of the kernel-facing
+    //      per-expert precision array (prec_per_eid_d_), any-prec
+    //      q_bias slot refresh, and the fused MoE GEMV launch.
+    //      Model layer never sees plane vocabulary (constraint 1).
+    anybcq::moe_chunk_matmul(
+        *rt_,
+        canonical_,
+        *any_layout_,
         *fuse_table_,
-        M, K, n_tokens, n_used,
-        uniform_precision_static_, prec_per_eid_d,
+        (int *) prec_per_eid_d_,
+        host_n_chunks_per_expert_,
+        (const int32_t *) sc->ids_d,
+        sc->xb_f16,
+        out.dst->data,
+        n_tokens, n_used, n_experts_,
+        M, K,
         group_size_,
         shared_x ? 1 : 0,
         stream_h);

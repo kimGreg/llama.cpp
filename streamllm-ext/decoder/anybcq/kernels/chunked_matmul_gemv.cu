@@ -205,34 +205,45 @@ void free_per_plane_arrays(void *& d_qw, void *& d_alpha) {
 }
 
 namespace {
-__global__ void k_clear_two_ptrs(void ** d_qw, void ** d_alpha, int plane) {
+// Clears a contiguous range of plane pointers (qw + alpha).
+// For any-prec, chunk 0 owns ``base_p`` planes — its after_evict must
+// invalidate ALL of them so a freed-and-reused slot can't be read
+// through a stale d_qw[plane>=1] entry.
+__global__ void k_clear_plane_range(void ** d_qw, void ** d_alpha,
+                                     int plane_first, int n_planes) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        d_qw[plane]    = nullptr;
-        d_alpha[plane] = nullptr;
+        for (int i = 0; i < n_planes; ++i) {
+            d_qw[plane_first + i]    = nullptr;
+            d_alpha[plane_first + i] = nullptr;
+        }
     }
 }
 }  // anon
 
 void clear_per_plane_after_evict_async(void ** d_qw, void ** d_alpha,
-                                       int plane,
+                                       int plane_first, int n_planes,
                                        StreamHandle stream) {
     if (d_qw == nullptr || d_alpha == nullptr) return;
-    if (plane < 0) return;
+    if (plane_first < 0 || n_planes < 1) return;
     auto s = (cudaStream_t) stream;
-    k_clear_two_ptrs<<<1, 1, 0, s>>>(d_qw, d_alpha, plane);
+    k_clear_plane_range<<<1, 1, 0, s>>>(d_qw, d_alpha, plane_first, n_planes);
 }
 
-void clear_per_plane_after_evict(void ** d_qw, void ** d_alpha, int plane) {
+void clear_per_plane_after_evict(void ** d_qw, void ** d_alpha,
+                                  int plane_first, int n_planes) {
     // Synchronous fallback for callers without a copy_stream (install
     // teardown).  Prefer the async variant on the pool's copy_stream
     // when an eviction fires mid-run (SSOT §6.1.6 step 6).
     if (d_qw == nullptr || d_alpha == nullptr) return;
-    if (plane < 0) return;
+    if (plane_first < 0 || n_planes < 1) return;
     void * null_ptr = nullptr;
-    cudaMemcpy((uint8_t *)d_qw    + (size_t)plane * sizeof(void *),
-               &null_ptr, sizeof(void *), cudaMemcpyHostToDevice);
-    cudaMemcpy((uint8_t *)d_alpha + (size_t)plane * sizeof(void *),
-               &null_ptr, sizeof(void *), cudaMemcpyHostToDevice);
+    for (int i = 0; i < n_planes; ++i) {
+        const size_t off = (size_t)(plane_first + i) * sizeof(void *);
+        cudaMemcpy((uint8_t *)d_qw    + off, &null_ptr, sizeof(void *),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy((uint8_t *)d_alpha + off, &null_ptr, sizeof(void *),
+                   cudaMemcpyHostToDevice);
+    }
 }
 
 void update_per_plane_after_load(void ** d_qw, void ** d_alpha,

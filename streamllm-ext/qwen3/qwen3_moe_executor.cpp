@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // getenv (STREAMLLM_VIOLATION_DUMP)
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -160,6 +161,72 @@ bool Qwen3MoEAnyBcqExecutor::validate_required_set_(
             std::fprintf(stderr, "%s\n", buf);
         }
     }
+
+    // Verbose per-violation dump for the T5 race investigation.
+    // Gated by STREAMLLM_VIOLATION_DUMP=1 to avoid log spam in
+    // normal runs.  Reveals whether the miss is:
+    //   - a load_set / required_set mismatch (required cid not in load_set)
+    //   - a wait/H2D timing issue (load_set has it but state < ready)
+    //   - an eviction race (resident earlier, NOT_RESIDENT now)
+    static const bool dump_enabled =
+        std::getenv("STREAMLLM_VIOLATION_DUMP") != nullptr;
+    if (dump_enabled) {
+        static std::mutex dump_mu;
+        std::lock_guard<std::mutex> lk(dump_mu);
+        std::fprintf(stderr, "  >>> dump (first_miss wid=%s):\n",
+                     first_miss->wid.c_str());
+
+        // Build load_set membership lookup keyed by full ChunkKey.
+        std::unordered_set<std::string> in_load_set;
+        in_load_set.reserve(plan.load_set.size());
+        for (const auto & k : plan.load_set) {
+            in_load_set.insert(k.wid + "#" + std::to_string(k.cid));
+        }
+
+        // Tally per-state for the missed chunks + record which were
+        // in load_set vs not.
+        int missed_NR = 0, missed_SA = 0, missed_H2D = 0, missed_PTR = 0;
+        int missed_in_load_set = 0, missed_not_in_load_set = 0;
+        for (const auto & k : plan.required_set) {
+            if (pool.kernel_ready_on(k.wid, k.cid, stream)) continue;
+            const ChunkState s = pool.chunk_state(k.wid, k.cid);
+            switch (s) {
+                case ChunkState::NOT_RESIDENT:        ++missed_NR;  break;
+                case ChunkState::SLOT_ALLOCATED:      ++missed_SA;  break;
+                case ChunkState::H2D_ISSUED:          ++missed_H2D; break;
+                case ChunkState::POINTER_TABLE_READY: ++missed_PTR; break;
+            }
+            const std::string key = k.wid + "#" + std::to_string(k.cid);
+            if (in_load_set.count(key)) ++missed_in_load_set;
+            else                        ++missed_not_in_load_set;
+        }
+        std::fprintf(stderr,
+            "      missed by state:  NOT_RESIDENT=%d SLOT_ALLOCATED=%d "
+            "H2D_ISSUED=%d POINTER_TABLE_READY=%d\n",
+            missed_NR, missed_SA, missed_H2D, missed_PTR);
+        std::fprintf(stderr,
+            "      missed vs load_set:  in_load=%d  not_in_load=%d "
+            "(load_set size=%zu, required_set size=%zu)\n",
+            missed_in_load_set, missed_not_in_load_set,
+            plan.load_set.size(), plan.required_set.size());
+
+        // Print the full required_set for the first_miss's expert
+        // (synthetic = "<canonical>:e<eid>") with per-cid state +
+        // in_load_set flag. This is the per-expert column dump.
+        const std::string focus_wid = first_miss->wid;
+        std::fprintf(stderr, "      per-cid for %s:\n", focus_wid.c_str());
+        for (const auto & k : plan.required_set) {
+            if (k.wid != focus_wid) continue;
+            const ChunkState s = pool.chunk_state(k.wid, k.cid);
+            const std::string key = k.wid + "#" + std::to_string(k.cid);
+            const bool in_load = in_load_set.count(key) > 0;
+            const bool ready   = pool.kernel_ready_on(k.wid, k.cid, stream);
+            std::fprintf(stderr,
+                "        cid=%d state=%s in_load=%d ready=%d\n",
+                k.cid, state_to_str(s),
+                in_load ? 1 : 0, ready ? 1 : 0);
+        }
+    }
     return false;
 #endif
 }
@@ -233,11 +300,23 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_one_canonical_(
 
     ChunkPlan plan = comp.plan(in);
 
-    if (!plan.load_set.empty()) {
-        for (const auto & k : plan.load_set) {
+    // ── Reservation contract (constraint: cap must not degenerate
+    //    quality).  Reserve EVERY chunk the kernel will read, not just
+    //    the ones newly loaded.  Chunks already resident from a prior
+    //    dispatch live in ``required_set`` but not in ``load_set``;
+    //    without an explicit reservation, the loader's
+    //    ``make_room_for`` is free to pick them as victims while THIS
+    //    dispatch's kernel is still reading them (race E from the T5
+    //    investigation).  Reserving the required_set superset is the
+    //    structural fix.
+    if (!plan.required_set.empty()) {
+        for (const auto & k : plan.required_set) {
             qwen3::scheduler_reserve_for_dispatch(
                 rt_->scheduler(), k.wid, k.cid);
         }
+    }
+
+    if (!plan.load_set.empty()) {
         const bool async_on = rt_->io_worker_count() > 0;
         if (async_on) {
             auto batch = std::make_shared<std::atomic<uint32_t>>(0);
@@ -259,11 +338,9 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_one_canonical_(
     }
 
     if (!validate_required_set_(plan, stream_h)) {
-        if (!plan.load_set.empty()) {
-            for (const auto & k : plan.load_set) {
-                qwen3::scheduler_release_from_dispatch(
-                    rt_->scheduler(), k.wid, k.cid);
-            }
+        for (const auto & k : plan.required_set) {
+            qwen3::scheduler_release_from_dispatch(
+                rt_->scheduler(), k.wid, k.cid);
         }
         std::fprintf(stderr,
             "streamllm-ext: forward_moe_layer[%s, L=%d]: "
@@ -274,11 +351,17 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_one_canonical_(
 
     comp.execute(in, out, stream_h);
 
-    if (!plan.load_set.empty()) {
-        for (const auto & k : plan.load_set) {
-            qwen3::scheduler_release_from_dispatch(
-                rt_->scheduler(), k.wid, k.cid);
-        }
+    // Release every chunk we reserved (the full required_set).  The
+    // chunks may still be referenced by the in-flight kernel — eviction
+    // safety is provided downstream by ``clear_chunk_device_ptr``'s
+    // ``wait_compute_on`` against ``latest_compute_event_``, so the
+    // after_evict pointer-table clear waits out the kernel before
+    // nulling the slot.  Release here is a host-side flag flip; it
+    // doesn't actually free anything until make_room_for picks the
+    // chunk.
+    for (const auto & k : plan.required_set) {
+        qwen3::scheduler_release_from_dispatch(
+            rt_->scheduler(), k.wid, k.cid);
     }
     return true;
 }

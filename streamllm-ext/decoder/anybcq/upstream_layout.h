@@ -73,16 +73,30 @@ using ChunkAfterLoadFn = void (*)(
 
 // ``ChunkAfterEvictFn``: after the chunk is evicted from VRAM, clear
 // the per-plane pointer-table entries so the kernel doesn't read
-// stale pointers if the slot is reused. ``plane_idx`` is the plane
-// in the per-encoder per-tensor index (shortcut: chunk_idx == plane_idx;
-// any-prec: ``host.chunk_planes[chunk_idx].plane_idx_first``).
-//   ``stream`` is the pool's copy stream — clear should be enqueued
-//   async so it overlaps with the worker's other emissions (SSOT
-//   §6.1.6 step 6).  May be null only on teardown.
+// stale pointers if the slot is reused.
+//
+// MUST be the exact inverse of ``ChunkAfterLoadFn`` at the plane
+// level — every plane the load wrote, the evict clears.  In
+// particular, any-prec chunk 0 owns ``base_p`` planes, so its evict
+// MUST clear all of ``[plane_first, plane_first + n_planes)`` — not
+// just ``plane_first``.  Shortcut: 1 plane per chunk (chunk_idx ==
+// plane_idx, n_planes always 1).
+//
+//   ``plane_first`` — first plane index this chunk owns.
+//                     shortcut: chunk_idx
+//                     any-prec: ``host.chunk_planes[chunk_idx].plane_idx_first``
+//   ``n_planes``    — number of planes this chunk owns.
+//                     shortcut: 1
+//                     any-prec: ``host.chunk_planes[chunk_idx].n_planes_this_chunk``
+//   ``stream``      — pool's copy stream; clear is enqueued async
+//                     so it overlaps with the worker's other
+//                     emissions (SSOT §6.1.6 step 6).  May be null
+//                     only on teardown.
 using ChunkAfterEvictFn = void (*)(
     void **       d_qw_ptrs,
     void **       d_alpha_ptrs,
-    int           plane_idx,
+    int           plane_first,
+    int           n_planes,
     StreamHandle  stream);
 
 

@@ -331,6 +331,122 @@ void refresh_q_bias_for_anyprec_launch(
         n);
 }
 
+
+namespace {
+// Rebuild the per-expert α and β pointer tables from the top resident
+// chunk's qw base, indexed by the per-expert plane count for THIS
+// dispatch.  Runs once per MoE dispatch on the compute stream right
+// before the fused MoE kernel.
+//
+// Why both α and β: any-prec stores precision-dependent α + β in each
+// chunk's payload.  ``update_anyprec_after_load`` wrote the kernel
+// table to point into whichever chunk loaded LAST — under varying-
+// precision dial + cap pressure, that chunk may have been evicted,
+// or it may simply be the wrong precision for THIS dispatch.  We
+// rebuild from the still-resident top chunk by:
+//   1. Reading d_qw_e[top_plane] to get the top chunk's slot base
+//      (its qw section starts here).
+//   2. α section = qw_base + n_planes_signs(top) × qw_bytes_per_chunk
+//   3. β section = α section + P × alpha_bytes_per_chunk
+//                  (chunk c stores P=base_p+c α values, then β)
+//
+// This makes the kernel-facing pointer table a pure function of
+// (residency state, per-expert precision) computed at launch time,
+// so stale-load / eviction-race effects can't propagate.
+__global__ void k_refresh_alpha_beta_anyprec(
+    void * const * const * d_alpha_planes_per_expert,   // [n_experts] → [kMaxChunks] α ptrs
+    void **                d_q_bias_per_expert,         // [n_experts] β ptrs
+    const void * const * const * d_qw_planes_per_expert,// [n_experts] → [kMaxChunks] qw ptrs
+    const int *  prec_per_eid_d,
+    int          base_p,
+    int          n_experts,
+    size_t       qw_bytes_per_chunk,
+    size_t       alpha_bytes_per_chunk)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_experts) return;
+    const int P = prec_per_eid_d[e];
+    if (P < 1) return;
+
+    void ** d_alpha_e = (void **) d_alpha_planes_per_expert[e];
+    const void * const * d_qw_e = d_qw_planes_per_expert[e];
+    if (d_alpha_e == nullptr || d_qw_e == nullptr) return;
+
+    // P = base_p + (N − 1) where N = number of chunks loaded for this
+    // expert. The top resident chunk owns plane (P − 1) for N >= 2, or
+    // planes [0, base_p) for N == 1. In both cases its qw section
+    // starts at d_qw_e[top_plane].
+    int top_plane;
+    int n_planes_signs;
+    if (P <= base_p) {
+        // N == 1: chunk 0 only.
+        top_plane      = 0;
+        n_planes_signs = base_p;
+    } else {
+        top_plane      = P - 1;
+        n_planes_signs = 1;
+    }
+
+    const uint8_t * qw_top =
+        (const uint8_t *) d_qw_e[top_plane];
+    if (qw_top == nullptr) return;
+
+    const uint8_t * alpha_base =
+        qw_top + (size_t) n_planes_signs * qw_bytes_per_chunk;
+
+    for (int p = 0; p < P; ++p) {
+        d_alpha_e[p] = (void *)(alpha_base +
+                                 (size_t) p * alpha_bytes_per_chunk);
+    }
+
+    // β section follows the precision-P α array inside the top chunk.
+    if (d_q_bias_per_expert != nullptr) {
+        const uint8_t * beta_base =
+            alpha_base + (size_t) P * alpha_bytes_per_chunk;
+        d_q_bias_per_expert[e] = (void *) beta_base;
+    }
+}
+}  // anon
+
+void refresh_alpha_for_anyprec_launch(
+    const MoeExpertTable & table,
+    const int *  prec_per_eid_d,
+    int          base_p,
+    size_t       qw_bytes_per_chunk,
+    size_t       alpha_bytes_per_chunk,
+    StreamHandle stream)
+{
+    if (table.d_alpha_planes_per_expert == nullptr) return;
+    if (table.d_qw_planes_per_expert    == nullptr) return;
+    if (prec_per_eid_d == nullptr) return;
+    if (table.n_experts <= 0) return;
+    if (base_p <= 0) return;
+    // Debug: confirm we're running with sane layout params.
+    // Fires once per process via static guard.
+    static bool logged = false;
+    if (!logged) {
+        std::fprintf(stderr,
+            "streamllm-ext: refresh_alpha_for_anyprec_launch active "
+            "(base_p=%d qw_bytes=%zu alpha_bytes=%zu n_experts=%d)\n",
+            base_p, qw_bytes_per_chunk, alpha_bytes_per_chunk,
+            table.n_experts);
+        logged = true;
+    }
+    const int n = table.n_experts;
+    const int block = 64;
+    const int grid  = (n + block - 1) / block;
+    auto s = (cudaStream_t) stream;
+    k_refresh_alpha_beta_anyprec<<<grid, block, 0, s>>>(
+        (void * const * const *) table.d_alpha_planes_per_expert,
+        table.d_q_bias_per_expert,
+        (const void * const * const *) table.d_qw_planes_per_expert,
+        prec_per_eid_d,
+        base_p,
+        n,
+        qw_bytes_per_chunk,
+        alpha_bytes_per_chunk);
+}
+
 // Mode A milestone 1, S4 — weighted reduce over the per-top-k slot axis.
 //
 // layer_out[t, m] = sum_{u=0..n_used} weights[t, u] * slot_out[t, u, m]
