@@ -130,24 +130,35 @@ private:
                                          int                M_gate_up,
                                          int                M_down);
 
-    // Dispatch one canonical's chunked matmul into a synthesized dst
-    // backed by a slot scratch pointer. Replicates forward_moe_block's
-    // plan/reserve/load/wait/validate/execute/release sequence in a
-    // form that reuses the existing MoEMatMulComp pipeline. Returns
-    // false on bail-out (logged); true on success.
-    bool dispatch_one_canonical_(
-        qwen3::MoEMatMulComp & comp,
-        const std::string &    canonical,
-        StreamHandle           stream,
-        const struct ggml_tensor * src1_synth,
+    // Batched per-layer dispatch.  Plans, loads, waits, and validates
+    // gate/up/down in a single coalesced phase, then runs the three
+    // matmuls (with SwiGLU between up and down + the final weighted
+    // reduce) back-to-back.  One ``cudaStreamSynchronize`` and one
+    // ``wait_async_load_batch`` per forward_moe_layer instead of one
+    // per canonical; the io-worker pool also sees a single larger
+    // batch to parallelise across.  This is the only dispatch path.
+    bool dispatch_three_canonicals_(
+        qwen3::MoEMatMulComp & gate_comp,
+        qwen3::MoEMatMulComp & up_comp,
+        qwen3::MoEMatMulComp & down_comp,
+        const std::string &    gate_canonical,
+        const std::string &    up_canonical,
+        const std::string &    down_canonical,
+        StreamHandle           stream_h,
+        const struct ggml_tensor * cur_3d,
+        const struct ggml_tensor * gated_3d,
         const struct ggml_tensor * ids,
         const struct ggml_tensor * probs,
         const struct ggml_tensor * weights,
-        void *                     dst_data_f32,
+        const struct ggml_tensor * layer_in,    // for n_embd
+        struct ggml_tensor *       layer_out,
+        void *                     slot_a_data,
+        void *                     slot_b_data,
         int                        n_tokens,
         int                        n_used,
         int                        n_expert_in_probs,
-        bool                       shared_x,
+        int                        n_ff,
+        int                        n_embd,
         int                        layer_idx);
 };
 

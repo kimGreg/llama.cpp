@@ -19,9 +19,12 @@
 #include "qwen3_moe_matmul_comp.h"     // MoEMatMulComp, MoEInput/Output
 #include "qwen3_moe_scheduler.h"       // qwen3::scheduler_* helpers
 #include "computation.h"               // ChunkPlan, ChunkKey
+#include "launch_diag.h"               // launch_diag counters
 #include "vram_pool.h"                 // ChunkState
 #include "runtime.h"
 #include "scheduler.h"
+
+#include <chrono>
 
 #include <ggml.h>
 #include <cuda_runtime.h>
@@ -231,140 +234,280 @@ bool Qwen3MoEAnyBcqExecutor::validate_required_set_(
 #endif
 }
 
-// ``probe_probs_tensor_`` was retired with the legacy
-// ``forward_moe_block`` body — probs now arrive concretely through
-// the sentinel's ``src[2]``.
-
-// M1 cutover S6: per-canonical chunked matmul dispatch helper.
-// Replicates forward_moe_block's plan→reserve→load→wait→validate→
-// execute→release sequence using a caller-supplied comp + synthesized
-// src1/dst views. ``src1_synth`` is a stack-allocated ggml_tensor in
-// the caller (forward_moe_layer) wrapping a raw F32 device pointer;
-// the comp's execute() reads only {.type, .data, .nb[1..2]} from
-// it, plus the shared_x flag carried via MoEInput.
-bool Qwen3MoEAnyBcqExecutor::dispatch_one_canonical_(
-    qwen3::MoEMatMulComp & comp,
-    const std::string &    canonical,
+// Batched per-layer dispatch.  See header doc.
+//
+// Pulls pre_inputs / sync / plan / reserve / load / wait / validate up
+// to a single coalesced phase across all three canonicals before
+// running the gate / up / SwiGLU / down / reduce kernel chain.  This
+// is the only dispatch path; cap-pressure measurements showed the
+// per-canonical fallback hurt TPS at every cap level worth
+// supporting.
+//
+// Correctness gates:
+//   - validate_required_set_ is called for each of the three plans;
+//     any miss takes the release-then-return-false path.
+//   - required_set reservation covers the *union* across gate/up/down
+//     for the full layer; release happens at the very end so a victim
+//     can't be picked from any of the three sets while down is still
+//     reading its chunks.
+//   - load_set submission is keyed on (wid, cid).  Gate / up / down
+//     have distinct synthetic wids by construction, so the per-plan
+//     load_sets don't collide; the pool's resident-skip handles any
+//     overlap defensively.
+bool Qwen3MoEAnyBcqExecutor::dispatch_three_canonicals_(
+    qwen3::MoEMatMulComp & gate_comp,
+    qwen3::MoEMatMulComp & up_comp,
+    qwen3::MoEMatMulComp & down_comp,
+    const std::string &    gate_canonical,
+    const std::string &    up_canonical,
+    const std::string &    down_canonical,
     StreamHandle           stream_h,
-    const ggml_tensor *    src1_synth,
+    const ggml_tensor *    cur_3d,
+    const ggml_tensor *    gated_3d,
     const ggml_tensor *    ids,
     const ggml_tensor *    probs,
     const ggml_tensor *    weights,
-    void *                 dst_data_f32,
+    const ggml_tensor *    /*layer_in*/,
+    ggml_tensor *          layer_out,
+    void *                 slot_a_data,
+    void *                 slot_b_data,
     int                    n_tokens,
     int                    n_used,
     int                    n_expert_in_probs,
-    bool                   shared_x,
+    int                    n_ff,
+    int                    n_embd,
     int                    layer_idx)
 {
     cudaStream_t stream = (cudaStream_t) stream_h;
 
-    // Synthesize a dst ggml_tensor wrapping the slot scratch.
-    // comp.execute() reads .data only. Its memset uses
-    // (n_tokens * n_used * M) so we leave .ne / .nb unset.
-    ggml_tensor dst_synth{};
-    dst_synth.type = GGML_TYPE_F32;
-    dst_synth.data = dst_data_f32;
+    auto set_in = [&](qwen3::MoEInput & io,
+                       const ggml_tensor * src1,
+                       bool sx,
+                       int K, int M) {
+        io.src0              = nullptr;
+        io.src1              = src1;
+        io.ids               = ids;
+        io.probs             = probs;
+        io.weights           = weights;
+        io.K                 = K;
+        io.M                 = M;
+        io.n_tokens          = n_tokens;
+        io.n_used_per_tok    = n_used;
+        io.n_expert_in_probs = n_expert_in_probs;
+        io.shared_x          = sx;
+        io.layer_index       = layer_idx;
+    };
 
-    qwen3::MoEInput  in;
-    in.src0              = nullptr;
-    in.src1              = src1_synth;
-    in.ids               = ids;
-    in.probs             = probs;
-    in.weights           = weights;
-    in.K                 = comp.K();
-    in.M                 = comp.M();
-    in.n_tokens          = n_tokens;
-    in.n_used_per_tok    = n_used;
-    in.n_expert_in_probs = n_expert_in_probs;
-    in.shared_x          = shared_x;
-    in.layer_index       = layer_idx;
+    qwen3::MoEInput in_gate, in_up, in_down;
+    set_in(in_gate, cur_3d,   /*shared_x=*/true,  gate_comp.K(), gate_comp.M());
+    set_in(in_up,   cur_3d,   /*shared_x=*/true,  up_comp.K(),   up_comp.M());
+    set_in(in_down, gated_3d, /*shared_x=*/false, down_comp.K(), down_comp.M());
 
-    qwen3::MoEOutput out;
-    out.dst = &dst_synth;
+    // Synthesize per-canonical dst views.
+    ggml_tensor dst_gate{};
+    dst_gate.type = GGML_TYPE_F32;
+    dst_gate.data = slot_a_data;
+    ggml_tensor dst_up{};
+    dst_up.type = GGML_TYPE_F32;
+    dst_up.data = slot_b_data;
+    ggml_tensor dst_down{};
+    dst_down.type = GGML_TYPE_F32;
+    dst_down.data = slot_a_data;  // reuses slot_a (down output target)
 
-    // D2H ids/probs/weights into comp's pinned buffers; sync once.
-    for (auto & m : comp.pre_inputs(in)) {
-        if (m.bytes == 0) continue;
-        if (m.is_2d) {
-            cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
-                m.device_src, m.src_pitch,
-                m.bytes, m.height,
-                cudaMemcpyDeviceToHost, stream);
-        } else {
-            cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
-                cudaMemcpyDeviceToHost, stream);
+    qwen3::MoEOutput out_gate{}; out_gate.dst = &dst_gate;
+    qwen3::MoEOutput out_up{};   out_up.dst   = &dst_up;
+    qwen3::MoEOutput out_down{}; out_down.dst = &dst_down;
+
+    struct CanonRef {
+        qwen3::MoEMatMulComp * comp;
+        qwen3::MoEInput *      in;
+        const char *           name;
+    };
+    CanonRef canon[3] = {
+        {&gate_comp, &in_gate, "gate"},
+        {&up_comp,   &in_up,   "up"  },
+        {&down_comp, &in_down, "down"},
+    };
+
+    const auto _t_disp_start = std::chrono::steady_clock::now();
+
+    // ── Phase 0a: enqueue pre_inputs D2Hs for all three canonicals.
+    //    Each canonical's pre_inputs writes to its own pinned arrays;
+    //    we're issuing 3× D2H_ids + 3× D2H_probs + 3× D2H_weights but
+    //    serialised on one stream and followed by ONE sync.
+    for (auto & c : canon) {
+        for (auto & m : c.comp->pre_inputs(*c.in)) {
+            if (m.bytes == 0) continue;
+            if (m.is_2d) {
+                launch_diag::note_launch(launch_diag::Kind::Memcpy2DAsync);
+                cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
+                    m.device_src, m.src_pitch,
+                    m.bytes, m.height,
+                    cudaMemcpyDeviceToHost, stream);
+            } else {
+                launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
+                cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
+                    cudaMemcpyDeviceToHost, stream);
+            }
         }
     }
+
+    // ── Phase 0b: single sync — host now sees the routed ids/probs/
+    //    weights for every comp.
+    launch_diag::note_stream_sync();
     cudaStreamSynchronize(stream);
 
-    ChunkPlan plan = comp.plan(in);
+    // ── Phase 0c: plan all three.
+    ChunkPlan plan_gate = gate_comp.plan(in_gate);
+    ChunkPlan plan_up   = up_comp.plan(in_up);
+    ChunkPlan plan_down = down_comp.plan(in_down);
 
-    // ── Reservation contract (constraint: cap must not degenerate
-    //    quality).  Reserve EVERY chunk the kernel will read, not just
-    //    the ones newly loaded.  Chunks already resident from a prior
-    //    dispatch live in ``required_set`` but not in ``load_set``;
-    //    without an explicit reservation, the loader's
-    //    ``make_room_for`` is free to pick them as victims while THIS
-    //    dispatch's kernel is still reading them (race E from the T5
-    //    investigation).  Reserving the required_set superset is the
-    //    structural fix.
-    if (!plan.required_set.empty()) {
-        for (const auto & k : plan.required_set) {
+    auto count_residency = [&](const ChunkPlan & pl) {
+        if (pl.required_set.empty()) return;
+        size_t hits = 0;
+        for (const auto & k : pl.required_set) {
+            if (rt_->pool().is_resident(k.wid, k.cid)) ++hits;
+        }
+        rt_->pool().note_required_set(pl.required_set.size(), hits);
+    };
+    count_residency(plan_gate);
+    count_residency(plan_up);
+    count_residency(plan_down);
+
+    // ── Phase 0d: reserve the union of all three required_sets.
+    auto reserve_plan = [&](const ChunkPlan & pl) {
+        for (const auto & k : pl.required_set) {
             qwen3::scheduler_reserve_for_dispatch(
                 rt_->scheduler(), k.wid, k.cid);
         }
-    }
+    };
+    reserve_plan(plan_gate);
+    reserve_plan(plan_up);
+    reserve_plan(plan_down);
 
-    if (!plan.load_set.empty()) {
-        const bool async_on = rt_->io_worker_count() > 0;
-        if (async_on) {
-            auto batch = std::make_shared<std::atomic<uint32_t>>(0);
-            for (const auto & k : plan.load_set) {
-                if (rt_->pool().is_resident(k.wid, k.cid)) continue;
-                rt_->submit_async_load(k.wid, k.cid, batch);
-            }
-            rt_->wait_async_load_batch(batch);
-        } else {
-            for (const auto & k : plan.load_set) {
-                if (rt_->pool().is_resident(k.wid, k.cid)) continue;
-                rt_->move_chunk(k.wid, k.cid, Tier::RAM, Tier::VRAM,
-                                /*compute_stream=*/nullptr);
-            }
-        }
-        for (const auto & k : plan.load_set) {
-            rt_->pool().wait_on_stream(k.wid, k.cid, stream_h);
-        }
-    }
-
-    if (!validate_required_set_(plan, stream_h)) {
-        for (const auto & k : plan.required_set) {
+    auto release_all = [&]() {
+        for (const auto & k : plan_gate.required_set) {
             qwen3::scheduler_release_from_dispatch(
                 rt_->scheduler(), k.wid, k.cid);
         }
+        for (const auto & k : plan_up.required_set) {
+            qwen3::scheduler_release_from_dispatch(
+                rt_->scheduler(), k.wid, k.cid);
+        }
+        for (const auto & k : plan_down.required_set) {
+            qwen3::scheduler_release_from_dispatch(
+                rt_->scheduler(), k.wid, k.cid);
+        }
+    };
+
+    // ── Phase 0e: submit the union of all three load_sets as a single
+    //    batch.  Gate/up/down canonical names are distinct (e.g.
+    //    "blk.0.ffn_gate_exps.weight:e5" vs ".ffn_up_..." vs
+    //    ".ffn_down_..."), so cross-plan dedupe isn't needed — each
+    //    plan's own ``issued_keys`` already removed intra-plan dupes
+    //    in the comp.plan code.  The pool is_resident probe still
+    //    short-circuits chunks that landed in a prior layer.
+    const size_t union_size =
+        plan_gate.load_set.size() +
+        plan_up.load_set.size() +
+        plan_down.load_set.size();
+
+    if (union_size > 0) {
+        launch_diag::note_load_set(union_size);
+        const bool async_on = rt_->io_worker_count() > 0;
+        if (async_on) {
+            auto batch = std::make_shared<std::atomic<uint32_t>>(0);
+            auto submit_plan = [&](const ChunkPlan & pl) {
+                for (const auto & k : pl.load_set) {
+                    if (rt_->pool().is_resident(k.wid, k.cid)) continue;
+                    rt_->submit_async_load(k.wid, k.cid, batch);
+                }
+            };
+            submit_plan(plan_gate);
+            submit_plan(plan_up);
+            submit_plan(plan_down);
+            launch_diag::note_async_load_wait();
+            rt_->wait_async_load_batch(batch);
+        } else {
+            auto move_plan = [&](const ChunkPlan & pl) {
+                for (const auto & k : pl.load_set) {
+                    if (rt_->pool().is_resident(k.wid, k.cid)) continue;
+                    rt_->move_chunk(k.wid, k.cid, Tier::RAM, Tier::VRAM,
+                                    /*compute_stream=*/nullptr);
+                }
+            };
+            move_plan(plan_gate);
+            move_plan(plan_up);
+            move_plan(plan_down);
+        }
+        // wait_on_stream per chunk.  pool.wait_on_stream is a no-op
+        // when ready_event is null (already waited or never had one),
+        // so re-walking the load_sets per canonical is safe and avoids
+        // a dedupe pass.
+        auto wait_plan = [&](const ChunkPlan & pl) {
+            for (const auto & k : pl.load_set) {
+                rt_->pool().wait_on_stream(k.wid, k.cid, stream_h);
+            }
+        };
+        wait_plan(plan_gate);
+        wait_plan(plan_up);
+        wait_plan(plan_down);
+    }
+
+    // ── Phase 0f: validate all three.
+    if (!validate_required_set_(plan_gate, stream_h) ||
+        !validate_required_set_(plan_up,   stream_h) ||
+        !validate_required_set_(plan_down, stream_h))
+    {
+        release_all();
         std::fprintf(stderr,
-            "streamllm-ext: forward_moe_layer[%s, L=%d]: "
-            "required_set validation failed\n",
-            canonical.c_str(), layer_idx);
+            "streamllm-ext: forward_moe_layer[L=%d] (batched): required_set "
+            "validation failed (gate=%s up=%s down=%s)\n",
+            layer_idx, gate_canonical.c_str(),
+            up_canonical.c_str(), down_canonical.c_str());
         return false;
     }
 
-    comp.execute(in, out, stream_h);
-
-    // Release every chunk we reserved (the full required_set).  The
-    // chunks may still be referenced by the in-flight kernel — eviction
-    // safety is provided downstream by ``clear_chunk_device_ptr``'s
-    // ``wait_compute_on`` against ``latest_compute_event_``, so the
-    // after_evict pointer-table clear waits out the kernel before
-    // nulling the slot.  Release here is a host-side flag flip; it
-    // doesn't actually free anything until make_room_for picks the
-    // chunk.
-    for (const auto & k : plan.required_set) {
-        qwen3::scheduler_release_from_dispatch(
-            rt_->scheduler(), k.wid, k.cid);
+    // Record dispatch time once for the whole batched phase, but
+    // attribute it 3-way to keep the per-dispatch average comparable
+    // to the per-canonical path.
+    {
+        const auto dt = std::chrono::steady_clock::now() - _t_disp_start;
+        const uint64_t ns_total = (uint64_t) std::chrono::duration_cast<
+            std::chrono::nanoseconds>(dt).count();
+        launch_diag::note_dispatch_one_canonical(ns_total / 3);
+        launch_diag::note_dispatch_one_canonical(ns_total / 3);
+        launch_diag::note_dispatch_one_canonical(ns_total - 2 * (ns_total / 3));
     }
+
+    // ── Phase 1+2: Gate + Up matmul, each as its own launch.
+    gate_comp.execute(in_gate, out_gate, stream_h);
+    up_comp.execute(in_up, out_up, stream_h);
+
+    // ── Phase 3: SwiGLU: slot_b ← silu(slot_a) * slot_b.
+    {
+        const size_t N_swiglu =
+            (size_t) n_tokens * (size_t) n_used * (size_t) n_ff;
+        qwen3::launch_swiglu_mul(
+            (const float *) slot_a_data,
+            (const float *) slot_b_data,
+            (float *)       slot_b_data,
+            N_swiglu, stream_h);
+    }
+    // ── Phase 4: Down matmul → slot_a (reused buffer).
+    down_comp.execute(in_down, out_down, stream_h);
+    // ── Phase 5: weighted reduce slot_a → layer_out.
+    qwen3::launch_weighted_reduce_slots(
+        (const float *) slot_a_data,
+        (const float *) weights->data,
+        (float *)       layer_out->data,
+        n_tokens, n_used, n_embd, stream_h);
+
+    // ── Phase 6: release the union of reserved chunks.
+    release_all();
     return true;
 }
+
 
 // M1 cutover S6: per-layer execution-time entry point (criterion 3).
 //
@@ -389,6 +532,17 @@ bool Qwen3MoEAnyBcqExecutor::forward_moe_layer(
     ggml_tensor *       layer_out,
     int                 layer_idx)
 {
+    const auto _t_fwd_start = std::chrono::steady_clock::now();
+    struct FwdScope {
+        std::chrono::steady_clock::time_point t0;
+        ~FwdScope() {
+            const auto dt = std::chrono::steady_clock::now() - t0;
+            launch_diag::note_forward_moe_layer(
+                (uint64_t) std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(dt).count());
+        }
+    } _fwd_scope{_t_fwd_start};
+
     if (rt_ == nullptr) return false;
     if (layer_in == nullptr || ids == nullptr) return false;
     if (probs == nullptr || weights == nullptr) return false;
@@ -504,36 +658,12 @@ bool Qwen3MoEAnyBcqExecutor::forward_moe_layer(
     cur_3d.nb[2]   = (size_t) n_embd * sizeof(float);
     cur_3d.nb[3]   = (size_t) n_embd * (size_t) n_tokens * sizeof(float);
 
-    // === Phase 1: Gate matmul → slot_a [n_tokens, n_used, n_ff] f32.
-    if (!dispatch_one_canonical_(
-            *gate_comp, gate_canonical, stream_h,
-            &cur_3d, ids, probs, weights,
-            ss->slot_a, n_tokens, n_used, n_expert_in_probs,
-            /*shared_x=*/true, layer_idx)) {
-        return false;
-    }
-
-    // === Phase 2: Up matmul → slot_b [n_tokens, n_used, n_ff] f32.
-    if (!dispatch_one_canonical_(
-            *up_comp, up_canonical, stream_h,
-            &cur_3d, ids, probs, weights,
-            ss->slot_b, n_tokens, n_used, n_expert_in_probs,
-            /*shared_x=*/true, layer_idx)) {
-        return false;
-    }
-
-    // === Phase 3: SwiGLU: slot_b ← silu(slot_a) * slot_b.
-    const size_t N_swiglu =
-        (size_t) n_tokens * (size_t) n_used * (size_t) n_ff;
-    qwen3::launch_swiglu_mul(
-        (const float *) ss->slot_a,
-        (const float *) ss->slot_b,
-        (float *)       ss->slot_b,
-        N_swiglu, stream_h);
-
-    // === Phase 4: Down matmul.
-    // src1 = slot_b viewed as 3D [n_ff, n_used, n_tokens] (per-slot X,
-    // shared_x=false). dst = slot_a (reused; sized for hidden_dim).
+    // src1 for the down matmul: slot_b as a 3D [n_ff, n_used, n_tokens]
+    // view (per-slot X, shared_x=false).  Built upfront so the batched
+    // dispatch can pass it as part of the down canonical's
+    // pre_inputs/plan — execute reads slot_b only AFTER SwiGLU has
+    // written it, which the compute stream's in-order semantics
+    // guarantee.
     ggml_tensor gated_3d{};
     gated_3d.type  = GGML_TYPE_F32;
     gated_3d.data  = ss->slot_b;
@@ -547,25 +677,16 @@ bool Qwen3MoEAnyBcqExecutor::forward_moe_layer(
     gated_3d.nb[3] = (size_t) n_ff * (size_t) n_used *
                      (size_t) n_tokens * sizeof(float);
 
-    if (!dispatch_one_canonical_(
-            *down_comp, down_canonical, stream_h,
-            &gated_3d, ids, probs, weights,
-            ss->slot_a, n_tokens, n_used, n_expert_in_probs,
-            /*shared_x=*/false, layer_idx)) {
-        return false;
-    }
-
-    // === Phase 5: weighted reduce slot_a → layer_out.
-    // weights from llm_build_moe_routing_softmax_topk has memory
-    // layout [t, u] contiguous (whether the ne is [n_used, n_tokens]
-    // or [1, n_used, n_tokens] — both reduce to the same byte order).
-    qwen3::launch_weighted_reduce_slots(
-        (const float *) ss->slot_a,
-        (const float *) weights->data,
-        (float *)       layer_out->data,
-        n_tokens, n_used, n_embd, stream_h);
-
-    return true;
+    return dispatch_three_canonicals_(
+        *gate_comp, *up_comp, *down_comp,
+        gate_canonical, up_canonical, down_canonical,
+        stream_h,
+        &cur_3d, &gated_3d,
+        ids, probs, weights,
+        layer_in, layer_out,
+        ss->slot_a, ss->slot_b,
+        n_tokens, n_used, n_expert_in_probs,
+        n_ff, n_embd, layer_idx);
 }
 
 // M1 cutover S2: router-gate binding (criterion 5). Caches the

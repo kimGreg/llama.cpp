@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -192,6 +193,52 @@ public:
     // (e.g. exclude install warmup from per-step streaming totals).
     void reset_stats();
 
+    // ─── Residency-skip invariant counters (always-on) ────────────────
+    //
+    // Contract: if ``ChunkKey`` is resident in the pool, the
+    // scheduler/load path MUST NOT submit a new H2D for it.  These
+    // counters expose the contract to runtime stats and to in-process
+    // assertions.  All are simple atomic counters — fine to read
+    // without the pool mutex.
+    //
+    //  required_chunks                 sum of plan.required_set across
+    //                                  every chunked dispatch
+    //  resident_hits                   required chunks that were already
+    //                                  in the pool when plan ran
+    //  load_misses                     required chunks that were NOT
+    //                                  resident when plan ran (these
+    //                                  drive new H2D submissions)
+    //  h2d_submitted_chunks            actual cudaMemcpyAsync H2D
+    //                                  operations (== total_h2d_calls_,
+    //                                  republished under the contract name)
+    //  redundant_h2d_skipped           ``move_chunk`` short-circuited a
+    //                                  call for a chunk that was already
+    //                                  resident (caller bypassed the
+    //                                  executor's pre-check; we caught
+    //                                  the redundancy at the chokepoint)
+    //  unexpected_h2d_for_resident     ``pool.load`` was entered with
+    //                                  ``host_ptr != nullptr`` for a key
+    //                                  that was already resident.  Must
+    //                                  be 0 if ``move_chunk``'s skip is
+    //                                  correct.  A non-zero value means
+    //                                  a caller bypassed move_chunk OR a
+    //                                  race promoted the chunk between
+    //                                  the chokepoint check and pool.load.
+    size_t required_chunks() const;
+    size_t resident_hits() const;
+    size_t load_misses() const;
+    size_t h2d_submitted_chunks() const { return total_h2d_calls(); }
+    size_t redundant_h2d_skipped() const;
+    size_t unexpected_h2d_for_resident() const;
+
+    // ``move_chunk``'s chokepoint reports a required-set walk through
+    // these.  ``n_required`` is plan.required_set.size(); ``n_resident``
+    // is how many were already in the pool.  Both bump in lock-step so
+    // ``resident_hits + load_misses == required_chunks`` always holds.
+    void note_required_set(size_t n_required, size_t n_resident);
+    // Bumped by ``move_chunk`` when the resident-skip fires.
+    void note_redundant_h2d_skipped();
+
 private:
     struct Slot {
         size_t offset = 0;   // byte offset inside arena
@@ -235,6 +282,13 @@ private:
     size_t peak_used_bytes_  = 0;
     size_t total_h2d_bytes_ = 0;
     size_t total_h2d_calls_ = 0;
+
+    // Residency-invariant atomics — see public accessors above.
+    std::atomic<size_t> required_chunks_{0};
+    std::atomic<size_t> resident_hits_{0};
+    std::atomic<size_t> load_misses_{0};
+    std::atomic<size_t> redundant_h2d_skipped_{0};
+    std::atomic<size_t> unexpected_h2d_for_resident_{0};
 
     // Serialises allocator state; H2D/kernel dispatch is lock-free on the
     // CUDA streams themselves.

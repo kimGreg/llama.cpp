@@ -6,6 +6,7 @@
 // per-op extern-C shims — funnels into model-specific behavior.
 
 #include "qwen3_runtime_glue.h"
+#include "launch_diag.h"
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "stream_reader.h"
@@ -455,6 +456,26 @@ void clear() {
             p.total_h2d_calls()
                 ? (double)p.total_h2d_bytes() / 1024.0 / p.total_h2d_calls()
                 : 0.0);
+        // Residency-invariant counters.  At full cap with no eviction,
+        // after warmup: resident_hits should dominate, load_misses
+        // should approach zero, h2d_submitted should stop growing, and
+        // unexpected_h2d_for_resident MUST be 0.  See
+        // docs/BENCH_V2_BOTTLENECK.md.
+        const size_t req  = p.required_chunks();
+        const size_t hits = p.resident_hits();
+        const double hit_pct = req
+            ? 100.0 * (double)hits / (double)req : 0.0;
+        std::fprintf(stderr,
+            "streamllm-ext residency: required=%zu  resident_hits=%zu (%.1f%%)  "
+            "load_misses=%zu  h2d_submitted=%zu  redundant_h2d_skipped=%zu  "
+            "unexpected_h2d_for_resident=%zu\n",
+            req, hits, hit_pct,
+            p.load_misses(),
+            p.h2d_submitted_chunks(),
+            p.redundant_h2d_skipped(),
+            p.unexpected_h2d_for_resident());
+        // Launch / sync breakdown for the sentinel eager MoE path.
+        launch_diag::dump_to_stderr();
     }
     diag::clear_close_trace_and_dump();
     moe_dispatch::print_profile_if_enabled();

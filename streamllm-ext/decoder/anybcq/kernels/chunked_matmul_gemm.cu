@@ -23,6 +23,7 @@
 
 #include "anybcq_gemm.h"
 #include "anybcq_gemv.h"   // kNaverMaxPrecision (used by naver_gemm_launch)
+#include "launch_diag.h"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -313,6 +314,8 @@ void launch_f32_to_f16(const void * src_f32, void * dst_f16,
                        int n, cudaStream_t stream) {
     const int block = 256;
     const int grid  = (n + block - 1) / block;
+    ::streamllm_ext::launch_diag::note_launch(
+        ::streamllm_ext::launch_diag::Kind::F32ToF16);
     k_f32_to_f16<<<grid, block, 0, stream>>>(
         (const float *) src_f32, (__half *) dst_f16, n);
 }

@@ -123,7 +123,6 @@ void naver_gemv_moe_launch(
     int                    group_size,
     int                    shared_x,
     StreamHandle           stream);
-
 // Mode A milestone 1, S6 — element-wise SwiGLU * up gate.
 //
 //   slot_gate [N] f32 — gate matmul output (per-slot, flattened)

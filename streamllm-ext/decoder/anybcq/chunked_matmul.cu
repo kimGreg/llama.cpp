@@ -6,6 +6,7 @@
 
 #include "chunked_matmul.h"
 
+#include "launch_diag.h"
 #include "runtime.h"           // StreamllmRuntime, UpstreamLayoutDevice
 #include "qwen3_moe_fused.h"   // refresh_q_bias_for_anyprec_launch,
                                 // naver_gemv_moe_launch
@@ -158,6 +159,8 @@ bool moe_chunk_matmul(
     //    non-null at launch (SSOT §6.9 M1).
     {
         const size_t bytes = (size_t) n_experts * sizeof(int);
+        ::streamllm_ext::launch_diag::note_launch(
+            ::streamllm_ext::launch_diag::Kind::MemcpyAsync);
         cudaError_t err = cudaMemcpyAsync(
             prec_per_eid_d, host_planes_per_eid.data(),
             bytes, cudaMemcpyHostToDevice,
@@ -204,6 +207,8 @@ bool moe_chunk_matmul(
     //    per-expert table, so uniform_precision just needs to lie in
     //    the kernel's [1, kMaxChunksPerTensor] range check.
     g_kernel_launch_calls.fetch_add(1, std::memory_order_relaxed);
+    ::streamllm_ext::launch_diag::note_launch(
+        ::streamllm_ext::launch_diag::Kind::MoeMatmul);
     qwen3::naver_gemv_moe_launch(
         X_fp16, Y_slot_f32, ids_d,
         table,

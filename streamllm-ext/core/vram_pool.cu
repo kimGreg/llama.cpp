@@ -4,6 +4,7 @@
 // load() returns a null handle on full; the caller drives policy.
 
 #include "vram_pool.h"
+#include "launch_diag.h"
 
 #include <cuda_runtime.h>
 
@@ -220,6 +221,17 @@ ChunkHandle VramChunkPool::load(
     auto it = residents_.find(key);
     if (it != residents_.end()) {
         // Already resident — return view, no LRU touch (pool is policy-free).
+        //
+        // Residency-invariant trip: if the caller passed bytes
+        // intending to copy, that's the chokepoint signal that
+        // ``move_chunk``'s resident-skip is being bypassed (or a race
+        // promoted the chunk between the chokepoint check and here).
+        // The skipped copy is harmless — the slot is already populated
+        // — but the count surfaces the broken contract.
+        if (host_ptr != nullptr) {
+            unexpected_h2d_for_resident_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         return ChunkHandle{
             (char *)arena_ + it->second.slot.offset,
             it->second.slot.nbytes,
@@ -273,6 +285,39 @@ void VramChunkPool::reset_stats() {
     peak_used_bytes_ = used_bytes_;
     total_h2d_bytes_ = 0;
     total_h2d_calls_ = 0;
+    required_chunks_.store(0, std::memory_order_relaxed);
+    resident_hits_.store(0, std::memory_order_relaxed);
+    load_misses_.store(0, std::memory_order_relaxed);
+    redundant_h2d_skipped_.store(0, std::memory_order_relaxed);
+    unexpected_h2d_for_resident_.store(0, std::memory_order_relaxed);
+}
+
+size_t VramChunkPool::required_chunks() const {
+    return required_chunks_.load(std::memory_order_relaxed);
+}
+size_t VramChunkPool::resident_hits() const {
+    return resident_hits_.load(std::memory_order_relaxed);
+}
+size_t VramChunkPool::load_misses() const {
+    return load_misses_.load(std::memory_order_relaxed);
+}
+size_t VramChunkPool::redundant_h2d_skipped() const {
+    return redundant_h2d_skipped_.load(std::memory_order_relaxed);
+}
+size_t VramChunkPool::unexpected_h2d_for_resident() const {
+    return unexpected_h2d_for_resident_.load(std::memory_order_relaxed);
+}
+
+void VramChunkPool::note_required_set(size_t n_required, size_t n_resident) {
+    if (n_resident > n_required) n_resident = n_required;  // defensive
+    required_chunks_.fetch_add(n_required, std::memory_order_relaxed);
+    resident_hits_.fetch_add(n_resident, std::memory_order_relaxed);
+    load_misses_.fetch_add(n_required - n_resident,
+                            std::memory_order_relaxed);
+}
+
+void VramChunkPool::note_redundant_h2d_skipped() {
+    redundant_h2d_skipped_.fetch_add(1, std::memory_order_relaxed);
 }
 
 
@@ -354,6 +399,7 @@ void VramChunkPool::wait_on_stream(
     auto ev = (cudaEvent_t)it->second.ready_event;
     auto s  = stream ? (cudaStream_t)stream
                      : (cudaStream_t)0;
+    launch_diag::note_stream_wait_event();
     check_cuda(cudaStreamWaitEvent(s, ev, 0), "cudaStreamWaitEvent(chunk)");
     // Event consumed — drop it so a second load for the same chunk isn't
     // chained against a stale event. Any future load re-records a new one.

@@ -18,6 +18,7 @@
 
 #include "qwen3_moe_dispatch.h"   // moe_dispatch::scratch_for_stream
 #include "qwen3_moe_scheduler.h"  // qwen3::scheduler_plan_for_expert_with_chunks
+#include "launch_diag.h"          // launch_diag counters
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "anybcq_gemm.h"          // launch_f32_to_f16
@@ -113,6 +114,7 @@ MoEMatMulComp::MoEMatMulComp(
             prec_per_eid_d_ = nullptr;
         }
     }
+
 }
 
 
@@ -431,6 +433,7 @@ void MoEMatMulComp::execute(const ComputationInput & in_base,
                 moe_dispatch::scratch_ids_bytes_total());
             return;
         }
+        launch_diag::note_launch(launch_diag::Kind::Memcpy2DAsync);
         cudaMemcpy2DAsync(
             sc->ids_d, /*dpitch=*/row_bytes,
             in.ids->data, /*spitch=*/(size_t) in.ids->nb[1],
@@ -443,6 +446,7 @@ void MoEMatMulComp::execute(const ComputationInput & in_base,
     {
         const size_t dst_bytes =
             (size_t) n_tokens * (size_t) n_used * (size_t) M * sizeof(float);
+        launch_diag::note_launch(launch_diag::Kind::MemsetAsync);
         cudaMemsetAsync(out.dst->data, 0, dst_bytes, stream);
     }
 

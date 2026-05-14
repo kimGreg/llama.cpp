@@ -4,6 +4,7 @@
 // placement rationale.
 
 #include "qwen3_moe_fused.h"
+#include "launch_diag.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -187,6 +188,7 @@ __global__ void nqmv_bias_planes_moe_fused(
 }
 
 
+
 void naver_gemv_moe_launch(
     const void *           X_fp16,
     void *                 Y_dst_f32,
@@ -325,6 +327,8 @@ void refresh_q_bias_for_anyprec_launch(
     const int block = 64;
     const int grid  = (n + block - 1) / block;
     auto s = (cudaStream_t) stream;
+    streamllm_ext::launch_diag::note_launch(
+        streamllm_ext::launch_diag::Kind::QbiasRefresh);
     k_refresh_qbias<<<grid, block, 0, s>>>(
         table.d_q_bias_per_expert,
         (void * const *) table.d_qbias_slot_per_expert,
@@ -436,6 +440,8 @@ void refresh_alpha_for_anyprec_launch(
     const int block = 64;
     const int grid  = (n + block - 1) / block;
     auto s = (cudaStream_t) stream;
+    streamllm_ext::launch_diag::note_launch(
+        streamllm_ext::launch_diag::Kind::AlphaBetaRefresh);
     k_refresh_alpha_beta_anyprec<<<grid, block, 0, s>>>(
         (void * const * const *) table.d_alpha_planes_per_expert,
         table.d_q_bias_per_expert,
@@ -502,6 +508,8 @@ void launch_swiglu_mul(
     const std::size_t elems_per_block =
         (std::size_t) kSwigluThreads * kSwigluPerThread;
     const std::size_t n_blocks = (N + elems_per_block - 1) / elems_per_block;
+    streamllm_ext::launch_diag::note_launch(
+        streamllm_ext::launch_diag::Kind::SwigluMul);
     k_swiglu_mul<<<(unsigned) n_blocks, (unsigned) kSwigluThreads,
                    0, (cudaStream_t) stream>>>(
         slot_gate, slot_up, slot_out, N);
@@ -564,6 +572,8 @@ void launch_weighted_reduce_slots(
     const int n_m_tiles = (M + kWRMTile - 1) / kWRMTile;
     dim3 grid((unsigned) n_tokens, (unsigned) n_m_tiles, 1u);
     dim3 block((unsigned) kWRThreads, 1u, 1u);
+    streamllm_ext::launch_diag::note_launch(
+        streamllm_ext::launch_diag::Kind::WeightedReduce);
     k_weighted_reduce_slots<<<grid, block, 0, (cudaStream_t) stream>>>(
         slot_out, weights, layer_out, n_tokens, n_used, M);
 }

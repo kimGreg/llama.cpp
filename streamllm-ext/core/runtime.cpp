@@ -486,6 +486,24 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
         // when host.chunks[p] is empty.
         return nullptr;
     }
+
+    // ── Residency-skip invariant (canonical chokepoint).
+    //
+    //   If the chunk is already in the pool, the entry's dev pointers
+    //   and the per-plane pointer table were populated by the prior
+    //   ``move_chunk`` that originally loaded it (and ``after_load`` ran
+    //   then; eviction nulls dev.chunk_ptrs and pool.evict erases the
+    //   resident entry atomically).  Skipping here saves the entire
+    //   pread / disk-to-kernel xform / DRAM-cache snapshot / pool.load
+    //   chain and — crucially — guarantees the invariant for every
+    //   caller (executor, async io worker, scheduler install) without
+    //   relying on each call site to remember the pre-check.
+    if (pool_->is_resident(wid, cid)) {
+        pool_->note_redundant_h2d_skipped();
+        ChunkHandle existing = pool_->view(wid, cid);
+        return existing.ready_event;
+    }
+
     auto it = entries_.find(wid);
     if (it == entries_.end()) {
         throw std::runtime_error(
