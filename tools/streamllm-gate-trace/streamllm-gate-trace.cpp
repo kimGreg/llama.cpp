@@ -73,8 +73,7 @@ public:
         m_ctx_n_tokens = ctx_n_tokens;
         m_layer_topk_w.assign(n_layer, {});
         m_layer_ids.assign(n_layer, {});
-        m_seen_probs.assign(n_layer, false);
-        m_seen_ids.assign(n_layer, false);
+        m_layer_tok_count.assign(n_layer, 0);
         m_n_expert = n_expert;
 
         m_out.open(path, std::ios::binary | std::ios::trunc);
@@ -125,23 +124,15 @@ public:
         if (is_logits) {
             const int il = parse_layer(name, 15);
             if (il < 0 || il >= (int) m_n_layer) return true;
-            if (m_seen_probs[il]) return true;  // first call per batch wins
 
             const int64_t n_expert   = t->ne[0];
             const int64_t n_tokens_t = t->ne[1];
             if (n_tokens_t <= 0) return true;
 
-            if (t->type != GGML_TYPE_F32) {
-                fprintf(stderr, "[gate-trace] WARN: logits tensor il=%d has type=%s, "
-                        "expected F32 — skipping\n", il, ggml_type_name(t->type));
-                m_seen_probs[il] = true;
-                auto & wts_dst = m_layer_topk_w[il];
-                auto & ids_dst = m_layer_ids[il];
-                const int64_t K = (int64_t) m_n_expert_used;
-                wts_dst.assign((size_t) n_tokens_t * K, 1.0f / (float) K);
-                ids_dst.assign((size_t) n_tokens_t * K, 0);
-                m_seen_ids[il] = true;
-                m_pending_n_tokens = n_tokens_t;
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+                fprintf(stderr, "[gate-trace] WARN: logits il=%d type=%s contig=%d\n",
+                        il, ggml_type_name(t->type),
+                        (int) ggml_is_contiguous(t));
                 return true;
             }
 
@@ -156,10 +147,15 @@ public:
             const float * logits = (const float *) host.data();
 
             const int64_t K = (int64_t) m_n_expert_used;
+            // APPEND mode: each microbatch's logits get appended to
+            // this layer's running buffer.  llama.cpp evaluates the
+            // n_ctx-token context in chunks of n_ubatch (typically
+            // 512) — the callback fires once per microbatch per layer.
             auto & ids_dst = m_layer_ids[il];
             auto & wts_dst = m_layer_topk_w[il];
-            ids_dst.resize((size_t) n_tokens_t * K);
-            wts_dst.resize((size_t) n_tokens_t * K);
+            const size_t base = m_layer_tok_count[il];
+            ids_dst.resize((base + (size_t) n_tokens_t) * K);
+            wts_dst.resize((base + (size_t) n_tokens_t) * K);
 
             std::vector<int>   idx_buf(n_expert);
             std::vector<float> probs(n_expert);
@@ -182,16 +178,13 @@ public:
                 float topk_sum = 0.0f;
                 for (int64_t k = 0; k < K; ++k) topk_sum += probs[idx_buf[k]];
                 const float inv_k = topk_sum > 0.0f ? 1.0f / topk_sum : 0.0f;
+                const size_t row_off = (base + (size_t) tok) * K;
                 for (int64_t k = 0; k < K; ++k) {
-                    ids_dst[(size_t) tok * K + k] = (uint16_t) idx_buf[k];
-                    wts_dst[(size_t) tok * K + k] = probs[idx_buf[k]] * inv_k;
+                    ids_dst[row_off + k] = (uint16_t) idx_buf[k];
+                    wts_dst[row_off + k] = probs[idx_buf[k]] * inv_k;
                 }
             }
-            m_seen_probs[il] = true;
-            // If MUL_MAT_ID didn't visit yet, mark ids-seen too (they
-            // come from the same softmax → top-K we just computed).
-            if (!m_seen_ids[il]) m_seen_ids[il] = true;
-            m_pending_n_tokens = n_tokens_t;
+            m_layer_tok_count[il] = base + (size_t) n_tokens_t;
             return true;  // continue traversal
         }
 
@@ -211,11 +204,15 @@ public:
     void flush_batch(int64_t batch_tokens) {
         std::lock_guard<std::mutex> lock(m_mu);
         if (batch_tokens <= 0) return;
+        // All 48 layers should have accumulated the same number of
+        // tokens (= batch_tokens) over the microbatches.
         for (int il = 0; il < (int) m_n_layer; ++il) {
-            if (!m_seen_probs[il] || !m_seen_ids[il]) {
-                fprintf(stderr, "[gate-trace] WARN: layer %d missing on batch "
-                        "(probs=%d ids=%d)\n",
-                        il, (int) m_seen_probs[il], (int) m_seen_ids[il]);
+            if ((int64_t) m_layer_tok_count[il] != batch_tokens) {
+                fprintf(stderr, "[gate-trace] WARN: layer %d tok_count=%zu "
+                        "!= expected %lld — skipping batch\n",
+                        il, m_layer_tok_count[il], (long long) batch_tokens);
+                // Reset to keep the file consistent.
+                for (int j = 0; j < (int) m_n_layer; ++j) m_layer_tok_count[j] = 0;
                 return;
             }
         }
@@ -236,10 +233,7 @@ public:
             }
         }
         m_n_tokens += (uint64_t) batch_tokens;
-        for (int il = 0; il < (int) m_n_layer; ++il) {
-            m_seen_probs[il] = false;
-            m_seen_ids[il]   = false;
-        }
+        for (int il = 0; il < (int) m_n_layer; ++il) m_layer_tok_count[il] = 0;
     }
 
 private:
@@ -258,10 +252,11 @@ private:
     uint64_t      m_n_tokens      = 0;
     int64_t       m_pending_n_tokens = 0;
 
-    std::vector<std::vector<float>>     m_layer_topk_w;  // [il] = [n_tokens × K]
-    std::vector<std::vector<uint16_t>>  m_layer_ids;     // [il] = [n_tokens × K]
-    std::vector<bool>                   m_seen_probs;
-    std::vector<bool>                   m_seen_ids;
+    // Per-layer buffers accumulate microbatch outputs within one chunk.
+    // Reset by flush_batch after the full chunk is written.
+    std::vector<std::vector<float>>     m_layer_topk_w;     // [il] = [tok_count × K]
+    std::vector<std::vector<uint16_t>>  m_layer_ids;        // [il] = [tok_count × K]
+    std::vector<size_t>                 m_layer_tok_count;  // [il] = running tok count
 
     std::mutex m_mu;
 };
