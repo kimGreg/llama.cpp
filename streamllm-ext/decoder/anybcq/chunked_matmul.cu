@@ -197,7 +197,7 @@ bool moe_chunk_matmul(
             layout.alpha_bytes_per_chunk,
             stream);
     } else {
-        // Shortcut family: β is per-tensor (single q_bias chunk pinned
+        // SsAnybcq family: β is per-tensor (single q_bias chunk pinned
         // at install) so the slot-scatter still applies.
         qwen3::refresh_q_bias_for_anyprec_launch(table, stream);
     }

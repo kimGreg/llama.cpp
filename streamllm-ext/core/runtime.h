@@ -9,7 +9,7 @@
 //   PLANE_i = kCidChunkBase + i   — plane i's payload
 //
 // Chunk computation (chunk_matmul) lives in the encoder layer, not
-// here — see ``decoder/shortcut_anybcq/chunked_matmul.h`` for the
+// here — see ``decoder/ss_anybcq/chunked_matmul.h`` for the
 // per-tensor path and ``qwen3/qwen3_moe_fused.h`` for the fused MoE GEMV.
 // Core only exposes the layout + pool primitives the encoder layer
 // reads.
@@ -90,7 +90,7 @@ struct UpstreamLayoutDevice {
     // ``chunk_ptrs[p]`` walk in ``build_plane_ptrs`` and go directly
     // through the device-side per-plane pointer table (which carries
     // the correct plane→signs/α mapping populated by
-    // update_anyprec_after_load_async). For shortcut wids both layouts
+    // update_anyprec_after_load_async). For ss_anybcq wids both layouts
     // coincide so the flag is false.
     bool         any_precision = false;
     int          base_precision = 0;  // chunk-0 owns this many planes
@@ -125,7 +125,7 @@ public:
 
     // (chunk_matmul / chunk_matmul_batched moved out of core. Callers
     // now invoke the encoder-side helpers in
-    // ``decoder/shortcut_anybcq/chunked_matmul.h`` directly. Core only
+    // ``decoder/ss_anybcq/chunked_matmul.h`` directly. Core only
     // exposes the layout + pool primitives those helpers need.)
 
     // --- accessors ------------------------------------------------------
@@ -165,8 +165,8 @@ public:
     ChunkedTensor * tensor(const std::string & wid) const;
     // Typed convenience accessor for the AnyBCQ family. Returns the
     // concrete subclass pointer when the managed tensor was parsed
-    // by the AnyBCQ / Shortcut-AnyBCQ encoder; null otherwise.
-    // Decoder-side callers (qwen3 dispatch glue, shortcut chunked-
+    // by the AnyBCQ / SsAnybcq-AnyBCQ encoder; null otherwise.
+    // Decoder-side callers (qwen3 dispatch glue, ss_anybcq chunked-
     // matmul wrappers) use this to reach d_qw_ptrs() / d_alpha_ptrs()
     // / d_qbias_slot() without dragging encoder names into core.
     anybcq::AnyBCQFamilyTensor * tensor_anybcq(const std::string & wid) const;
@@ -219,7 +219,7 @@ public:
 
 private:
     struct Entry {
-        // Concrete ChunkedTensor (AnyBCQTensor / ShortcutTensor) owning
+        // Concrete ChunkedTensor (AnyBCQTensor / SsAnybcqTensor) owning
         // this tensor's host layout + per-plane device pointer tables.
         // Allocated by register_layout from the parsed UpstreamLayoutHost
         // (slab-allocated pointer arrays bound via set_device_state).

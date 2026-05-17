@@ -271,7 +271,7 @@ public:
             const bool any_prec = host.any_precision;
             // Snapshot before std::move(host) so the host LRU has a
             // consistent per-tensor byte size for cap accounting.
-            // Shortcut: every chunk shares ``bytes_per_chunk`` (this is
+            // SsAnybcq: every chunk shares ``bytes_per_chunk`` (this is
             // the per-chunk size, no max-vs-min ambiguity).
             // Any-prec: per-chunk sizes differ (chunk 0 holds base_p
             // planes, later chunks hold 1) so snapshot the per-chunk
@@ -291,7 +291,7 @@ public:
             register_chunk_io_from_layout(rt, reader, name);
 
             if (!any_prec) {
-                // Shortcut layout: upload q_bias once at install (small,
+                // SsAnybcq layout: upload q_bias once at install (small,
                 // hot — every kernel call reads it). Plane chunks load on
                 // demand. Plan = q_bias only at steady state.
                 rt.move_chunk(name, kCidQBias, Tier::RAM, Tier::VRAM);
@@ -304,7 +304,7 @@ public:
                 // Any-prec layout: each data chunk carries its own
                 // α^(p)/β^(p). No install-time pin — chunks stream on
                 // demand under the same VRAM/host cache policy the
-                // shortcut path uses, with the precision tier driven by
+                // ss_anybcq path uses, with the precision tier driven by
                 // the score policy at dispatch time.
                 base_plans_.emplace(name, Plan{
                     /*chunks=*/{},
@@ -602,7 +602,7 @@ public:
                     HostKey victim = host_lru_.back();
                     host_lru_.pop_back();
                     host_pos_.erase(victim);
-                    // ``bytes_for_chunk`` covers both shortcut and
+                    // ``bytes_for_chunk`` covers both ss_anybcq and
                     // any-prec — the shared LRU may contain victims
                     // from either layout.
                     const size_t vb = bytes_for_chunk(victim.wid, victim.cid);

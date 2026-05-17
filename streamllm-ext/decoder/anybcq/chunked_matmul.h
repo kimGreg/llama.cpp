@@ -4,7 +4,7 @@
 // Owns the plane↔chunk translation for the AnyBCQ encoder family.
 // ────────────────────────────────────────────────────────────────────
 //
-// Layering contract (mirrors decoder/shortcut_anybcq/chunked_matmul.h):
+// Layering contract (mirrors decoder/ss_anybcq/chunked_matmul.h):
 //
 //   * Caller (qwen3/MoEMatMulComp) passes CHUNK COUNTS per expert.
 //     The model layer never thinks in planes; the score-dial maps
@@ -21,7 +21,7 @@
 //   * Asserts (constraint 6):
 //       1 <= host_n_chunks_per_eid[eid] <= layout.n_chunks
 //       planes := base_p + n_chunks - 1  for any-prec
-//                 n_chunks                for shortcut/static
+//                 n_chunks                for ss_anybcq/static
 //       1 <= planes <= kMaxChunksPerTensor
 //     Out-of-range entries abort in debug, clamp + count in release.
 //

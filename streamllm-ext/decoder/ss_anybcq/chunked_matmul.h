@@ -1,4 +1,4 @@
-// streamllm-ext / decoder / shortcut_anybcq — chunked-matmul dispatch.
+// streamllm-ext / decoder / ss_anybcq — chunked-matmul dispatch.
 //
 // ────────────────────────────────────────────────────────────────────
 // FUTURE: DenseExecutor — no runtime caller in M1.
@@ -16,7 +16,7 @@
 // approved future path.
 // ────────────────────────────────────────────────────────────────────
 //
-// Shortcut layout: each chunk packs ONE plane's signs + that plane's α
+// SsAnybcq layout: each chunk packs ONE plane's signs + that plane's α
 // scalar inline ([signs | α]); β is in a tensor-wide kCidQBias chunk
 // pinned at install. Decode is one naver_gemv_launch per token across
 // the resident planes; prefill dequants planes into a dense fp16
@@ -25,7 +25,7 @@
 // The kernels themselves are shared with the any-prec path
 // (``decoder/anybcq/anybcq_gemv.h`` and ``anybcq_gemm.h``); only the
 // per-encoder pointer staging — what address α_i resolves to — is
-// shortcut-specific and lives here. The any-prec equivalent goes
+// ss_anybcq-specific and lives here. The any-prec equivalent goes
 // through the MoE-fused dispatcher in ``qwen3/`` and the per-plane
 // ``update_anyprec_after_load_*`` writers.
 
@@ -44,7 +44,7 @@ namespace streamllm_ext {
 struct UpstreamLayoutDevice;
 class StreamllmRuntime;
 
-namespace shortcut_anybcq {
+namespace ss_anybcq {
 
 // Per-token decode path. Reads ``chunks``, builds per-plane (qw, α)
 // pointer arrays from ``L.chunk_ptrs`` + ``L.qw_bytes_per_chunk``, and
@@ -107,5 +107,5 @@ bool chunk_matmul_batched_for_wid(
     void * w_scratch_f16,
     StreamHandle compute_stream);
 
-}  // namespace shortcut_anybcq
+}  // namespace ss_anybcq
 }  // namespace streamllm_ext

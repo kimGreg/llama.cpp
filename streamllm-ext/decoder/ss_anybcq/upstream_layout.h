@@ -1,6 +1,6 @@
-// streamllm-ext / decoder / shortcut_anybcq — host layout builder.
+// streamllm-ext / decoder / ss_anybcq — host layout builder.
 //
-// SHORTCUT byte format on disk:
+// SS_ANYBCQ byte format on disk:
 //   [32 B header] [d1 × β (fp16/fp32)]                    ← fixed_meta
 //   [P chunks × (plane_sign_bytes + d1 × α_dtype)]        ← one plane per chunk
 //
@@ -11,17 +11,17 @@
 #pragma once
 
 // Reuses the shared UpstreamLayoutHost struct. The struct has both
-// shortcut and any-prec fields; the shortcut builder fills only the
-// shortcut-relevant ones.
+// ss_anybcq and any-prec fields; the ss_anybcq builder fills only the
+// ss_anybcq-relevant ones.
 #include "../anybcq/upstream_layout.h"
 
 #include <cstdint>
 
-namespace streamllm_ext { namespace shortcut_anybcq {
+namespace streamllm_ext { namespace ss_anybcq {
 
-// Build the host-side chunk layout for a SHORTCUT-encoded tensor.
+// Build the host-side chunk layout for a SS_ANYBCQ-encoded tensor.
 // Caller has already validated the magic + version + flag bits.
-UpstreamLayoutHost build_upstream_layout_shortcut(
+UpstreamLayoutHost build_upstream_layout_ss_anybcq(
     const TensorLayout & layout,
     const uint8_t * tensor_data,
     uint32_t group_size,
@@ -46,4 +46,4 @@ void plane_disk_to_kernel(
     int32_t         ng,
     int32_t         disk_alpha_size = 2);
 
-}}  // namespace streamllm_ext::shortcut_anybcq
+}}  // namespace streamllm_ext::ss_anybcq

@@ -7,7 +7,7 @@
 //                                        ``precision`` planes and stages
 //                                        pointer arrays.
 //   3. Per-plane device-pointer table updates (alloc, free, write,
-//      clear) for both shortcut and any-prec layouts.
+//      clear) for both ss_anybcq and any-prec layouts.
 //
 // All three served by the same ``anybcq_gemv.h`` public header.
 //

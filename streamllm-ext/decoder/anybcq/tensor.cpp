@@ -2,8 +2,8 @@
 //
 // All virtuals delegate to the ``UpstreamLayoutHost`` callbacks the
 // upstream-layout parser registered (see decoder/anybcq/upstream_layout.cpp
-// :: build_upstream_layout_anyprec and decoder/shortcut_anybcq/upstream_layout
-// .cpp :: build_upstream_layout_shortcut).  This keeps the encoder-specific
+// :: build_upstream_layout_anyprec and decoder/ss_anybcq/upstream_layout
+// .cpp :: build_upstream_layout_ss_anybcq).  This keeps the encoder-specific
 // byte-format knowledge in the parser layer and makes the tensor a thin
 // ABC adapter.
 
@@ -20,7 +20,7 @@ AnyBCQFamilyTensor::AnyBCQFamilyTensor(std::string wid,
 
 size_t AnyBCQFamilyTensor::disk_bytes(int chunk_idx) const {
     // Any-prec stores per-chunk disk sizes (chunk 0 carries base_p
-    // planes; later chunks carry one).  Shortcut has a uniform
+    // planes; later chunks carry one).  SsAnybcq has a uniform
     // disk_bytes_per_chunk.
     if (host_.any_precision) {
         if (chunk_idx < 0 || chunk_idx >= (int)host_.chunk_planes.size()) {
@@ -67,7 +67,7 @@ void AnyBCQFamilyTensor::after_evict(int chunk_idx, StreamHandle stream) {
     if (host_.after_evict_fn == nullptr) return;
     // The encoder maps chunk_idx → (plane_first, n_planes) differently
     // per family:
-    //   - shortcut: chunk_idx == plane_idx; n_planes == 1
+    //   - ss_anybcq: chunk_idx == plane_idx; n_planes == 1
     //   - any-prec: chunk_planes[chunk_idx].{plane_idx_first,
     //                                        n_planes_this_chunk}
     //     so chunk 0 covers planes [0, base_p) and chunk c>=1 covers

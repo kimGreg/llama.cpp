@@ -1,5 +1,5 @@
 // streamllm-ext / decoder / anybcq — concrete ChunkedTensor wrapper for
-// AnyBCQ-family tensors (any-prec + shortcut variants).
+// AnyBCQ-family tensors (any-prec + ss_anybcq variants).
 //
 // Owns one tensor's per-tensor encoder state:
 //   - the gguf-parsed host layout (byte sizes, chunk_planes, base_p
@@ -12,9 +12,9 @@
 // specifics stay routed through the function-pointer callbacks the
 // upstream-layout parser installed on ``host``.
 //
-// Both any-prec and shortcut share this single class — the byte-format
+// Both any-prec and ss_anybcq share this single class — the byte-format
 // differences are absorbed by the parser's chosen function pointers.
-// Distinct C++ types (AnyBCQTensor, ShortcutTensor) are exposed as
+// Distinct C++ types (AnyBCQTensor, SsAnybcqTensor) are exposed as
 // thin aliases so call sites can name the encoder family they expect.
 
 #pragma once
@@ -56,7 +56,7 @@ public:
     //   - d_qw_ptrs    : void** [kMaxChunksPerTensor], plane → signs base
     //   - d_alpha_ptrs : void** [kMaxChunksPerTensor], plane → α base
     //   - d_qbias_slot : void**  [1] for any-prec (highest-active β
-    //                    pointer); ignored for shortcut.
+    //                    pointer); ignored for ss_anybcq.
     void set_device_state(void ** d_qw_ptrs,
                           void ** d_alpha_ptrs,
                           void ** d_qbias_slot);

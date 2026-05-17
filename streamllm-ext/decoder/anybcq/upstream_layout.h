@@ -2,10 +2,10 @@
 // any-prec specifics).
 //
 // The struct ``UpstreamLayoutHost`` is encoder-agnostic — both the
-// shortcut and any-prec parsers fill it. The byte layout each parser
+// ss_anybcq and any-prec parsers fill it. The byte layout each parser
 // reads from disk is encoder-specific:
 //
-//   SHORTCUT (any_prec = 0, default):  see decoder/shortcut_anybcq/
+//   SS_ANYBCQ (any_prec = 0, default):  see decoder/ss_anybcq/
 //   ANY-PREC (any_prec = 1):
 //     [32 B header] (no fixed_meta β)
 //     [(target − base + 1) chunks, each carrying P=base+i:
@@ -20,7 +20,7 @@
 // via the scheduler's "highest-active chunk" hook.
 //
 // Per managed tensor, the framework sees two chunk kinds:
-//   - cid = kCidQBias       the install-pinned meta blob (shortcut: β).
+//   - cid = kCidQBias       the install-pinned meta blob (ss_anybcq: β).
 //   - cid = kCidChunkBase+i a data chunk i.
 
 #pragma once
@@ -61,7 +61,7 @@ using ChunkDiskToKernelFn = void (*)(
 // ``ChunkAfterLoadFn``: after the chunk lands in VRAM, write the
 // per-plane device-pointer-table entries the kernel reads.
 //   d_qbias_slot is nullable — used only by encoders that store β
-//   per chunk (any-prec). Shortcut passes nullptr.
+//   per chunk (any-prec). SsAnybcq passes nullptr.
 using ChunkAfterLoadFn = void (*)(
     const UpstreamLayoutHost & host,
     int           chunk_idx,
@@ -79,14 +79,14 @@ using ChunkAfterLoadFn = void (*)(
 // level — every plane the load wrote, the evict clears.  In
 // particular, any-prec chunk 0 owns ``base_p`` planes, so its evict
 // MUST clear all of ``[plane_first, plane_first + n_planes)`` — not
-// just ``plane_first``.  Shortcut: 1 plane per chunk (chunk_idx ==
+// just ``plane_first``.  SsAnybcq: 1 plane per chunk (chunk_idx ==
 // plane_idx, n_planes always 1).
 //
 //   ``plane_first`` — first plane index this chunk owns.
-//                     shortcut: chunk_idx
+//                     ss_anybcq: chunk_idx
 //                     any-prec: ``host.chunk_planes[chunk_idx].plane_idx_first``
 //   ``n_planes``    — number of planes this chunk owns.
-//                     shortcut: 1
+//                     ss_anybcq: 1
 //                     any-prec: ``host.chunk_planes[chunk_idx].n_planes_this_chunk``
 //   ``stream``      — pool's copy stream; clear is enqueued async
 //                     so it overlaps with the worker's other
@@ -105,13 +105,13 @@ using ChunkAfterEvictFn = void (*)(
 struct UpstreamLayoutHost {
     std::vector<std::vector<uint8_t>> chunks;    // length = n_chunks
     std::vector<uint16_t>              q_bias;   // [K_groups * n] fp16
-                                                  // shortcut: filled from
+                                                  // ss_anybcq: filled from
                                                   // FIXED_META β; any-prec:
                                                   // empty (β lives per chunk)
 
     size_t qw_bytes_per_chunk    = 0;
     size_t alpha_bytes_per_chunk = 0;
-    size_t bytes_per_chunk       = 0;  // shortcut: full chunk size; any-
+    size_t bytes_per_chunk       = 0;  // ss_anybcq: full chunk size; any-
                                         // prec: max over chunks (pool sizing)
     size_t q_bias_n_elem         = 0;
     size_t q_bias_bytes_per_chunk = 0; // any-prec: K_groups * n * 2
@@ -124,7 +124,7 @@ struct UpstreamLayoutHost {
 
     int32_t disk_alpha_size = 2;
     int32_t disk_beta_size  = 2;
-    size_t  disk_bytes_per_chunk = 0;  // shortcut SSD-stream HOT path; any-
+    size_t  disk_bytes_per_chunk = 0;  // ss_anybcq SSD-stream HOT path; any-
                                        // prec stores per-chunk sizes in
                                        // chunk_planes[i].disk_chunk_bytes
 
@@ -153,7 +153,7 @@ struct UpstreamLayoutHost {
 };
 
 // Top-level dispatcher: reads the v2 stream header (magic / version /
-// flag bits) and forwards to either decoder/shortcut_anybcq's parser
+// flag bits) and forwards to either decoder/ss_anybcq's parser
 // or the any-prec parser below. Throws on bad magic / version /
 // per-encoder validation failure.
 UpstreamLayoutHost build_upstream_layout_host(
@@ -163,7 +163,7 @@ UpstreamLayoutHost build_upstream_layout_host(
 
 // Same dispatch but wraps the parsed host layout in the appropriate
 // concrete ChunkedTensor (anybcq::AnyBCQTensor for any-prec,
-// shortcut_anybcq::ShortcutTensor for shortcut). The framework hands
+// ss_anybcq::SsAnybcqTensor for ss_anybcq). The framework hands
 // the runtime ChunkedTensor pointers; this is the entry point that
 // produces them.
 std::unique_ptr<ChunkedTensor> build_chunked_tensor(
@@ -173,8 +173,8 @@ std::unique_ptr<ChunkedTensor> build_chunked_tensor(
     uint32_t group_size);
 
 // Wrap an already-parsed UpstreamLayoutHost in the appropriate
-// ChunkedTensor subclass (any-prec → anybcq::AnyBCQTensor, shortcut →
-// shortcut_anybcq::ShortcutTensor). Used by call sites that obtained
+// ChunkedTensor subclass (any-prec → anybcq::AnyBCQTensor, ss_anybcq →
+// ss_anybcq::SsAnybcqTensor). Used by call sites that obtained
 // the parsed layout via build_upstream_layout_host directly (e.g.
 // the runtime's register_layout backward-compat path). Returns the
 // concrete AnyBCQ-family pointer so the runtime can read the per-

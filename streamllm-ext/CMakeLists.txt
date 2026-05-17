@@ -24,7 +24,7 @@ set(STREAMLLM_EXT_SOURCES
     qwen3/qwen3_moe_scheduler.cpp
     decoder/anybcq/upstream_layout.cpp
     decoder/anybcq/tensor.cpp
-    decoder/shortcut_anybcq/upstream_layout.cpp
+    decoder/ss_anybcq/upstream_layout.cpp
 )
 
 # ggml-cuda hook glue. Requires GGML_CUDA=ON (the hook signature takes
@@ -50,7 +50,7 @@ if (GGML_CUDA)
         decoder/anybcq/kernels/chunked_matmul_gemv.cu
         decoder/anybcq/kernels/chunked_matmul_gemm.cu
         decoder/anybcq/chunked_matmul.cu
-        decoder/shortcut_anybcq/chunked_matmul.cu
+        decoder/ss_anybcq/chunked_matmul.cu
         qwen3/qwen3_moe_fused.cu
     )
 endif()
@@ -62,7 +62,7 @@ target_include_directories(streamllm_ext PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq/kernels
-    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/shortcut_anybcq
+    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/ss_anybcq
     ${CMAKE_CURRENT_SOURCE_DIR}/qwen3
 )
 

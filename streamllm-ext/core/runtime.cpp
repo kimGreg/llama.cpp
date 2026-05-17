@@ -277,8 +277,8 @@ void StreamllmRuntime::register_layout(const std::string & wid,
     }
 
     // Wrap the parsed layout in the appropriate ChunkedTensor subclass
-    // (any-prec → anybcq::AnyBCQTensor, shortcut → shortcut_anybcq::
-    // ShortcutTensor). The decoder's wrap_host_in_tensor is the one
+    // (any-prec → anybcq::AnyBCQTensor, ss_anybcq → ss_anybcq::
+    // SsAnybcqTensor). The decoder's wrap_host_in_tensor is the one
     // place encoder typing is materialised — Entry holds the abstract
     // family base from here on.
     e.tensor = wrap_host_in_tensor(wid, std::move(host));
@@ -455,7 +455,7 @@ void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid,
     }
 
     // ChunkedTensor::after_evict knows the encoder's chunk_idx →
-    // plane_idx mapping (shortcut: identity; any-prec: plane_idx_first
+    // plane_idx mapping (ss_anybcq: identity; any-prec: plane_idx_first
     // off chunk_planes). Routes to the registered encoder callback
     // internally.  Caller passes the pool's copy_stream so the clear
     // is async and ordered against subsequent loads (SSOT §6.1.6 step 6).
@@ -631,7 +631,7 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             // device saw disk-format bytes that the kernel reinterpreted
             // as kernel-format → garbage scales and bit-flipped signs →
             // NaN / wrong output. Visible only when HOT > 0.
-            // Per-chunk size + transform dispatch.  Shortcut layout has
+            // Per-chunk size + transform dispatch.  SsAnybcq layout has
             // a uniform per-plane disk size; any-prec has variable
             // per-chunk sizes (chunk 0 carries base_p planes; later
             // chunks carry 1).  Both go through codec-aware
@@ -823,8 +823,8 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
 }
 
 // (chunk_matmul / chunk_matmul_batched moved to
-// decoder/shortcut_anybcq/chunked_matmul.{h,cu} as
-// ``shortcut_anybcq::chunk_matmul_for_wid`` / ``..._batched_for_wid``.
+// decoder/ss_anybcq/chunked_matmul.{h,cu} as
+// ``ss_anybcq::chunk_matmul_for_wid`` / ``..._batched_for_wid``.
 // Core's runtime now exposes only the layout + pool primitives those
 // helpers need — no encoder dispatch lives here.)
 

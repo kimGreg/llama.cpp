@@ -1,8 +1,8 @@
-// streamllm-ext / decoder / shortcut_anybcq — host layout builder impl.
+// streamllm-ext / decoder / ss_anybcq — host layout builder impl.
 
 #include "upstream_layout.h"
 #include "anybcq_format.h"
-// Per-plane pointer-table updates the shortcut after-load callback
+// Per-plane pointer-table updates the ss_anybcq after-load callback
 // drives. Lives in decoder/anybcq/kernels/ (encoder-neutral kernel layer).
 #include "anybcq_gemv.h"
 
@@ -15,7 +15,7 @@
 #include <immintrin.h>
 #endif
 
-namespace streamllm_ext { namespace shortcut_anybcq {
+namespace streamllm_ext { namespace ss_anybcq {
 namespace {
 
 // Local copy of the IEEE 754 fp32 → fp16 RNE helper. The any-prec side
@@ -58,7 +58,7 @@ constexpr uint8_t kFlagBetaFp16    = anybcq_format::flag::kBetaFp16;
 
 }  // anon namespace
 
-UpstreamLayoutHost build_upstream_layout_shortcut(
+UpstreamLayoutHost build_upstream_layout_ss_anybcq(
     const TensorLayout & layout,
     const uint8_t * tensor_data,
     uint32_t group_size,
@@ -79,7 +79,7 @@ UpstreamLayoutHost build_upstream_layout_shortcut(
 
     if ((size_t)layout.fixed_bytes < kStreamHeaderSize + (size_t)d1 * b_size) {
         throw std::runtime_error(
-            "build_upstream_layout_shortcut: fixed_bytes too small for "
+            "build_upstream_layout_ss_anybcq: fixed_bytes too small for "
             "32 B stream header + d1 × " + std::to_string(b_size) +
             " B beta");
     }
@@ -87,7 +87,7 @@ UpstreamLayoutHost build_upstream_layout_shortcut(
         int32_t expected = plane_sign_bytes + d1 * a_size;
         if ((int32_t)layout.chunk_bytes[p] != expected) {
             throw std::runtime_error(
-                "build_upstream_layout_shortcut: plane " + std::to_string(p) +
+                "build_upstream_layout_ss_anybcq: plane " + std::to_string(p) +
                 " byte size " + std::to_string(layout.chunk_bytes[p]) +
                 " != signs(" + std::to_string(plane_sign_bytes) +
                 ") + alpha(" + std::to_string(d1 * a_size) + ")");
@@ -177,7 +177,7 @@ UpstreamLayoutHost build_upstream_layout_shortcut(
         int plane_first, int n_planes,
         StreamHandle stream)
     {
-        // Shortcut: 1 plane per chunk by construction; the caller
+        // SsAnybcq: 1 plane per chunk by construction; the caller
         // (AnyBCQFamilyTensor::after_evict) already passes n_planes=1.
         if (stream != nullptr) {
             anybcq::clear_per_plane_after_evict_async(
@@ -256,4 +256,4 @@ void plane_disk_to_kernel(
     }
 }
 
-}}  // namespace streamllm_ext::shortcut_anybcq
+}}  // namespace streamllm_ext::ss_anybcq

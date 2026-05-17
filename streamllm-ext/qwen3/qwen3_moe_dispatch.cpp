@@ -19,7 +19,7 @@
 #include "anybcq_gemv.h"
 #include "anybcq_gemm.h"
 #include "qwen3_moe_fused.h"        // MoeExpertTable + qwen3::naver_gemv_moe_launch
-#include "chunked_matmul.h"   // shortcut_anybcq::chunk_matmul_*for_wid
+#include "chunked_matmul.h"   // ss_anybcq::chunk_matmul_*for_wid
 #include "streamllm_nvtx.h"
 
 #include <ggml.h>

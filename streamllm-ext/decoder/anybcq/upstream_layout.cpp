@@ -6,15 +6,15 @@
 // Per-plane pointer-table updates the any-prec after-load callback
 // drives. Lives in decoder/anybcq/kernels/.
 #include "anybcq_gemv.h"
-// Concrete ChunkedTensor wrappers (any-prec + shortcut share the
+// Concrete ChunkedTensor wrappers (any-prec + ss_anybcq share the
 // AnyBCQFamilyTensor base; the typed subclasses are the public face).
 #include "tensor.h"
-#include "../shortcut_anybcq/tensor.h"
+#include "../ss_anybcq/tensor.h"
 
-// Cross-encoder forward into the shortcut parser. The dispatcher reads
+// Cross-encoder forward into the ss_anybcq parser. The dispatcher reads
 // the flag bit and routes; calling cross-encoder is fine because this
 // is the encoder-selection layer.
-#include "../shortcut_anybcq/upstream_layout.h"
+#include "../ss_anybcq/upstream_layout.h"
 
 #include <cstdint>
 #include <cstring>
@@ -31,7 +31,7 @@ namespace streamllm_ext {
 namespace {
 
 // IEEE 754 fp32 → fp16 with round-to-nearest-even. Local copy; the
-// shortcut .cpp has its own to keep the per-encoder TUs independently
+// ss_anybcq .cpp has its own to keep the per-encoder TUs independently
 // translatable.
 uint16_t fp32_to_fp16_rne(float f) {
 #if defined(__F16C__)
@@ -290,7 +290,7 @@ UpstreamLayoutHost build_upstream_layout_host(
     if ((flags & kFlagAnyPrec) != 0) {
         return build_upstream_layout_anyprec(layout, tensor_data, group_size, flags);
     }
-    return shortcut_anybcq::build_upstream_layout_shortcut(
+    return ss_anybcq::build_upstream_layout_ss_anybcq(
         layout, tensor_data, group_size, flags);
 }
 
@@ -303,7 +303,7 @@ std::unique_ptr<anybcq::AnyBCQFamilyTensor> wrap_host_in_tensor(
             new anybcq::AnyBCQTensor(std::move(wid), std::move(host)));
     }
     return std::unique_ptr<anybcq::AnyBCQFamilyTensor>(
-        new shortcut_anybcq::ShortcutTensor(std::move(wid), std::move(host)));
+        new ss_anybcq::SsAnybcqTensor(std::move(wid), std::move(host)));
 }
 
 std::unique_ptr<ChunkedTensor> build_chunked_tensor(

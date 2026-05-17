@@ -14,7 +14,7 @@
 // Layout summary (v2):
 //
 //   HEADER (32 B)        StreamHeader, see below
-//   FIXED_META           shortcut: d1 × β-dtype; any-prec: empty
+//   FIXED_META           ss_anybcq: d1 × β-dtype; any-prec: empty
 //   CHUNKS               per-chunk byte recipe — see ShortcutChunkLayout
 //                        / AnyPrecChunkLayout
 //
@@ -40,7 +40,7 @@ namespace flag {
 constexpr uint8_t kAlphaFp16 = 1u << 0;  // 1 = α stored as fp16, 0 = fp32
 constexpr uint8_t kBetaFp16  = 1u << 1;  // 1 = β stored as fp16, 0 = fp32
 constexpr uint8_t kAnyPrec   = 1u << 2;  // 1 = per-precision-α layout
-                                          // 0 = shortcut (one α set)
+                                          // 0 = ss_anybcq (one α set)
 }
 
 // 32-byte stream header. Mirrors Python ``struct.Struct("<IBHBBB2xIIII4x")``.
@@ -72,7 +72,7 @@ static_assert(sizeof(StreamHeader) == kHeaderSize,
 // disk; the C++ runtime uses them to compute byte offsets, the Python
 // encoder uses them to predict chunk_bytes for GGUF metadata.
 
-// Shortcut layout (flag::kAnyPrec = 0): one plane per chunk.
+// SsAnybcq layout (flag::kAnyPrec = 0): one plane per chunk.
 //   [signs (plane_sign_bytes)][alpha (alpha_bytes)]
 struct ShortcutChunkLayout {
     int32_t plane_sign_bytes;   // = (d1 × group_size + 7) / 8

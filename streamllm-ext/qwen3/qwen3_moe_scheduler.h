@@ -38,7 +38,7 @@ const Plan * scheduler_plan_dense(
 //
 // ``n_chunks_requested`` is in the model layer's unit (CHUNKS).
 // Internally the scheduler routes any-prec wids through
-// build_plan_for_anyprec(synthetic, n_chunks) and shortcut wids
+// build_plan_for_anyprec(synthetic, n_chunks) and ss_anybcq wids
 // through build_plan_for(synthetic, n_chunks) — both interpret the
 // argument as a chunk count.  Plane semantics live entirely inside
 // decoder/anybcq (SSOT §6.1.5 layering).

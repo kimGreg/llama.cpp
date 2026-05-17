@@ -8,7 +8,7 @@
 //     w · x ≈ β + Σ α_i × (sign_i · x)   for i ∈ [0, precision)
 //
 // from per-plane pointer tables. ``update_per_plane_after_load*`` and
-// ``update_anyprec_after_load*`` populate those tables for shortcut
+// ``update_anyprec_after_load*`` populate those tables for ss_anybcq
 // and any-prec layouts respectively — encoder-specific staging only.
 //
 // MoE-fused dispatch is NOT here. Fusion across MoE experts is an
@@ -117,7 +117,7 @@ void alloc_per_plane_arrays(void **& d_qw, void **& d_alpha,
                             int max_planes);
 void free_per_plane_arrays(void *& d_qw, void *& d_alpha);
 
-// Shortcut layout: one plane per chunk. ``d_qw[plane]`` ← chunk_device_ptr
+// SsAnybcq layout: one plane per chunk. ``d_qw[plane]`` ← chunk_device_ptr
 // and ``d_alpha[plane]`` ← chunk_device_ptr + qw_bytes_per_chunk.
 // The async variant launches a 1-thread kernel and the caller must
 // re-record the chunk's ready event on ``stream`` so wait_on_stream
@@ -138,7 +138,7 @@ void update_per_plane_after_load_async(void ** d_qw, void ** d_alpha,
 //
 // IMPORTANT: this is the inverse of ``update_per_plane_after_load`` /
 // ``update_anyprec_after_load`` — it MUST clear every plane those
-// writers populated. For shortcut, that is one plane per chunk
+// writers populated. For ss_anybcq, that is one plane per chunk
 // (chunk_idx == plane). For any-prec chunk 0, ``base_p`` planes
 // ([0, base_p)) — leaving planes 1..base_p-1 dangling makes a
 // freed-and-reused slot readable through a stale d_qw[plane>=1]

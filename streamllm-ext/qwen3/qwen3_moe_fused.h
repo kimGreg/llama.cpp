@@ -41,7 +41,7 @@ struct MoeExpertTable {
     // entry holds the highest-active chunk's β buffer pointer).
     // Refreshed into ``d_q_bias_per_expert`` by
     // ``refresh_q_bias_for_anyprec_launch`` before each MoE kernel
-    // call. Null for fully-shortcut canonicals.
+    // call. Null for fully-ss_anybcq canonicals.
     void *** d_qbias_slot_per_expert   = nullptr;
     bool     needs_qbias_refresh       = false;
 };

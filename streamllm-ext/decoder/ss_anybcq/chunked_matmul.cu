@@ -1,4 +1,4 @@
-// streamllm-ext / decoder / shortcut_anybcq — chunked-matmul impl.
+// streamllm-ext / decoder / ss_anybcq — chunked-matmul impl.
 //
 // FUTURE: DenseExecutor — no runtime caller in M1. See the banner on
 // ``chunked_matmul.h`` for the contract. This TU is kept on disk
@@ -6,7 +6,7 @@
 // milestone) will reuse it as a per-tile compute back-end; no Mode A
 // production path links against the symbols here.
 //
-// Shortcut layout: each chunk packs [signs | α-scalar]. β is in a
+// SsAnybcq layout: each chunk packs [signs | α-scalar]. β is in a
 // separate kCidQBias chunk pinned at install. Decode = naver_gemv per
 // token; prefill = dequant + cuBLAS GEMM (or fused chunked LUT-GEMM).
 // Kernels themselves are shared with the any-prec decoder (under
@@ -30,7 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace streamllm_ext { namespace shortcut_anybcq {
+namespace streamllm_ext { namespace ss_anybcq {
 
 // Reuse the GEMV kernel scratch typedef + entry points from anybcq's
 // shared kernel header.
@@ -53,7 +53,7 @@ static int build_plane_ptrs(
     const void * (&alpha_ptrs)[kNaverMaxPrecision],
     bool & prefix_plan)
 {
-    // Shortcut layout only — any-prec is rejected upstream by
+    // SsAnybcq layout only — any-prec is rejected upstream by
     // StreamllmRuntime::chunk_matmul.
     int precision = 0;
     prefix_plan = true;
@@ -181,7 +181,7 @@ bool chunk_matmul_batched(
 
 namespace {
 
-// Translate a chunk-cid list to plane indices (shortcut layout: one
+// Translate a chunk-cid list to plane indices (ss_anybcq layout: one
 // plane per data chunk). Reject any-prec layouts loudly — that path
 // goes through the qwen3 MoE-fused kernel, not this dispatcher.
 inline std::vector<int> cids_to_planes_or_throw(
@@ -225,7 +225,7 @@ bool chunk_matmul_for_wid(
 
     auto planes = cids_to_planes_or_throw(
         tens->host(), wid, chunks,
-        "shortcut_anybcq::chunk_matmul_for_wid");
+        "ss_anybcq::chunk_matmul_for_wid");
 
     return chunk_matmul(
         *dev,
@@ -255,11 +255,11 @@ bool chunk_matmul_batched_for_wid(
 
     auto planes = cids_to_planes_or_throw(
         tens->host(), wid, chunks,
-        "shortcut_anybcq::chunk_matmul_batched_for_wid");
+        "ss_anybcq::chunk_matmul_batched_for_wid");
 
     return chunk_matmul_batched(
         *dev, planes, X_fp16, Y_fp16, n_tokens,
         w_scratch_f16, compute_stream);
 }
 
-}}  // namespace streamllm_ext::shortcut_anybcq
+}}  // namespace streamllm_ext::ss_anybcq
