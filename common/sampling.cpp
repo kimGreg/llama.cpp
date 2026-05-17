@@ -11,9 +11,34 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
+
+// Forward declaration of the streamllm-ext score-table setter so this
+// file doesn't take a hard include dependency on the streamllm-ext tree.
+// Resolved at final link via the `llama` library's private dep on
+// `streamllm_ext` (see src/CMakeLists.txt:63). Returns false if no
+// streamllm runtime is installed — in that case the call is a no-op.
+extern "C" bool streamllm_set_score_table(const float * thresholds, int n_thresh);
+
+// Parse a CSV float list. Returns empty vector on any parse failure.
+static std::vector<float> parse_phase_thresholds_csv(const char * csv) {
+    std::vector<float> out;
+    if (!csv || !*csv) return out;
+    std::stringstream ss(csv);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        try {
+            out.push_back(std::stof(tok));
+        } catch (...) {
+            return {};
+        }
+    }
+    return out;
+}
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -120,6 +145,16 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    // ── Phase-aware adaptive dial (StreamLLM) ──
+    // When phase_aware_enabled is true, common_sampler_accept polls the
+    // reasoning-budget state and calls streamllm_set_score_table on
+    // each IDLE/COUNTING/WAITING_UTF8/FORCING ↔ DONE transition.
+    // Populated once in common_sampler_init from environment.
+    bool                          phase_aware_enabled = false;
+    std::vector<float>            thr_reasoning;
+    std::vector<float>            thr_generation;
+    common_reasoning_budget_state prev_rbudget_state  = REASONING_BUDGET_IDLE;
 
     void reset() {
         prev.clear();
@@ -289,6 +324,42 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
+    // StreamLLM phase-aware extension: when the caller (typically a
+    // non-chat-template path like llama-completion or llama-perplexity)
+    // hasn't populated reasoning_budget_start/end from a chat template,
+    // honour direct token-id envs so the reasoning-budget sampler can
+    // still attach. Required for the phase-aware dial observer below
+    // to fire on <think>/</think> transitions.
+    if (params.reasoning_budget_start.empty() || params.reasoning_budget_end.empty()) {
+        auto parse_token_id_csv = [](const char * s) -> std::vector<llama_token> {
+            std::vector<llama_token> out;
+            if (!s || !*s) return out;
+            std::stringstream ss(s);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                try { out.push_back((llama_token) std::stoi(tok)); }
+                catch (...) { return {}; }
+            }
+            return out;
+        };
+        const char * open_csv  = std::getenv("STREAMLLM_PHASE_OPEN_TOKEN_IDS");
+        const char * close_csv = std::getenv("STREAMLLM_PHASE_CLOSE_TOKEN_IDS");
+        auto open_ids  = parse_token_id_csv(open_csv);
+        auto close_ids = parse_token_id_csv(close_csv);
+        if (!open_ids.empty() && !close_ids.empty()) {
+            params.reasoning_budget_start = std::move(open_ids);
+            params.reasoning_budget_end   = std::move(close_ids);
+            if (params.reasoning_budget_tokens < 0) {
+                params.reasoning_budget_tokens = INT_MAX;
+            }
+            LOG_INF("streamllm phase-aware: reasoning_budget seeded from env "
+                    "(start_ids=%zu, end_ids=%zu, tokens=%d)\n",
+                    params.reasoning_budget_start.size(),
+                    params.reasoning_budget_end.size(),
+                    params.reasoning_budget_tokens);
+        }
+    }
+
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0)) {
         rbudget = common_reasoning_budget_init(
@@ -401,6 +472,36 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .cur_p   = */ {},
     };
 
+    // Phase-aware adaptive dial wiring. Activated when both
+    // STREAMLLM_PHASE_REASONING_THRESHOLDS and STREAMLLM_PHASE_GENERATION_THRESHOLDS
+    // are set AND a reasoning-budget sampler is attached. Otherwise inert.
+    if (rbudget) {
+        const char * thr_r_csv = std::getenv("STREAMLLM_PHASE_REASONING_THRESHOLDS");
+        const char * thr_g_csv = std::getenv("STREAMLLM_PHASE_GENERATION_THRESHOLDS");
+        if (thr_r_csv && thr_g_csv) {
+            auto thr_r = parse_phase_thresholds_csv(thr_r_csv);
+            auto thr_g = parse_phase_thresholds_csv(thr_g_csv);
+            if (!thr_r.empty() && !thr_g.empty() && thr_r.size() == thr_g.size()) {
+                result->phase_aware_enabled = true;
+                result->thr_reasoning       = std::move(thr_r);
+                result->thr_generation      = std::move(thr_g);
+                result->prev_rbudget_state  = REASONING_BUDGET_IDLE;
+                // Prime: IDLE is treated as reasoning (model typically opens
+                // <think> at t=0; this also covers prompts that skip it).
+                const bool ok = streamllm_set_score_table(
+                    result->thr_reasoning.data(),
+                    (int) result->thr_reasoning.size());
+                LOG_INF("streamllm phase-aware dial: enabled, primed reasoning=%s\n",
+                        ok ? "ok" : "no-op (no runtime)");
+            } else {
+                LOG_WRN("streamllm phase-aware dial: env vars present but "
+                        "thresholds malformed or length mismatch "
+                        "(reasoning=%zu, generation=%zu) — disabled\n",
+                        thr_r.size(), thr_g.size());
+            }
+        }
+    }
+
     return result;
 }
 
@@ -442,6 +543,29 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     accept_grammar = accept_grammar && grammar_should_apply(gsmpl);
 
     llama_sampler_accept(gsmpl->rbudget, token);
+
+    // Phase-aware adaptive dial: observe the reasoning-budget state
+    // *after* the accept above has updated it. Flip the streamllm score
+    // table on any transition into/out of the reasoning phase.
+    if (gsmpl->phase_aware_enabled && gsmpl->rbudget) {
+        const auto cur = common_reasoning_budget_get_state(gsmpl->rbudget);
+        if (cur != gsmpl->prev_rbudget_state) {
+            const bool in_reasoning =
+                (cur == REASONING_BUDGET_IDLE         ||
+                 cur == REASONING_BUDGET_COUNTING     ||
+                 cur == REASONING_BUDGET_WAITING_UTF8 ||
+                 cur == REASONING_BUDGET_FORCING);
+            const auto & thr = in_reasoning ? gsmpl->thr_reasoning
+                                            : gsmpl->thr_generation;
+            const bool ok = streamllm_set_score_table(
+                thr.data(), (int) thr.size());
+            LOG_INF("streamllm phase-aware dial: %s -> %s (set_score_table=%s)\n",
+                    in_reasoning ? "non-reasoning" : "reasoning",
+                    in_reasoning ? "reasoning"     : "generation",
+                    ok ? "ok" : "no-op");
+            gsmpl->prev_rbudget_state = cur;
+        }
+    }
 
     if (gsmpl->grmr && accept_grammar) {
         llama_sampler_accept(gsmpl->grmr, token);
