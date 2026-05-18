@@ -156,6 +156,22 @@ struct common_sampler {
     std::vector<float>            thr_generation;
     common_reasoning_budget_state prev_rbudget_state  = REASONING_BUDGET_IDLE;
 
+    // ── Gradual-schedule adaptive dial (StreamLLM) ──
+    // Token-count-keyed sequence of dials.  STREAMLLM_SCHEDULE_THRESHOLDS
+    // = ascending list of generated-token breakpoints t1<t2<...<tN;
+    // STREAMLLM_SCHEDULE_DIALS = N+1 dials separated by ';' (each a
+    // comma-separated threshold list).  Schedule walks dial[0] for
+    // tokens [0, t1), dial[1] for [t1, t2), ..., dial[N] for [tN, ∞).
+    // Generalises both fixed-dial (N=0, one dial) and phase-aware
+    // (transitions keyed on a marker token rather than count).  When
+    // both schedule and phase-aware env vars are present, schedule
+    // wins — easier to characterise dial-aware TPS.
+    bool                          schedule_enabled = false;
+    std::vector<int>              schedule_thresholds;
+    std::vector<std::vector<float>> schedule_dials;
+    int                           n_tokens_generated = 0;
+    int                           schedule_next_idx  = 0;
+
     void reset() {
         prev.clear();
 
@@ -472,10 +488,71 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .cur_p   = */ {},
     };
 
+    // Gradual-schedule adaptive dial wiring (StreamLLM).
+    // STREAMLLM_SCHEDULE_THRESHOLDS=t1,t2,...,tN  (ascending ints)
+    // STREAMLLM_SCHEDULE_DIALS=dial0;dial1;...;dialN  (N+1 dials,
+    // each a comma-separated thresholds list).  If both schedule and
+    // phase-aware env vars are present, schedule wins (sets the dial
+    // last and tracks transitions via the per-token observer; the
+    // phase observer would just no-op on the first transition since
+    // the prev_state still matches).
+    const char * sch_thr_csv  = std::getenv("STREAMLLM_SCHEDULE_THRESHOLDS");
+    const char * sch_dial_csv = std::getenv("STREAMLLM_SCHEDULE_DIALS");
+    if (sch_thr_csv && sch_dial_csv) {
+        auto parse_int_csv = [](const char * s) {
+            std::vector<int> out;
+            std::stringstream ss(s ? s : "");
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                try { out.push_back(std::stoi(tok)); }
+                catch (...) { return std::vector<int>{}; }
+            }
+            return out;
+        };
+        auto parse_dials = [](const char * s) {
+            std::vector<std::vector<float>> out;
+            std::stringstream ss(s ? s : "");
+            std::string dial_str;
+            while (std::getline(ss, dial_str, ';')) {
+                auto thr = parse_phase_thresholds_csv(dial_str.c_str());
+                if (thr.empty()) return std::vector<std::vector<float>>{};
+                out.push_back(std::move(thr));
+            }
+            return out;
+        };
+        auto sch_thr   = parse_int_csv(sch_thr_csv);
+        auto sch_dials = parse_dials(sch_dial_csv);
+        // Validate: N thresholds + N+1 dials, thresholds strictly ascending.
+        bool valid = (!sch_thr.empty() && sch_dials.size() == sch_thr.size() + 1);
+        for (size_t i = 1; valid && i < sch_thr.size(); ++i) {
+            if (sch_thr[i] <= sch_thr[i - 1]) valid = false;
+        }
+        if (valid) {
+            result->schedule_enabled    = true;
+            result->schedule_thresholds = std::move(sch_thr);
+            result->schedule_dials      = std::move(sch_dials);
+            result->n_tokens_generated  = 0;
+            result->schedule_next_idx   = 0;
+            const bool ok = streamllm_set_score_table(
+                result->schedule_dials[0].data(),
+                (int) result->schedule_dials[0].size());
+            LOG_INF("streamllm schedule: enabled with %zu transition(s); "
+                    "primed dial[0]=%s\n",
+                    result->schedule_thresholds.size(),
+                    ok ? "ok" : "no-op (no runtime)");
+        } else {
+            LOG_WRN("streamllm schedule: env vars present but malformed "
+                    "(thresholds=%zu, dials=%zu — expected dials=thresholds+1, "
+                    "thresholds strictly ascending) — disabled\n",
+                    sch_thr.size(), sch_dials.size());
+        }
+    }
+
     // Phase-aware adaptive dial wiring. Activated when both
     // STREAMLLM_PHASE_REASONING_THRESHOLDS and STREAMLLM_PHASE_GENERATION_THRESHOLDS
     // are set AND a reasoning-budget sampler is attached. Otherwise inert.
-    if (rbudget) {
+    // Skipped when schedule is enabled (one dial-driver at a time).
+    if (rbudget && !result->schedule_enabled) {
         const char * thr_r_csv = std::getenv("STREAMLLM_PHASE_REASONING_THRESHOLDS");
         const char * thr_g_csv = std::getenv("STREAMLLM_PHASE_GENERATION_THRESHOLDS");
         if (thr_r_csv && thr_g_csv) {
@@ -543,6 +620,30 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     accept_grammar = accept_grammar && grammar_should_apply(gsmpl);
 
     llama_sampler_accept(gsmpl->rbudget, token);
+
+    // Gradual-schedule adaptive dial: count generated tokens and walk
+    // through the precomputed dial schedule. Each dial swap calls
+    // streamllm_set_score_table which bumps the score-table version —
+    // in capture mode that triggers exactly one re-capture per
+    // transition; replay reuses for tokens between thresholds.
+    if (gsmpl->schedule_enabled) {
+        gsmpl->n_tokens_generated++;
+        while (gsmpl->schedule_next_idx <
+               (int) gsmpl->schedule_thresholds.size() &&
+               gsmpl->n_tokens_generated >=
+               gsmpl->schedule_thresholds[gsmpl->schedule_next_idx])
+        {
+            const int next_dial = gsmpl->schedule_next_idx + 1;
+            const auto & dial = gsmpl->schedule_dials[next_dial];
+            const bool ok = streamllm_set_score_table(
+                dial.data(), (int) dial.size());
+            LOG_INF("streamllm schedule: at token %d, "
+                    "swap to dial[%d] (set_score_table=%s)\n",
+                    gsmpl->n_tokens_generated, next_dial,
+                    ok ? "ok" : "no-op");
+            gsmpl->schedule_next_idx++;
+        }
+    }
 
     // Phase-aware adaptive dial: observe the reasoning-budget state
     // *after* the accept above has updated it. Flip the streamllm score

@@ -2464,6 +2464,17 @@ static inline bool ggml_cuda_cgraph_has_user_node(const ggml_cgraph * cgraph) {
     return false;
 }
 
+// streamllm-ext: score-table version hook (see header). Returns the
+// scheduler's monotonic score_table_version counter; 0 if no runtime
+// is currently installed.
+typedef uint64_t (*ggml_cuda_streamllm_score_version_hook_t)(void);
+static ggml_cuda_streamllm_score_version_hook_t g_cuda_streamllm_score_version_hook = nullptr;
+
+extern "C" void ggml_cuda_set_streamllm_score_version_hook(void * hook_fn) {
+    g_cuda_streamllm_score_version_hook =
+        (ggml_cuda_streamllm_score_version_hook_t) hook_fn;
+}
+
 // streamllm-ext integration: generic pre-op claim hook. Fires at the
 // very top of ggml_cuda_compute_forward, before the per-op dispatch
 // switch — gives a registered hook the chance to claim ANY op by
@@ -3234,8 +3245,17 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     const bool stream_llm_hook = (g_cuda_mul_mat_hook != nullptr);
     if (stream_llm_hook) {
         const char * enable = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
-        const bool allow = enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
-        if (!allow) return false;
+        const bool allow_legacy =
+            enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
+        // STREAMLLM_ALLOW_CAPTURE (benchmark/score mode) also implies
+        // "the operator has verified streamllm is safe to capture" —
+        // qwen3_moe_scheduler asserts full VRAM pin at install when
+        // it is set. Honour both env vars here so the user-facing knob
+        // is just STREAMLLM_ALLOW_CAPTURE for benchmark mode.
+        const char * allow_capture_env = std::getenv("STREAMLLM_ALLOW_CAPTURE");
+        const bool allow_capture =
+            allow_capture_env && allow_capture_env[0] && allow_capture_env[0] != '0';
+        if (!allow_legacy && !allow_capture) return false;
     }
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -3287,11 +3307,36 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (cgraph->uid != 0 &&
+    // streamllm-ext: score-table version key. Kernel grid dims for
+    // managed mul_mat dispatches are derived host-side from the
+    // current dial during ``on_graph_compute_begin``; if the dial
+    // changes between captures the previously-captured graph would
+    // replay with stale grid dims. Force re-capture on any version
+    // mismatch.
+    bool streamllm_version_changed = false;
+    if (g_cuda_streamllm_score_version_hook != nullptr) {
+        const uint64_t cur = g_cuda_streamllm_score_version_hook();
+        if (cur != graph->cached_streamllm_score_version) {
+            graph->cached_streamllm_score_version = cur;
+            streamllm_version_changed = true;
+            static const bool log_cache = (getenv("STREAMLLM_LOG_GRAPH_CACHE") != nullptr);
+            if (log_cache) {
+                GGML_LOG_INFO("[streamllm] score_table_version=%llu → re-capture\n",
+                              (unsigned long long) cur);
+            }
+        }
+    }
+
+    if (!streamllm_version_changed &&
+        cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
+    }
+
+    if (streamllm_version_changed) {
+        res = true;
     }
 
     graph->uid = cgraph->uid;

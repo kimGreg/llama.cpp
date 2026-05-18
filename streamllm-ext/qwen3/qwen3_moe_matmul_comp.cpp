@@ -450,18 +450,59 @@ void MoEMatMulComp::execute(const ComputationInput & in_base,
         cudaMemsetAsync(out.dst->data, 0, dst_bytes, stream);
     }
 
+    // ── 3a. Capture-mode plan: device-side per-expert chunk-count
+    //       computation. Reads the contiguous ids buffer we just
+    //       wrote (sc->ids_d), the weights/probs tensors (which the
+    //       eager pre_inputs D2H also treats as contiguous), and the
+    //       device-side score-thresholds buffer maintained by the
+    //       scheduler — writes prec_per_eid_d_ entirely on device.
+    //       The H2D + cudaStreamSynchronize in dispatch_three_
+    //       canonicals_'s eager path is skipped when this runs.
+    const bool capture_path =
+        sched_ != nullptr &&
+        qwen3::scheduler_allow_capture(*sched_);
+    if (capture_path) {
+        const float * thresholds_d =
+            qwen3::scheduler_score_thresholds_device(*sched_);
+        const int n_tiers =
+            qwen3::scheduler_score_n_tiers(*sched_);
+        const auto * layout = any_layout_;
+        if (layout != nullptr && thresholds_d != nullptr) {
+            qwen3::launch_plan_per_expert_planes(
+                /*ids_d=*/        (const int32_t *) sc->ids_d,
+                /*weights_d=*/    in.weights ? (const float *) in.weights->data : nullptr,
+                /*probs_d=*/      in.probs   ? (const float *) in.probs->data   : nullptr,
+                /*thresholds_d=*/ thresholds_d,
+                n_tokens,
+                n_used,
+                n_experts_,
+                n_tiers,
+                /*n_chunks_max=*/ n_chunks_,
+                layout->base_precision > 0 ? layout->base_precision : 1,
+                layout->any_precision,
+                (int *) prec_per_eid_d_,
+                stream_h);
+        }
+    }
+
     // ── 4. Hand off to the decoder.  anybcq::moe_chunk_matmul owns
     //      chunks→planes conversion, H2D of the kernel-facing
     //      per-expert precision array (prec_per_eid_d_), any-prec
     //      q_bias slot refresh, and the fused MoE GEMV launch.
     //      Model layer never sees plane vocabulary (constraint 1).
+    //
+    //      Capture-mode opt-in: the plan kernel in Phase 3a already
+    //      populated prec_per_eid_d_ on the device. Passing nullptr
+    //      for host_n_chunks_per_eid signals moe_chunk_matmul to
+    //      skip the host conversion + H2D and trust the device
+    //      buffer.
     anybcq::moe_chunk_matmul(
         *rt_,
         canonical_,
         *any_layout_,
         *fuse_table_,
         (int *) prec_per_eid_d_,
-        host_n_chunks_per_expert_,
+        capture_path ? nullptr : host_n_chunks_per_expert_,
         (const int32_t *) sc->ids_d,
         sc->xb_f16,
         out.dst->data,

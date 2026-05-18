@@ -347,6 +347,14 @@ public:
     void                       set_replay_score_table(std::vector<float> snap);
     const std::vector<float> & current_replay_score_table() const;
 
+    // Score-table version key, refreshed alongside the snapshot.
+    // Read by ggml-cuda's CUDA-graph cache predicate to force re-
+    // capture when the dial changes (e.g. HTTP /streamllm/score_table
+    // swap or a phase-aware reasoning→generation transition). Atomic
+    // so the cache hook can read it lock-free per cgraph_compute.
+    void     set_replay_score_table_version(uint64_t v);
+    uint64_t replay_score_table_version() const;
+
 private:
     bool installed_ = false;
 
@@ -354,6 +362,7 @@ private:
     // on_graph_compute_begin.
     std::vector<float>                       replay_score_table_;
     mutable std::mutex                       replay_score_table_mu_;
+    std::atomic<uint64_t>                    replay_score_table_version_{0};
 };
 
 } // namespace streamllm_ext

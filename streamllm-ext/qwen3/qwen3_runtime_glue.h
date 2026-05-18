@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -164,5 +165,10 @@ extern "C" void streamllm_on_graph_audit_and_score_snapshot_end(
 // cgraph that carries managed MoE.
 extern "C" bool streamllm_user_node_claims(
     const struct ggml_tensor * node);
+
+// Score-table version key. Registered with ggml-cuda's
+// ``ggml_cuda_set_streamllm_score_version_hook``; the cgraph cache
+// reads it once per compute and forces re-capture on any change.
+extern "C" uint64_t streamllm_replay_score_table_version(void);
 
 } // namespace streamllm_ext

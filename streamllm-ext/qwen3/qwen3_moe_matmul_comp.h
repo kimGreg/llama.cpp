@@ -109,6 +109,15 @@ public:
     int M() const { return M_; }
     int n_experts() const { return n_experts_; }
 
+    // Capture-mode hooks. The on-device plan kernel writes per-expert
+    // PLANE counts directly into ``prec_per_eid_d_``; ``execute`` is
+    // then called with host_n_chunks_per_expert_ unused. The accessor
+    // surfaces the device pointer + the layout fields the kernel needs.
+    int *                         prec_per_eid_device() { return (int *) prec_per_eid_d_; }
+    const UpstreamLayoutDevice *  any_layout()    const { return any_layout_; }
+    int                           n_chunks_max()  const { return n_chunks_; }
+    int                           group_size()    const { return group_size_; }
+
 private:
     StreamllmRuntime *           rt_         = nullptr;
     Scheduler *                  sched_      = nullptr;

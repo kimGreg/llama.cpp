@@ -164,5 +164,45 @@ void launch_weighted_reduce_slots(
     int             M,
     StreamHandle    stream);
 
+// Capture-mode planning kernel — populates ``planes_per_eid_d`` from
+// (ids, weights, probs, dial) entirely on the device. Mirrors the
+// host-side ``MoEMatMulComp::plan`` logic in qwen3_moe_matmul_comp.cpp
+// (per-expert max gate score → chunks_for_gate → planes_for_chunks),
+// so the eager and capture paths produce the same prec_per_eid_d for
+// the same (routing, dial). Used by Qwen3MoEAnyBcqExecutor's
+// capture-mode fast path to eliminate the D2H + cudaStreamSynchronize
+// that breaks CUDA-graph capture.
+//
+//   ids_d         [n_tokens, n_used]      int32  — top-K expert ids
+//                                                  per token. Required.
+//   weights_d     [n_tokens, n_used]      f32    — renormalised weights;
+//                                                  optional (may be null).
+//   probs_d       [n_tokens, n_expert]    f32    — raw routing scores;
+//                                                  optional (used only
+//                                                  if weights_d is null).
+//   thresholds_d  [n_tiers]               f32    — score-table device
+//                                                  mirror from MoESchd.
+//   planes_per_eid_d [n_expert]           int32  — output: number of
+//                                                  planes the kernel
+//                                                  should sweep for each
+//                                                  expert.
+//
+// Unrouted experts (no (t,u) with ids[t,u] == eid) receive the maximum
+// plane count — matching the host pre-fill in MoEMatMulComp::on_install.
+void launch_plan_per_expert_planes(
+    const int32_t * ids_d,
+    const float *   weights_d,
+    const float *   probs_d,
+    const float *   thresholds_d,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             n_tiers,
+    int             n_chunks_max,
+    int             base_p,
+    bool            any_precision,
+    int *           planes_per_eid_d,
+    StreamHandle    stream);
+
 }  // namespace qwen3
 }  // namespace streamllm_ext

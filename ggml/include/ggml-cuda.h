@@ -98,6 +98,20 @@ GGML_BACKEND_API void ggml_cuda_set_graph_compute_end_hook  (void * hook_fn);
 // Set to null to unregister. Independent of the other streamllm hooks.
 GGML_BACKEND_API void ggml_cuda_set_user_node_claims_hook(void * hook_fn);
 
+// streamllm-ext integration: score-table version hook. When set,
+// ggml-cuda's per-cgraph "update required?" predicate calls this and
+// compares the returned uint64_t to a per-graph cached version. A
+// version mismatch forces re-capture of the cgraph — used by
+// streamllm-ext to invalidate captured graphs whenever the runtime
+// score-dial swaps (HTTP /streamllm/score_table or a phase-aware
+// reasoning→generation transition). The version is bumped each time
+// streamllm_set_score_table() succeeds.
+//
+// Callback signature:
+//   uint64_t fn(void);
+// Set to null to unregister.
+GGML_BACKEND_API void ggml_cuda_set_streamllm_score_version_hook(void * hook_fn);
+
 // streamllm-ext integration: generic pre-op claim hook. Fires at the
 // top of ggml_cuda_compute_forward for EVERY op — the hook inspects
 // dst (op type, name, src[i]) and returns true to indicate "I handled

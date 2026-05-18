@@ -190,10 +190,25 @@ void register_chunk_io_from_layout(StreamllmRuntime & rt,
 //                                   streamllm_set_score_table.
 class MoEScheduler : public Scheduler {
 public:
+    ~MoEScheduler() override {
+        if (score_thresholds_d_ != nullptr) {
+            cudaFree(score_thresholds_d_);
+            score_thresholds_d_ = nullptr;
+        }
+    }
+
     void on_install(StreamllmRuntime & rt,
                     const StreamReader & reader,
                     const std::string & gguf_path) override {
         rt_ = &rt;
+        // Benchmark/score-mode opt-in: when set, claims_node() returns
+        // false so ggml-cuda is free to capture the cgraph. Safe only
+        // when every chunk is pinned in VRAM (no SSD streaming, no
+        // eviction). The fully-pinned check at the end of on_install
+        // aborts loudly if pool capacity is too small.
+        if (const char * s = std::getenv("STREAMLLM_ALLOW_CAPTURE")) {
+            if (s[0] && s[0] != '0') allow_capture_ = true;
+        }
         // Snapshot every managed name (chunked synthetic wids AND
         // placeholder-only canonicals).  claims_tensor / claims_node /
         // dispatch_node consult this set.  Used to live as
@@ -294,22 +309,53 @@ public:
                 // SsAnybcq layout: upload q_bias once at install (small,
                 // hot — every kernel call reads it). Plane chunks load on
                 // demand. Plan = q_bias only at steady state.
+                //
+                // Benchmark/capture mode (STREAMLLM_ALLOW_CAPTURE=1):
+                // pre-pin every chunk at install — the load_set is
+                // permanently empty and the dispatch's residency checks
+                // all short-circuit on first probe.
                 rt.move_chunk(name, kCidQBias, Tier::RAM, Tier::VRAM);
-                base_plans_.emplace(name, Plan{
-                    /*chunks=*/{kCidQBias},
-                    /*moves =*/{}
-                });
-                total_pinned += 1;
+                if (allow_capture_) {
+                    for (int p = 0; p < P; ++p) {
+                        rt.move_chunk(name, cid_chunk(p), Tier::RAM, Tier::VRAM);
+                    }
+                    std::vector<int> all_chunks;
+                    all_chunks.reserve(P + 1);
+                    all_chunks.push_back(kCidQBias);
+                    for (int p = 0; p < P; ++p) all_chunks.push_back(cid_chunk(p));
+                    base_plans_.emplace(name, Plan{ all_chunks, {} });
+                    total_pinned += (size_t)(P + 1);
+                } else {
+                    base_plans_.emplace(name, Plan{
+                        /*chunks=*/{kCidQBias},
+                        /*moves =*/{}
+                    });
+                    total_pinned += 1;
+                }
             } else {
                 // Any-prec layout: each data chunk carries its own
                 // α^(p)/β^(p). No install-time pin — chunks stream on
                 // demand under the same VRAM/host cache policy the
                 // ss_anybcq path uses, with the precision tier driven by
                 // the score policy at dispatch time.
-                base_plans_.emplace(name, Plan{
-                    /*chunks=*/{},
-                    /*moves =*/{}
-                });
+                //
+                // Benchmark/capture mode pins every plane chunk eagerly
+                // for the same reason as ss_anybcq above.
+                if (allow_capture_) {
+                    for (int p = 0; p < P; ++p) {
+                        rt.move_chunk(name, cid_chunk(p), Tier::RAM, Tier::VRAM);
+                    }
+                    std::vector<int> all_chunks;
+                    all_chunks.reserve(P);
+                    for (int p = 0; p < P; ++p) all_chunks.push_back(cid_chunk(p));
+                    base_plans_.emplace(name, Plan{ all_chunks, {} });
+                    total_pinned += (size_t)P;
+                } else {
+                    base_plans_.emplace(name, Plan{
+                        /*chunks=*/{},
+                        /*moves =*/{}
+                    });
+                }
             }
 
             if (P > max_n_chunks_) max_n_chunks_ = P;
@@ -428,6 +474,71 @@ public:
         std::fprintf(stderr,
             "streamllm-scheduler[moe]: built %zu MoEMatMulComp instances\n",
             comps_built);
+
+        // Fully-pinned guard for the capture opt-in (benchmark/score
+        // mode). Sum every managed chunk's on-disk byte size and
+        // compare to the VRAM pool capacity. If the pool can't hold
+        // the whole model, capture is unsafe (eviction would
+        // invalidate captured chunk pointers mid-replay) — abort
+        // rather than silently corrupt graphs.
+        if (allow_capture_) {
+            size_t total_managed_bytes = 0;
+            for (const auto & kv : P_of_) {
+                const auto & nm = kv.first;
+                const int    P  = kv.second;
+                auto it_any = per_chunk_bytes_anyprec_.find(nm);
+                if (it_any != per_chunk_bytes_anyprec_.end()) {
+                    for (size_t b : it_any->second) total_managed_bytes += b;
+                } else {
+                    auto it_b = bytes_per_chunk_of_.find(nm);
+                    if (it_b != bytes_per_chunk_of_.end()) {
+                        // ss_anybcq: q_bias + P plane chunks all
+                        // share bytes_per_chunk.
+                        total_managed_bytes += it_b->second * (size_t)(P + 1);
+                    }
+                }
+            }
+            const size_t cap = rt.pool().capacity_bytes();
+            if (cap < total_managed_bytes) {
+                std::fprintf(stderr,
+                    "streamllm-scheduler[moe]: STREAMLLM_ALLOW_CAPTURE=1 but "
+                    "pool capacity %.2f GB < total managed %.2f GB. "
+                    "Capture mode requires fully-pinned VRAM. Set "
+                    "STREAMLLM_VRAM_CAP_MB high enough to fit the whole "
+                    "model, or unset STREAMLLM_ALLOW_CAPTURE.\n",
+                    (double)cap / 1e9, (double)total_managed_bytes / 1e9);
+                GGML_ABORT("streamllm-scheduler: capture mode misconfigured");
+            }
+            std::fprintf(stderr,
+                "streamllm-scheduler[moe]: capture mode ENABLED — "
+                "pool %.2f GB >= managed %.2f GB (version-keyed graph cache)\n",
+                (double)cap / 1e9, (double)total_managed_bytes / 1e9);
+
+            // Device-side mirror of the score-threshold table — read
+            // by the on-device plan kernel to compute per-expert
+            // chunk counts without a host round-trip.
+            const size_t th_bytes = (size_t)n_score_tiers_ * sizeof(float);
+            cudaError_t err = cudaMalloc(&score_thresholds_d_, th_bytes);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr,
+                    "streamllm-scheduler[moe]: cudaMalloc(score_thresholds_d, "
+                    "%zu B) failed: %s\n",
+                    th_bytes, cudaGetErrorString(err));
+                GGML_ABORT("streamllm-scheduler: capture-mode cudaMalloc failed");
+            }
+            // Seed with the current thresholds + matching version so the
+            // hook+kernel see consistent state on the first cgraph.
+            std::vector<float> snap;
+            uint64_t version;
+            {
+                std::lock_guard<std::mutex> lk(score_table_mu_);
+                snap    = score_thresholds_;
+                version = score_table_version_.load(std::memory_order_relaxed);
+            }
+            cudaMemcpy(score_thresholds_d_, snap.data(),
+                       th_bytes, cudaMemcpyHostToDevice);
+            score_thresholds_d_version_ = version;
+        }
     }
 
     qwen3::MoEMatMulComp * lookup_moe_comp(const std::string & canonical) {
@@ -766,6 +877,13 @@ public:
         // every invocation, which cuda-graph capture forbids. ggml-
         // cuda consults this predicate per cgraph node and disables
         // capture for any cgraph where it returns true.
+        //
+        // Benchmark/score-mode opt-in (STREAMLLM_ALLOW_CAPTURE=1):
+        // operator has guaranteed full VRAM pin → LOAD is a no-op,
+        // capture is safe.  The score-table version hook
+        // (qwen3_runtime_glue) invalidates the captured graph when
+        // the dial swaps, so phase-aware C_phase works too.
+        if (allow_capture_) return false;
         if (node == nullptr) return false;
         if (node->op != GGML_OP_MUL_MAT &&
             node->op != GGML_OP_MUL_MAT_ID) {
@@ -827,10 +945,38 @@ public:
                                  const struct ggml_cgraph * cgraph) override {
         if (rt_ == nullptr || cgraph == nullptr) return;
 
-        // Snapshot the score table once per cgraph_compute so every
-        // managed dispatch in this token sees the same dial value
-        // even if a live ``set_score_table`` call lands mid-token.
-        rt_->set_replay_score_table(score_thresholds_snapshot());
+        // Snapshot the score table + its version atomically (under
+        // score_table_mu_) once per cgraph_compute. The thresholds
+        // copy drives kernel grid dims; the version is read by ggml-
+        // cuda's graph-cache predicate (via the
+        // ggml_cuda_set_streamllm_score_version_hook installed in
+        // qwen3_runtime_glue) so a dial swap forces re-capture.
+        {
+            std::vector<float> snap;
+            uint64_t           version;
+            {
+                std::lock_guard<std::mutex> lk(score_table_mu_);
+                snap    = score_thresholds_;
+                version = score_table_version_.load(std::memory_order_relaxed);
+            }
+            // Refresh the device-side mirror only when the dial has
+            // actually changed — the H2D is async (stream-ordered, so
+            // capture-safe), but a no-op call per cgraph is still
+            // worth skipping.  Done BEFORE the host-side snap is
+            // stored so a cgraph that sees the new version will also
+            // see the matching device buffer.
+            if (score_thresholds_d_ != nullptr &&
+                version != score_thresholds_d_version_)
+            {
+                cudaMemcpyAsync(score_thresholds_d_, snap.data(),
+                                snap.size() * sizeof(float),
+                                cudaMemcpyHostToDevice,
+                                (cudaStream_t)compute_stream);
+                score_thresholds_d_version_ = version;
+            }
+            rt_->set_replay_score_table(std::move(snap));
+            rt_->set_replay_score_table_version(version);
+        }
 
         // S8 (Mode A): cgraph audit. STREAMLLM_CGRAPH_AUDIT=1 walks
         // the cgraph and proves the two post-cutover invariants:
@@ -976,8 +1122,23 @@ public:
         }
         std::lock_guard<std::mutex> lk(score_table_mu_);
         score_thresholds_ = th;
+        // Bump under the same lock so on_graph_compute_begin sees a
+        // consistent (snapshot, version) pair.  The atomic store
+        // gives the version a lock-free read on the cgraph dispatch
+        // path (ggml-cuda's score-version hook).
+        score_table_version_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+
+    uint64_t score_table_version() const {
+        return score_table_version_.load(std::memory_order_relaxed);
+    }
+
+    // Capture-mode accessors. The on-device plan kernel reads the
+    // thresholds buffer; the executor consults allow_capture() to
+    // gate its capture-mode dispatch fast path.
+    const float * score_thresholds_device() const { return score_thresholds_d_; }
+    bool          allow_capture()           const { return allow_capture_; }
 
 private:
     static int read_int_env(const char * name, int fallback) {
@@ -1010,9 +1171,32 @@ private:
     // score_table_mu_.  Hot-path readers take a snapshot via
     // score_thresholds_snapshot() and iterate locally so a swap
     // mid-generation never tears.
-    mutable std::mutex score_table_mu_;
-    std::vector<float> score_thresholds_;
-    int                n_score_tiers_ = 0;
+    mutable std::mutex    score_table_mu_;
+    std::vector<float>    score_thresholds_;
+    int                   n_score_tiers_ = 0;
+    // Monotonic counter bumped under score_table_mu_ on every
+    // successful set_score_table() call. Reading is lock-free via
+    // atomic — the ggml-cuda graph-cache predicate (registered
+    // through ggml_cuda_set_streamllm_score_version_hook) consults
+    // this once per cgraph_compute to force re-capture across dial
+    // swaps (HTTP score_table swap, phase-aware reasoning→generation
+    // transition).
+    std::atomic<uint64_t> score_table_version_{0};
+
+    // STREAMLLM_ALLOW_CAPTURE=1: opt-in to CUDA-graph capture for the
+    // managed cgraph. Only legal when the operator has set
+    // STREAMLLM_VRAM_CAP_MB large enough to keep every chunk pinned.
+    // The fully-pinned check at the end of on_install aborts loudly
+    // when the assumption is broken.
+    bool allow_capture_ = false;
+    // Device-side mirror of score_thresholds_. Used by the on-device
+    // plan kernel (capture mode) to compute per-expert chunk counts
+    // without a host round-trip. Allocated at on_install when
+    // allow_capture_ is set; refreshed in on_graph_compute_begin via
+    // async H2D when score_table_version_ differs from the value last
+    // pushed.  nullptr in non-capture mode.
+    float *               score_thresholds_d_ = nullptr;
+    uint64_t              score_thresholds_d_version_ = 0;
 
     std::unordered_map<std::string, int> P_of_;
     // Synthetic wids whose host layout flag had any_precision=true.
@@ -1249,6 +1433,18 @@ bool scheduler_set_score_table(
     const std::vector<float> & thresholds)
 {
     return as_moe(sched).set_score_table(thresholds);
+}
+
+uint64_t scheduler_score_table_version(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).score_table_version();
+}
+
+const float * scheduler_score_thresholds_device(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).score_thresholds_device();
+}
+
+bool scheduler_allow_capture(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).allow_capture();
 }
 
 MoEMatMulComp * scheduler_lookup_moe_comp(

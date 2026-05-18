@@ -960,4 +960,12 @@ const std::vector<float> & StreamllmRuntime::current_replay_score_table() const 
     return replay_score_table_;
 }
 
+void StreamllmRuntime::set_replay_score_table_version(uint64_t v) {
+    replay_score_table_version_.store(v, std::memory_order_release);
+}
+
+uint64_t StreamllmRuntime::replay_score_table_version() const {
+    return replay_score_table_version_.load(std::memory_order_acquire);
+}
+
 } // namespace streamllm_ext

@@ -104,4 +104,17 @@ bool                scheduler_set_score_table(
     Scheduler &                sched,
     const std::vector<float> & thresholds);
 
+// Monotonic counter bumped each time set_score_table() succeeds.  The
+// CUDA-graph cache reads this through ggml_cuda_set_streamllm_score_
+// version_hook to force re-capture whenever the dial swaps.
+uint64_t            scheduler_score_table_version    (const Scheduler & sched);
+
+// Capture-mode accessors. ``score_thresholds_device`` returns the
+// device-side mirror of the score-threshold table populated under
+// STREAMLLM_ALLOW_CAPTURE=1; nullptr otherwise.  ``allow_capture``
+// returns true iff the operator opted into CUDA-graph capture for
+// this install.
+const float *       scheduler_score_thresholds_device(const Scheduler & sched);
+bool                scheduler_allow_capture          (const Scheduler & sched);
+
 }}  // namespace streamllm_ext::qwen3

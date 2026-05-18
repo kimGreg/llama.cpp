@@ -66,6 +66,15 @@ bool                                  g_required_runtime_was_true = false;
 std::atomic<uint64_t>                 g_sentinel_claims{0};
 std::atomic<uint64_t>                 g_forward_moe_layer_calls{0};
 
+// Benchmark/score-mode capture opt-in.  Mirrors MoEScheduler::
+// allow_capture_ so the cgraph-level claim hook can short-circuit
+// without locking g_runtime_mu on every node — install_for_gguf
+// reads STREAMLLM_ALLOW_CAPTURE once and writes here, the scheduler
+// reads the same env var in its own on_install.  clear() resets to
+// false so a subsequent install (e.g. server reload) re-reads the
+// env.
+std::atomic<bool>                     g_streamllm_allow_capture{false};
+
 // Mode A milestone 1, S1 — bound model-slot set. Records every
 // model's streamllm_executor slot address that has been wired by the
 // install path. clear() walks this under g_runtime_mu and writes
@@ -163,6 +172,16 @@ bool install_for_gguf(const char * gguf_path) {
         long mb = std::atol(s);
         if (mb > 0) cap = (size_t)mb * 1024UL * 1024UL;
     }
+    // Benchmark/score-mode capture opt-in. Read here so the hook
+    // short-circuit below sees the right value the first time it
+    // fires (sentinel-bearing cgraphs land on the very first
+    // graph_compute, before any HTTP handler can touch the runtime).
+    if (const char * s = getenv("STREAMLLM_ALLOW_CAPTURE")) {
+        g_streamllm_allow_capture.store(
+            s[0] && s[0] != '0', std::memory_order_relaxed);
+    } else {
+        g_streamllm_allow_capture.store(false, std::memory_order_relaxed);
+    }
     const char * sched_name = getenv("STREAMLLM_SCHEDULER");
     g_runtime = std::make_unique<StreamllmRuntime>(
         cap, /*device=*/0, /*copy_stream=*/true, sched_name);
@@ -253,6 +272,13 @@ bool install_for_gguf(const char * gguf_path) {
         (void *) &streamllm_on_graph_audit_and_score_snapshot_end);
     ggml_cuda_set_user_node_claims_hook(
         (void *) &streamllm_user_node_claims);
+    // Score-table version key for the CUDA-graph cache. Fires once
+    // per cgraph_compute; bumps invalidate the cached graph so a
+    // dial swap (HTTP /streamllm/score_table or phase-aware
+    // reasoning→generation transition) re-captures with the new
+    // grid dims instead of replaying the stale graph.
+    ggml_cuda_set_streamllm_score_version_hook(
+        (void *) &streamllm_replay_score_table_version);
     return true;
 }
 
@@ -305,6 +331,15 @@ extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     // missing capture speedup doesn't matter for streamllm's use
     // case.
     if (node == nullptr) return false;
+    // Benchmark/score-mode opt-in: operator has set
+    // STREAMLLM_ALLOW_CAPTURE=1 AND STREAMLLM_VRAM_CAP_MB large
+    // enough to fit every chunk (verified by the scheduler's
+    // on_install assert). Skip the per-node claim so ggml-cuda can
+    // capture the cgraph; dial swaps are picked up by the score-
+    // version hook, which invalidates the cached graph.
+    if (g_streamllm_allow_capture.load(std::memory_order_relaxed)) {
+        return false;
+    }
     // Sentinel nodes (Mode A S5) are unambiguously claimed by name
     // and don't need a scheduler hop. Recognising them here keeps
     // the user-node-claims contract tight even if the scheduler's
@@ -316,6 +351,17 @@ extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return false;
     return g_runtime->scheduler().claims_node(node);
+}
+
+extern "C" uint64_t streamllm_replay_score_table_version(void) {
+    // Hot path: called by ggml-cuda's graph-update predicate once
+    // per cgraph_compute. The runtime's atomic version field is
+    // refreshed in MoEScheduler::on_graph_compute_begin alongside
+    // the dial snapshot, so it stays consistent with the kernels'
+    // grid dims for the current capture window.
+    std::lock_guard<std::mutex> lk(g_runtime_mu);
+    if (!g_runtime) return 0;
+    return g_runtime->replay_score_table_version();
 }
 
 // streamllm_claims_tensor extern-C was retired with the fusion_skip
@@ -485,6 +531,8 @@ void clear() {
     ggml_cuda_set_graph_compute_begin_hook(nullptr);
     ggml_cuda_set_graph_compute_end_hook(nullptr);
     ggml_cuda_set_user_node_claims_hook(nullptr);
+    ggml_cuda_set_streamllm_score_version_hook(nullptr);
+    g_streamllm_allow_capture.store(false, std::memory_order_relaxed);
 
     // Mode A milestone 1, S1: null every bound model's streamllm_executor
     // slot BEFORE g_executor.reset() runs. Otherwise a live model could

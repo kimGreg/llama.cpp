@@ -578,4 +578,118 @@ void launch_weighted_reduce_slots(
         slot_out, weights, layer_out, n_tokens, n_used, M);
 }
 
+// ─── Capture-mode plan kernel ────────────────────────────────────────
+//
+// One thread block per expert. Threads in the block stride-scan the
+// (n_tokens × n_used) ids matrix looking for routes to `eid`; for each
+// match they compute the gate score (weights[t,u] if available, else
+// probs[t, eid], else a deterministic fallback that matches the host
+// plan's "no real scores" branch), and reduce per-block via shared-
+// memory atomicMax on the float bit pattern. After the reduction, thread
+// 0 maps the max gate to chunks → planes and writes
+// planes_per_eid_d[eid].
+//
+// `g` is non-negative (renormalised weights / probs from softmax), so
+// the `__float_as_uint` ordering matches the actual float ordering for
+// atomicMax. Sentinel "no route found" leaves the block's s_max_bits at
+// 0 → falls into the "unrouted: max planes" branch, which matches the
+// host pre-fill behaviour in MoEMatMulComp::on_install.
+namespace {
+
+__global__ void k_plan_per_expert_planes(
+    const int32_t * __restrict__ ids,
+    const float   * __restrict__ weights,
+    const float   * __restrict__ probs,
+    const float   * __restrict__ thresholds,
+    int n_tokens,
+    int n_used,
+    int n_expert,
+    int n_tiers,
+    int n_chunks_max,
+    int base_p,
+    int any_precision,
+    int * __restrict__ planes_per_eid)
+{
+    const int eid = (int) blockIdx.x;
+    if (eid >= n_expert) return;
+
+    __shared__ unsigned int s_max_bits;
+    __shared__ int          s_any;
+    if (threadIdx.x == 0) {
+        s_max_bits = 0u;          // __float_as_uint(0.0f)
+        s_any      = 0;
+    }
+    __syncthreads();
+
+    const int total = n_tokens * n_used;
+    for (int idx = (int) threadIdx.x; idx < total; idx += (int) blockDim.x) {
+        const int e = ids[idx];
+        if (e != eid) continue;
+        atomicExch(&s_any, 1);
+
+        float g;
+        if (weights != nullptr) {
+            g = weights[idx];
+        } else if (probs != nullptr) {
+            const int t = idx / n_used;
+            g = probs[t * n_expert + eid];
+        } else {
+            const int u = idx % n_used;
+            g = 0.45f - 0.05f * (float) u;
+            if (g < 0.05f) g = 0.05f;
+        }
+        if (g < 0.0f) g = 0.0f;   // keep __float_as_uint ordering valid
+        atomicMax(&s_max_bits, __float_as_uint(g));
+    }
+    __syncthreads();
+
+    if (threadIdx.x != 0) return;
+
+    int chunks;
+    if (s_any == 0) {
+        chunks = n_chunks_max;
+    } else {
+        const float g = __uint_as_float(s_max_bits);
+        int k = -1;
+        for (int i = n_tiers - 1; i >= 0; --i) {
+            if (g >= thresholds[i]) { k = i; break; }
+        }
+        chunks = (k < 0) ? n_chunks_max : (k + 1);
+        if (chunks < 1)            chunks = 1;
+        if (chunks > n_chunks_max) chunks = n_chunks_max;
+    }
+    int planes = any_precision ? (base_p + chunks - 1) : chunks;
+    if (planes < 1) planes = 1;
+    planes_per_eid[eid] = planes;
+}
+
+}  // anon
+
+void launch_plan_per_expert_planes(
+    const int32_t * ids_d,
+    const float   * weights_d,
+    const float   * probs_d,
+    const float   * thresholds_d,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             n_tiers,
+    int             n_chunks_max,
+    int             base_p,
+    bool            any_precision,
+    int *           planes_per_eid_d,
+    StreamHandle    stream)
+{
+    if (n_expert <= 0 || planes_per_eid_d == nullptr) return;
+    if (ids_d == nullptr || thresholds_d == nullptr) return;
+    if (n_tokens <= 0 || n_used <= 0 || n_tiers <= 0) return;
+    const unsigned grid  = (unsigned) n_expert;
+    const unsigned block = 256u;
+    k_plan_per_expert_planes<<<grid, block, 0, (cudaStream_t) stream>>>(
+        ids_d, weights_d, probs_d, thresholds_d,
+        n_tokens, n_used, n_expert, n_tiers,
+        n_chunks_max, base_p, any_precision ? 1 : 0,
+        planes_per_eid_d);
+}
+
 }}  // namespace streamllm_ext::qwen3

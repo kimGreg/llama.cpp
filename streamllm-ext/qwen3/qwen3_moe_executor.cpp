@@ -331,59 +331,17 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_three_canonicals_(
 
     const auto _t_disp_start = std::chrono::steady_clock::now();
 
-    // ── Phase 0a: enqueue pre_inputs D2Hs for all three canonicals.
-    //    Each canonical's pre_inputs writes to its own pinned arrays;
-    //    we're issuing 3× D2H_ids + 3× D2H_probs + 3× D2H_weights but
-    //    serialised on one stream and followed by ONE sync.
-    for (auto & c : canon) {
-        for (auto & m : c.comp->pre_inputs(*c.in)) {
-            if (m.bytes == 0) continue;
-            if (m.is_2d) {
-                launch_diag::note_launch(launch_diag::Kind::Memcpy2DAsync);
-                cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
-                    m.device_src, m.src_pitch,
-                    m.bytes, m.height,
-                    cudaMemcpyDeviceToHost, stream);
-            } else {
-                launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
-                cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
-                    cudaMemcpyDeviceToHost, stream);
-            }
-        }
-    }
+    // Capture-mode fast path: every chunk is already pinned (scheduler
+    // asserted this at install) so the load_set is permanently empty,
+    // and the only remaining host dependency is the per-expert chunk-
+    // count for the GEMV kernel. Compute that ON-DEVICE via
+    // launch_plan_per_expert_planes — no D2H, no cudaStreamSynchronize,
+    // no host plan, no reservation. Phase 0a-0f collapse into one
+    // kernel launch per canonical.
+    const bool capture_path =
+        qwen3::scheduler_allow_capture(rt_->scheduler());
 
-    // ── Phase 0b: single sync — host now sees the routed ids/probs/
-    //    weights for every comp.
-    launch_diag::note_stream_sync();
-    cudaStreamSynchronize(stream);
-
-    // ── Phase 0c: plan all three.
-    ChunkPlan plan_gate = gate_comp.plan(in_gate);
-    ChunkPlan plan_up   = up_comp.plan(in_up);
-    ChunkPlan plan_down = down_comp.plan(in_down);
-
-    auto count_residency = [&](const ChunkPlan & pl) {
-        if (pl.required_set.empty()) return;
-        size_t hits = 0;
-        for (const auto & k : pl.required_set) {
-            if (rt_->pool().is_resident(k.wid, k.cid)) ++hits;
-        }
-        rt_->pool().note_required_set(pl.required_set.size(), hits);
-    };
-    count_residency(plan_gate);
-    count_residency(plan_up);
-    count_residency(plan_down);
-
-    // ── Phase 0d: reserve the union of all three required_sets.
-    auto reserve_plan = [&](const ChunkPlan & pl) {
-        for (const auto & k : pl.required_set) {
-            qwen3::scheduler_reserve_for_dispatch(
-                rt_->scheduler(), k.wid, k.cid);
-        }
-    };
-    reserve_plan(plan_gate);
-    reserve_plan(plan_up);
-    reserve_plan(plan_down);
+    ChunkPlan plan_gate, plan_up, plan_down;
 
     auto release_all = [&]() {
         for (const auto & k : plan_gate.required_set) {
@@ -400,73 +358,135 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_three_canonicals_(
         }
     };
 
-    // ── Phase 0e: submit the union of all three load_sets as a single
-    //    batch.  Gate/up/down canonical names are distinct (e.g.
-    //    "blk.0.ffn_gate_exps.weight:e5" vs ".ffn_up_..." vs
-    //    ".ffn_down_..."), so cross-plan dedupe isn't needed — each
-    //    plan's own ``issued_keys`` already removed intra-plan dupes
-    //    in the comp.plan code.  The pool is_resident probe still
-    //    short-circuits chunks that landed in a prior layer.
-    const size_t union_size =
-        plan_gate.load_set.size() +
-        plan_up.load_set.size() +
-        plan_down.load_set.size();
-
-    if (union_size > 0) {
-        launch_diag::note_load_set(union_size);
-        const bool async_on = rt_->io_worker_count() > 0;
-        if (async_on) {
-            auto batch = std::make_shared<std::atomic<uint32_t>>(0);
-            auto submit_plan = [&](const ChunkPlan & pl) {
-                for (const auto & k : pl.load_set) {
-                    if (rt_->pool().is_resident(k.wid, k.cid)) continue;
-                    rt_->submit_async_load(k.wid, k.cid, batch);
-                }
-            };
-            submit_plan(plan_gate);
-            submit_plan(plan_up);
-            submit_plan(plan_down);
-            launch_diag::note_async_load_wait();
-            rt_->wait_async_load_batch(batch);
-        } else {
-            auto move_plan = [&](const ChunkPlan & pl) {
-                for (const auto & k : pl.load_set) {
-                    if (rt_->pool().is_resident(k.wid, k.cid)) continue;
-                    rt_->move_chunk(k.wid, k.cid, Tier::RAM, Tier::VRAM,
-                                    /*compute_stream=*/nullptr);
-                }
-            };
-            move_plan(plan_gate);
-            move_plan(plan_up);
-            move_plan(plan_down);
+    if (capture_path) {
+        // Set per-canonical dims (cur_n_tokens_ / cur_n_used_ / etc.)
+        // by calling pre_inputs and discarding its MemcpySpec list. We
+        // don't issue any D2H — but execute() short-circuits when the
+        // dims aren't set, so this side effect is required. The plan
+        // kernel itself runs inside execute() after the ids D2D copy.
+        for (auto & c : canon) {
+            (void) c.comp->pre_inputs(*c.in);
         }
-        // wait_on_stream per chunk.  pool.wait_on_stream is a no-op
-        // when ready_event is null (already waited or never had one),
-        // so re-walking the load_sets per canonical is safe and avoids
-        // a dedupe pass.
-        auto wait_plan = [&](const ChunkPlan & pl) {
-            for (const auto & k : pl.load_set) {
-                rt_->pool().wait_on_stream(k.wid, k.cid, stream_h);
+    } else {
+        // ── Phase 0a: enqueue pre_inputs D2Hs for all three canonicals.
+        //    Each canonical's pre_inputs writes to its own pinned arrays;
+        //    we're issuing 3× D2H_ids + 3× D2H_probs + 3× D2H_weights but
+        //    serialised on one stream and followed by ONE sync.
+        for (auto & c : canon) {
+            for (auto & m : c.comp->pre_inputs(*c.in)) {
+                if (m.bytes == 0) continue;
+                if (m.is_2d) {
+                    launch_diag::note_launch(launch_diag::Kind::Memcpy2DAsync);
+                    cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
+                        m.device_src, m.src_pitch,
+                        m.bytes, m.height,
+                        cudaMemcpyDeviceToHost, stream);
+                } else {
+                    launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
+                    cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
+                        cudaMemcpyDeviceToHost, stream);
+                }
+            }
+        }
+
+        // ── Phase 0b: single sync — host now sees the routed ids/probs/
+        //    weights for every comp.
+        launch_diag::note_stream_sync();
+        cudaStreamSynchronize(stream);
+
+        // ── Phase 0c: plan all three.
+        plan_gate = gate_comp.plan(in_gate);
+        plan_up   = up_comp.plan(in_up);
+        plan_down = down_comp.plan(in_down);
+
+        auto count_residency = [&](const ChunkPlan & pl) {
+            if (pl.required_set.empty()) return;
+            size_t hits = 0;
+            for (const auto & k : pl.required_set) {
+                if (rt_->pool().is_resident(k.wid, k.cid)) ++hits;
+            }
+            rt_->pool().note_required_set(pl.required_set.size(), hits);
+        };
+        count_residency(plan_gate);
+        count_residency(plan_up);
+        count_residency(plan_down);
+
+        // ── Phase 0d: reserve the union of all three required_sets.
+        auto reserve_plan = [&](const ChunkPlan & pl) {
+            for (const auto & k : pl.required_set) {
+                qwen3::scheduler_reserve_for_dispatch(
+                    rt_->scheduler(), k.wid, k.cid);
             }
         };
-        wait_plan(plan_gate);
-        wait_plan(plan_up);
-        wait_plan(plan_down);
-    }
+        reserve_plan(plan_gate);
+        reserve_plan(plan_up);
+        reserve_plan(plan_down);
 
-    // ── Phase 0f: validate all three.
-    if (!validate_required_set_(plan_gate, stream_h) ||
-        !validate_required_set_(plan_up,   stream_h) ||
-        !validate_required_set_(plan_down, stream_h))
-    {
-        release_all();
-        std::fprintf(stderr,
-            "streamllm-ext: forward_moe_layer[L=%d] (batched): required_set "
-            "validation failed (gate=%s up=%s down=%s)\n",
-            layer_idx, gate_canonical.c_str(),
-            up_canonical.c_str(), down_canonical.c_str());
-        return false;
-    }
+        // ── Phase 0e: submit the union of all three load_sets as a
+        //    single batch.  Gate/up/down canonical names are distinct
+        //    (e.g. "blk.0.ffn_gate_exps.weight:e5" vs ".ffn_up_..." vs
+        //    ".ffn_down_..."), so cross-plan dedupe isn't needed —
+        //    each plan's own ``issued_keys`` already removed intra-
+        //    plan dupes in the comp.plan code.  The pool is_resident
+        //    probe still short-circuits chunks that landed in a prior
+        //    layer.
+        const size_t union_size =
+            plan_gate.load_set.size() +
+            plan_up.load_set.size() +
+            plan_down.load_set.size();
+
+        if (union_size > 0) {
+            launch_diag::note_load_set(union_size);
+            const bool async_on = rt_->io_worker_count() > 0;
+            if (async_on) {
+                auto batch = std::make_shared<std::atomic<uint32_t>>(0);
+                auto submit_plan = [&](const ChunkPlan & pl) {
+                    for (const auto & k : pl.load_set) {
+                        if (rt_->pool().is_resident(k.wid, k.cid)) continue;
+                        rt_->submit_async_load(k.wid, k.cid, batch);
+                    }
+                };
+                submit_plan(plan_gate);
+                submit_plan(plan_up);
+                submit_plan(plan_down);
+                launch_diag::note_async_load_wait();
+                rt_->wait_async_load_batch(batch);
+            } else {
+                auto move_plan = [&](const ChunkPlan & pl) {
+                    for (const auto & k : pl.load_set) {
+                        if (rt_->pool().is_resident(k.wid, k.cid)) continue;
+                        rt_->move_chunk(k.wid, k.cid, Tier::RAM, Tier::VRAM,
+                                        /*compute_stream=*/nullptr);
+                    }
+                };
+                move_plan(plan_gate);
+                move_plan(plan_up);
+                move_plan(plan_down);
+            }
+            auto wait_plan = [&](const ChunkPlan & pl) {
+                for (const auto & k : pl.load_set) {
+                    rt_->pool().wait_on_stream(k.wid, k.cid, stream_h);
+                }
+            };
+            wait_plan(plan_gate);
+            wait_plan(plan_up);
+            wait_plan(plan_down);
+        }
+
+        // ── Phase 0f: validate all three.
+        if (!validate_required_set_(plan_gate, stream_h) ||
+            !validate_required_set_(plan_up,   stream_h) ||
+            !validate_required_set_(plan_down, stream_h))
+        {
+            release_all();
+            std::fprintf(stderr,
+                "streamllm-ext: forward_moe_layer[L=%d] (batched): required_set "
+                "validation failed (gate=%s up=%s down=%s)\n",
+                layer_idx, gate_canonical.c_str(),
+                up_canonical.c_str(), down_canonical.c_str());
+            return false;
+        }
+    }  // !capture_path
 
     // Record dispatch time once for the whole batched phase, but
     // attribute it 3-way to keep the per-dispatch average comparable
