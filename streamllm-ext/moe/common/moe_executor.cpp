@@ -13,7 +13,7 @@
 // on — the body does NOT take g_runtime_mu. The runtime's internal
 // state (pool, scheduler, layouts) carries its own thread-safety.
 
-#include "qwen3_executor.h"
+#include "moe_executor.h"
 #include "dispatch.h"        // scratch_for_stream, topk_weights_lookup, profile_inc_hook_calls
 #include "fused_kernels.h"           // launch_swiglu_mul, launch_weighted_reduce_slots
 #include "matmul_comp.h"     // MoEMatMulComp, MoEInput/Output
@@ -43,9 +43,9 @@
 
 namespace streamllm_ext { namespace qwen3 {
 
-std::atomic<std::uint64_t> Qwen3MoEAnyBcqExecutor::required_set_misses_{0};
+std::atomic<std::uint64_t> MoEAnyBcqExecutor::required_set_misses_{0};
 
-Qwen3MoEAnyBcqExecutor::~Qwen3MoEAnyBcqExecutor()
+MoEAnyBcqExecutor::~MoEAnyBcqExecutor()
 {
     std::lock_guard<std::mutex> lk(slot_scratch_mu_);
     for (auto & [_, ss] : slot_scratch_) {
@@ -55,7 +55,7 @@ Qwen3MoEAnyBcqExecutor::~Qwen3MoEAnyBcqExecutor()
     slot_scratch_.clear();
 }
 
-void Qwen3MoEAnyBcqExecutor::bind_to_model(
+void MoEAnyBcqExecutor::bind_to_model(
     StreamllmRuntime &  rt,
     const StreamReader & /*reader*/,
     const std::string &  /*gguf_path*/)
@@ -63,7 +63,7 @@ void Qwen3MoEAnyBcqExecutor::bind_to_model(
     rt_ = &rt;
 }
 
-SlotScratch * Qwen3MoEAnyBcqExecutor::acquire_slot_scratch_(
+SlotScratch * MoEAnyBcqExecutor::acquire_slot_scratch_(
     unsigned long long stream_key,
     int                n_tokens,
     int                n_used,
@@ -109,7 +109,7 @@ SlotScratch * Qwen3MoEAnyBcqExecutor::acquire_slot_scratch_(
     return &ss;
 }
 
-bool Qwen3MoEAnyBcqExecutor::validate_required_set_(
+bool MoEAnyBcqExecutor::validate_required_set_(
     const ChunkPlan & plan,
     StreamHandle      stream) const
 {
@@ -254,7 +254,7 @@ bool Qwen3MoEAnyBcqExecutor::validate_required_set_(
 //     have distinct synthetic wids by construction, so the per-plan
 //     load_sets don't collide; the pool's resident-skip handles any
 //     overlap defensively.
-bool Qwen3MoEAnyBcqExecutor::dispatch_three_canonicals_(
+bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
     qwen3::MoEMatMulComp & gate_comp,
     qwen3::MoEMatMulComp & up_comp,
     qwen3::MoEMatMulComp & down_comp,
@@ -543,7 +543,7 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_three_canonicals_(
 //   slot_b  [n_tokens, n_used, n_ff]      f32 — up output → SwiGLU result
 //   slot_a  [n_tokens, n_used, hidden]    f32 — down output (reused buffer)
 //   layer_out [n_tokens, hidden]          f32 — weighted reduce target
-bool Qwen3MoEAnyBcqExecutor::forward_moe_layer(
+bool MoEAnyBcqExecutor::forward_moe_layer(
     StreamHandle        stream_h,
     const ggml_tensor * layer_in,
     const ggml_tensor * ids,
@@ -713,7 +713,7 @@ bool Qwen3MoEAnyBcqExecutor::forward_moe_layer(
 // per-layer ffn_gate_inp pointers for a post-M1 move; M1 does not
 // read from this cache (router/topk is built by the arch builder
 // in S5 using the shared helper).
-void Qwen3MoEAnyBcqExecutor::attach_router_gates(
+void MoEAnyBcqExecutor::attach_router_gates(
     const struct ggml_tensor * const * ffn_gate_inp_per_layer,
     int                                n_layer)
 {
@@ -725,16 +725,31 @@ void Qwen3MoEAnyBcqExecutor::attach_router_gates(
     }
 }
 
+}  // namespace qwen3
+}  // namespace streamllm_ext
+
+// ───────────────────────────────────────────────────────────────────
+// Per-arch register entry points (each is a thin shim that creates
+// its arch's subclass instance).  Forward-declared here so the
+// legacy ``register_qwen3_moe_anybcq_executor`` below can fan out
+// without pulling per-arch headers into this TU.
+// ───────────────────────────────────────────────────────────────────
+namespace streamllm_ext {
+namespace qwen3        { void register_qwen3_moe_executor();     }
+namespace deepseek_moe { void register_deepseek_moe_executor();  }
+namespace gemma_4      { void register_gemma4_moe_executor();    }
+
+namespace qwen3 {
+
 void register_qwen3_moe_anybcq_executor() {
-    static bool once = false;
-    if (once) return;
-    once = true;
-    register_executor(
-        "qwen3_moe_anybcq_v1",
-        []() -> std::unique_ptr<ModelExecutor> {
-            return std::unique_ptr<ModelExecutor>(
-                new Qwen3MoEAnyBcqExecutor());
-        });
+    // Legacy compat: a single call from ``runtime_glue.cpp`` covers
+    // every supported arch.  Each per-arch register_*() is itself
+    // idempotent (static once-flag), so the legacy entry can be
+    // invoked alongside direct per-arch calls without
+    // double-registration risk.
+    qwen3::register_qwen3_moe_executor();
+    deepseek_moe::register_deepseek_moe_executor();
+    gemma_4::register_gemma4_moe_executor();
 }
 
 }}  // namespace streamllm_ext::qwen3

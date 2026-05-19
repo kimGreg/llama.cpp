@@ -44,7 +44,10 @@ if (GGML_CUDA)
         moe/common/runtime_glue.cpp
         moe/common/dispatch.cpp
         moe/common/matmul_comp.cpp
-        moe/qwen3/qwen3_executor.cpp
+        moe/common/moe_executor.cpp
+        moe/qwen3/qwen3_moe_executor.cpp
+        moe/deepseek_moe/deepseek_moe_executor.cpp
+        moe/gemma_4/gemma4_moe_executor.cpp
     )
 endif()
 

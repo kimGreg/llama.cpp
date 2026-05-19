@@ -22,7 +22,7 @@
 
 #pragma once
 
-#include "qwen3_executor.h"
+#include "moe_executor.h"
 
 #include <cuda_runtime.h>
 

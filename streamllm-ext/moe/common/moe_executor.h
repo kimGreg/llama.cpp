@@ -49,10 +49,10 @@ struct SlotScratch {
     size_t  slot_b_bytes = 0;
 };
 
-class Qwen3MoEAnyBcqExecutor : public ModelExecutor {
+class MoEAnyBcqExecutor : public ModelExecutor {
 public:
-    Qwen3MoEAnyBcqExecutor() = default;
-    ~Qwen3MoEAnyBcqExecutor() override;
+    MoEAnyBcqExecutor() = default;
+    ~MoEAnyBcqExecutor() override;
 
     const char * name() const override { return "qwen3_moe_anybcq_v1"; }
 
@@ -171,9 +171,18 @@ private:
         int                        layer_idx);
 };
 
-// Static-init registration.  Called from qwen3_runtime_glue's
-// ``install_for_gguf`` (idempotent) so the executor is registered
-// before ``make_executor("qwen3_moe_anybcq_v1")`` runs.
+// Back-compat alias.  The class was renamed in the 2026-05-20
+// multi-arch refactor; callers that still spell the old name keep
+// working transparently.
+using Qwen3MoEAnyBcqExecutor = MoEAnyBcqExecutor;
+
+// Legacy registration entry retained for runtime_glue.cpp call sites
+// that haven't moved to the per-arch register_*_executor() functions
+// in ``moe/{qwen3,deepseek_moe,gemma_4}/<arch>_executor.cpp``.  This
+// function registers ALL per-arch aliases (qwen3_anybcq_v1,
+// qwen3_moe_anybcq_v1 legacy, deepseek_anybcq_v1, gemma4_anybcq_v1,
+// qwen35_anybcq_v1, qwen36_anybcq_v1) so a single call covers every
+// supported model.  Idempotent.
 void register_qwen3_moe_anybcq_executor();
 
 }  // namespace qwen3

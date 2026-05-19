@@ -10,7 +10,7 @@
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "stream_reader.h"
-#include "qwen3_executor.h"
+#include "moe_executor.h"
 #include "anybcq_gemm.h"
 
 #include "dispatch.h"
@@ -239,22 +239,19 @@ bool install_for_gguf(const char * gguf_path) {
     g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
     g_required_runtime_was_true = reader.global().required_runtime;
 
-    // Per-arch activation install.  Today's only executor is the
-    // Qwen3-MoE AnyBCQ one but its SwiGLU stage supports SiLU/GELU
-    // selection — we pick based on the GGUF arch so a streamllm-
-    // encoded Gemma-4 (LLM_ARCH_GEMMA4) gets the right elementwise
-    // op without a per-arch executor.
-    if (auto * exec_qwen3 =
-            dynamic_cast<qwen3::Qwen3MoEAnyBcqExecutor *>(g_executor.get())) {
-        if (gguf_arch == "gemma4") {
-            exec_qwen3->set_activation(qwen3::Activation::GELU);
-        } else {
-            exec_qwen3->set_activation(qwen3::Activation::SiLU);
-        }
+    // Per-arch activation is now set in the executor subclass's
+    // constructor (Qwen3MoEExecutor → SiLU, DeepSeekMoEExecutor →
+    // SiLU, Gemma4MoEExecutor → GELU).  The class identity is implied
+    // by the GGUF's ``streamllm.executor`` field; the dynamic-cast
+    // auto-select path that used to live here is gone.  Log the arch
+    // + activation for greppable provenance.
+    if (auto * exec_moe =
+            dynamic_cast<qwen3::MoEAnyBcqExecutor *>(g_executor.get())) {
         std::fprintf(stderr,
-            "streamllm-ext: gguf_arch='%s' → activation=%s\n",
+            "streamllm-ext: gguf_arch='%s' executor='%s' activation=%s\n",
             gguf_arch.c_str(),
-            exec_qwen3->activation() == qwen3::Activation::GELU ? "GELU" : "SiLU");
+            g_executor->name(),
+            exec_moe->activation() == qwen3::Activation::GELU ? "GELU" : "SiLU");
     }
 
     std::fprintf(stderr,
