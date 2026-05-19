@@ -15,7 +15,8 @@
 
 #pragma once
 
-#include "executor.h"
+#include "executor.h"          // ModelExecutor base
+#include "fused_kernels.h"     // Activation
 
 #include <atomic>
 #include <cstdint>
@@ -30,7 +31,7 @@ struct ChunkKey;        // core/vram_pool.h
 struct ChunkPlan;       // core/computation.h
 
 namespace qwen3 {
-class MoEMatMulComp;    // qwen3/qwen3_moe_matmul_comp.h
+class MoEMatMulComp;    // qwen3/matmul_comp.h
 
 // Per-stream slot scratch consumed by forward_moe_layer (S6). One
 // pair of F32 device buffers per compute stream: ``slot_a`` is the
@@ -101,12 +102,20 @@ public:
     // the extern-C ``streamllm_stat_required_set_misses`` accessor.
     static std::atomic<std::uint64_t> required_set_misses_;
 
+    // Per-arch activation for the SwiGLU stage between gate/up and
+    // down matmuls.  Default SiLU matches Qwen3-MoE + DeepSeek-V2;
+    // Gemma 4 MoE installs GELU at bind time.  Setter is host-only
+    // and read once per ``forward_moe_layer`` call.
+    void set_activation(Activation a) { activation_ = a; }
+    Activation activation() const { return activation_; }
+
 private:
     // ``probe_probs_tensor_`` was retired with the legacy
     // ``forward_moe_block`` body — the sentinel carries probs through
     // ``src[2]`` directly.
 
     StreamllmRuntime * rt_ = nullptr;
+    Activation activation_ = Activation::SiLU;
 
     // M1 cutover S2: cached per-layer ffn_gate_inp pointers from
     // attach_router_gates. Empty until S5 wires the install path

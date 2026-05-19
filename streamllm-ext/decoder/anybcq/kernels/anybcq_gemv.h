@@ -12,7 +12,7 @@
 // and any-prec layouts respectively — encoder-specific staging only.
 //
 // MoE-fused dispatch is NOT here. Fusion across MoE experts is an
-// architecture-specific optimisation; see ``qwen3/qwen3_moe_fused.h``.
+// architecture-specific optimisation; see ``qwen3/fused_kernels.h``.
 //
 // Callers in core/, qwen3/, and tests include only this header.
 

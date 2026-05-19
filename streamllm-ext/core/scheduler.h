@@ -3,7 +3,7 @@
 // The framework manages chunked tensors via two encoder/architecture-
 // blind ABCs (ChunkedTensor, ChunkedComputation) and one global brain:
 // the Scheduler.  Concrete schedulers live in model subtrees (e.g.
-// qwen3::MoEScheduler in qwen3/qwen3_moe_scheduler.cpp).
+// qwen3::MoEScheduler in qwen3/scheduler.cpp).
 //
 // Narrow surface — six virtuals total:
 //
@@ -24,7 +24,7 @@
 //
 // Model-specific entry points (per-op dispatch, MoE expert tables,
 // score-policy snapshot/replace) are exposed as free-function
-// accessors in the model layer's header (qwen3/qwen3_moe_scheduler.h's
+// accessors in the model layer's header (qwen3/scheduler.h's
 // scheduler_handle_mul_mat / scheduler_set_score_table / etc.). Each
 // downcasts internally; core stays free of model vtable contracts.
 //
@@ -50,11 +50,11 @@ class StreamllmRuntime;
 
 // Decoder-neutral per-MoE-tensor expert pointer table.  The fused
 // kernel that consumes it is architecture-specific (see
-// ``qwen3/qwen3_moe_fused.h``); the *struct* is encoder/architecture-
+// ``qwen3/fused_kernels.h``); the *struct* is encoder/architecture-
 // agnostic — three device-pointer arrays indexed by expert id —
 // so a forward decl here keeps core's contract free of architecture
 // types while letting model-side schedulers expose getters via the
-// free-function accessors in qwen3_moe_scheduler.h.
+// free-function accessors in scheduler.h.
 struct MoeExpertTable;
 
 // Storage tier for a chunk.  move_chunk(wid, cid, src, dst) currently

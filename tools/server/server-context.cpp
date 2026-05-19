@@ -35,6 +35,15 @@ bool streamllm_get_score_table(
 } // namespace streamllm_ext
 using streamllm_ext::streamllm_get_score_table;
 
+// streamllm-ext gradual-schedule API. The /streamllm/schedule POST
+// route writes via streamllm_schedule_set; sampling.cpp reads on each
+// common_sampler_init.
+extern "C" bool streamllm_schedule_set(
+    const int * thresholds, int n_thresh,
+    const float * dials_flat, const int * dial_lens, int n_dials);
+extern "C" void streamllm_schedule_clear(void);
+extern "C" bool streamllm_schedule_active(void);
+
 // /streamllm/stats accessors. Each is a single atomic read from the
 // streamllm-ext runtime; safe to call at high frequency.
 extern "C" {
@@ -4233,6 +4242,68 @@ void server_routes::init_routes() {
         res->ok({{"thresholds", th}});
         return res;
     };
+
+    // streamllm-ext gradual-schedule API (Pareto-orchestrator path).
+    // Two POST shapes:
+    //   {"clear": true}                  → streamllm_schedule_clear
+    //   {"thresholds":[...], "dials":[[...]]} → streamllm_schedule_set
+    // |dials| must equal |thresholds|+1; thresholds must be strictly
+    // ascending non-negative ints; each dial is a list of floats in
+    // [0, 1]. Returns 400 on shape/order violations.  Sampler init
+    // reads the runtime state on each new request, so a swap here is
+    // visible to the next /v1/chat/completions call.
+    this->post_streamllm_schedule = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        bool ctx_server; GGML_UNUSED(ctx_server);
+        const json body = json::parse(req.body);
+        if (body.is_object() && body.value("clear", false)) {
+            streamllm_schedule_clear();
+            res->ok({{"status", "cleared"}});
+            return res;
+        }
+        if (!body.is_object() ||
+            !body.contains("thresholds") || !body["thresholds"].is_array() ||
+            !body.contains("dials")      || !body["dials"].is_array())
+        {
+            res->error(format_error_response(
+                "body must be {\"thresholds\":[ints],\"dials\":[[floats],...]} "
+                "with |dials|=|thresholds|+1 (or {\"clear\":true})",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<int>   thr;
+        std::vector<float> flat;
+        std::vector<int>   lens;
+        for (const auto & v : body["thresholds"]) thr.push_back(v.get<int>());
+        for (const auto & dial : body["dials"]) {
+            if (!dial.is_array()) {
+                res->error(format_error_response(
+                    "each entry of 'dials' must be an array of floats",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            int n = 0;
+            for (const auto & v : dial) { flat.push_back(v.get<float>()); ++n; }
+            lens.push_back(n);
+        }
+        if (!streamllm_schedule_set(
+                thr.data(), (int) thr.size(),
+                flat.data(), lens.data(), (int) lens.size()))
+        {
+            res->error(format_error_response(
+                "streamllm: schedule_set rejected (thresholds must be "
+                "ascending, |dials|=|thresholds|+1, all dial lengths > 0)",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok({
+            {"thresholds", thr},
+            {"n_dials",    (int) lens.size()},
+            {"status",     "applied"},
+        });
+        return res;
+    };
+
 
     // /streamllm/stats — realtime cache + prefetch counters. Each
     // accessor is a single atomic load, so polling at 1 Hz adds

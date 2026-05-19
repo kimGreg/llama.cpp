@@ -204,6 +204,7 @@ int main(int argc, char ** argv) {
     // streamllm-ext live precision dial + realtime stats
     ctx_http.get ("/streamllm/score_table",    ex_wrapper(routes.get_streamllm_score_table));
     ctx_http.post("/streamllm/score_table",    ex_wrapper(routes.post_streamllm_score_table));
+    ctx_http.post("/streamllm/schedule",       ex_wrapper(routes.post_streamllm_schedule));
     ctx_http.get ("/streamllm/stats",          ex_wrapper(routes.get_streamllm_stats));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));

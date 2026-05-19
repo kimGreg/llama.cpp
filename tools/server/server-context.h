@@ -129,6 +129,16 @@ struct server_routes {
     // using the snapshot it took at entry, so output never tears.
     server_http_context::handler_t post_streamllm_score_table;
     server_http_context::handler_t get_streamllm_score_table;
+    // Schedule API — runtime-mutable token-count-keyed dial sequence
+    // (generalises score_table + phase-aware).  POST a JSON body with
+    // {"thresholds":[int,...], "dials":[[float,...], ...]} where
+    // |dials|=|thresholds|+1. Optional {"clear": true} body clears
+    // the schedule (sampler falls back to env or fixed dial).
+    //
+    // Note: KV-cache flush between configs is NOT a separate endpoint
+    // — set ``"cache_prompt": false`` in the /v1/chat/completions
+    // body and the slot's prompt cache is bypassed for that request.
+    server_http_context::handler_t post_streamllm_schedule;
     server_http_context::handler_t get_streamllm_stats;
 private:
     std::unique_ptr<server_res_generator> handle_completions_impl(

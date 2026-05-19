@@ -15,7 +15,7 @@
 //
 // Exits 0 on success, 1 on first mismatch.
 
-#include "qwen3_moe_fused.h"   // launch_swiglu_mul
+#include "fused_kernels.h"   // launch_swiglu_mul
 
 #include <cuda_runtime.h>
 

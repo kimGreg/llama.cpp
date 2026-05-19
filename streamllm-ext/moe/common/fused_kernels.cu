@@ -3,7 +3,7 @@
 // Architecture-specific kernel-fusion. See moe_fused.h for the layer
 // placement rationale.
 
-#include "qwen3_moe_fused.h"
+#include "fused_kernels.h"
 #include "launch_diag.h"
 
 #include <cuda_runtime.h>
@@ -473,6 +473,22 @@ namespace {
 constexpr int kSwigluThreads = 256;
 constexpr int kSwigluPerThread = 4;
 
+__device__ __forceinline__ float act_silu(float x) {
+    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    // __expf is the fast-path single-precision intrinsic, matching the
+    // existing Qwen3-MoE numerics.
+    return x / (1.0f + __expf(-x));
+}
+
+__device__ __forceinline__ float act_gelu_tanh(float x) {
+    // tanh-approximation GELU (matches ggml_cuda_op_gelu_single and
+    // HF transformers' "gelu_pytorch_tanh", used by Gemma 4 MoE).
+    constexpr float COEF_A    = 0.044715f;
+    constexpr float SQRT_2_PI = 0.79788456080286535587989211986876f;
+    return 0.5f * x * (1.0f + tanhf(SQRT_2_PI * x * (1.0f + COEF_A * x * x)));
+}
+
+template <Activation A>
 __global__ void k_swiglu_mul(
     const float * __restrict__ slot_gate,
     const float * __restrict__ slot_up,
@@ -488,10 +504,8 @@ __global__ void k_swiglu_mul(
         if (idx >= N) return;
         const float g = slot_gate[idx];
         const float u = slot_up[idx];
-        // silu(g) = g * sigmoid(g) = g / (1 + exp(-g)).
-        // Use the standard form; CUDA's __expf is fast-path single-precision.
-        const float sig = 1.0f / (1.0f + __expf(-g));
-        slot_out[idx]   = g * sig * u;
+        const float a = (A == Activation::SiLU) ? act_silu(g) : act_gelu_tanh(g);
+        slot_out[idx] = a * u;
     }
 }
 
@@ -502,7 +516,8 @@ void launch_swiglu_mul(
     const float * slot_up,
     float       * slot_out,
     std::size_t   N,
-    StreamHandle  stream)
+    StreamHandle  stream,
+    Activation    act)
 {
     if (N == 0 || slot_gate == nullptr || slot_up == nullptr || slot_out == nullptr) return;
     const std::size_t elems_per_block =
@@ -510,9 +525,20 @@ void launch_swiglu_mul(
     const std::size_t n_blocks = (N + elems_per_block - 1) / elems_per_block;
     streamllm_ext::launch_diag::note_launch(
         streamllm_ext::launch_diag::Kind::SwigluMul);
-    k_swiglu_mul<<<(unsigned) n_blocks, (unsigned) kSwigluThreads,
+    switch (act) {
+        case Activation::SiLU:
+            k_swiglu_mul<Activation::SiLU>
+                <<<(unsigned) n_blocks, (unsigned) kSwigluThreads,
                    0, (cudaStream_t) stream>>>(
-        slot_gate, slot_up, slot_out, N);
+                slot_gate, slot_up, slot_out, N);
+            break;
+        case Activation::GELU:
+            k_swiglu_mul<Activation::GELU>
+                <<<(unsigned) n_blocks, (unsigned) kSwigluThreads,
+                   0, (cudaStream_t) stream>>>(
+                slot_gate, slot_up, slot_out, N);
+            break;
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────

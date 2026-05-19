@@ -6,13 +6,13 @@
 // desired chunk count for each (canonical, expert_id, gate_score)
 // the runtime hook fires.
 
-#include "scheduler.h"
+#include "moe_scheduler.h"
 #include "runtime.h"
 #include "anybcq_gemv.h"
-#include "qwen3_moe_fused.h"   // MoeExpertTable + qwen3::alloc/free_moe_expert_table
-#include "qwen3_moe_matmul_comp.h"  // MoEMatMulComp (registered at install)
-#include "qwen3_moe_residency.h"
-#include "qwen3_moe_dispatch.h"
+#include "fused_kernels.h"   // MoeExpertTable + qwen3::alloc/free_moe_expert_table
+#include "matmul_comp.h"  // MoEMatMulComp (registered at install)
+#include "residency.h"
+#include "dispatch.h"
 // S8 (Mode A): qwen3_graph_instrumenter retired with the legacy
 // MUL_MAT_ID dispatch surface; the include is gone.
 #include "tensor.h"   // anybcq::AnyBCQFamilyTensor (per-tensor pointer-table accessors)
@@ -869,7 +869,7 @@ public:
     // Per-node dispatch is routed through the Scheduler base via
     // claims_node + dispatch_node; this scheduler claims managed
     // MUL_MAT / MUL_MAT_ID nodes and dispatches them through the
-    // existing per-op implementations in qwen3_moe_dispatch.cpp.
+    // existing per-op implementations in dispatch.cpp.
 
     bool claims_node(const struct ggml_tensor * node) const override {
         // streamllm always dispatches managed mul_mat / mul_mat_id
@@ -1345,7 +1345,7 @@ std::unique_ptr<Scheduler> make_scheduler(const char * which) {
     return nullptr;
 }
 
-// ─── Free-function entry points (qwen3_moe_scheduler.h) ───────────
+// ─── Free-function entry points (scheduler.h) ───────────
 //
 // Concrete MoEScheduler is anonymously namespaced above; the dispatch
 // glue calls into it via these typed helpers.  Static-cast is safe

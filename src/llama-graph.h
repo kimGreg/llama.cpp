@@ -136,6 +136,21 @@ ggml_tensor * llm_build_moe_sentinel(
     int            il,
     bool           norm_w = true);
 
+// Pre-routed variant — the caller has already produced ``ids``,
+// ``probs``, ``weights`` (e.g. via a per-arch routing branch with
+// sigmoid gating, ``exp_probs_b`` bias, or a non-trivial logit
+// projection) and just wants the sentinel rail.  Used by arches
+// whose routing math doesn't match the simple softmax+topk path
+// hard-wired in ``llm_build_moe_sentinel``.  Same name + src wiring
+// convention; the dispatch hook can't tell the two variants apart.
+ggml_tensor * llm_build_moe_sentinel_pre_routed(
+    ggml_context * ctx,
+    ggml_tensor *  cur,
+    ggml_tensor *  ids,
+    ggml_tensor *  probs,
+    ggml_tensor *  weights,
+    int            il);
+
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
     // the output embeddings from the encoder as a ggml tensor

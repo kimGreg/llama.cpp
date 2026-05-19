@@ -17,7 +17,7 @@
 //
 // Exits 0 on success, 1 on first mismatch.
 
-#include "qwen3_moe_fused.h"   // launch_weighted_reduce_slots
+#include "fused_kernels.h"   // launch_weighted_reduce_slots
 
 #include <cuda_runtime.h>
 

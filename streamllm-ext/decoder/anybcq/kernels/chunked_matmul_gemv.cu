@@ -13,7 +13,7 @@
 //
 // MoE-fused dispatch (the ``naver_gemv_moe_launch`` kernel + the
 // ``MoeExpertTable`` it reads) is NOT here. Fusion across MoE experts
-// is an architecture decision; see ``qwen3/qwen3_moe_fused.cu``.
+// is an architecture decision; see ``qwen3/fused_kernels.cu``.
 
 #include "anybcq_gemv.h"
 

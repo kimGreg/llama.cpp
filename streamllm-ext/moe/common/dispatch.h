@@ -2,12 +2,12 @@
 //
 // Owned by the scheduler architecturally: MoEScheduler::handle_mul_mat,
 // handle_mul_mat_id and on_topk_moe_observed forward to the *_impl
-// functions declared here. qwen3/qwen3_runtime_glue.cpp's extern-C shims also
+// functions declared here. qwen3/runtime_glue.cpp's extern-C shims also
 // reach the scheduler via Scheduler::handle_*; the scheduler then calls
 // these impls.
 //
 // Lifecycle helpers (size_scratch, free_scratch, print_profile,
-// clear_topk_weights) are called by qwen3/qwen3_runtime_glue.cpp at install
+// clear_topk_weights) are called by qwen3/runtime_glue.cpp at install
 // and clear time.
 
 #pragma once
@@ -55,7 +55,7 @@ int    scratch_batch_n_max();
 // body), ``handle_mul_mat_id_impl``, ``on_topk_moe_observed_impl``,
 // ``topk_weights_lookup``, and ``clear_topk_weights`` — all part of
 // the legacy MUL_MAT_ID / dense interception rails. Sentinel
-// dispatch (qwen3_runtime_glue.cpp ``streamllm_pre_op`` →
+// dispatch (runtime_glue.cpp ``streamllm_pre_op`` →
 // ``forward_moe_layer``) is the only managed-MoE path.
 
 // Per-stream cast scratch sizing. Called once at install_for_gguf;
@@ -70,7 +70,7 @@ void free_scratch();
 void print_profile_if_enabled();
 
 // Step 3 (Milestone 1): increment the MoE dispatch entry counter. The
-// counter itself stays in qwen3_moe_dispatch.cpp alongside the rest of
+// counter itself stays in dispatch.cpp alongside the rest of
 // the profile counters; the executor calls this from
 // forward_moe_block's entry now that the dispatch body lives there.
 // No-op when STREAMLLM_PROFILE is unset (the counter just isn't

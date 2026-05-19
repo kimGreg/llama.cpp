@@ -7,15 +7,16 @@
 // dispatch reservations — is qwen3-specific and lives here.
 //
 // The Qwen3 MoE scheduler implementation is anonymously-namespaced in
-// qwen3_moe_scheduler.cpp.  These free functions expose the typed
-// methods to the dispatch glue (qwen3_moe_dispatch.cpp) without
+// scheduler.cpp.  These free functions expose the typed
+// methods to the dispatch glue (dispatch.cpp) without
 // publishing the full class definition.  Each function takes a
 // reference to the active ``Scheduler`` and downcasts internally —
 // safe because make_scheduler returns exactly one concrete type.
 
 #pragma once
 
-#include "scheduler.h"
+#include "scheduler.h"        // core Scheduler ABC + Plan
+#include "fused_kernels.h"    // MoeExpertTable
 
 #include <string>
 #include <vector>
@@ -85,12 +86,12 @@ void scheduler_after_compute(
 // scheduler_handle_mul_mat / _id, scheduler_on_topk_moe_observed,
 // scheduler_claims_tensor have been removed.  Each was a downcast
 // wrapper for what is now a Scheduler virtual; the per-op extern-C
-// entries in qwen3_runtime_glue.cpp call ``Scheduler::claims_node``
+// entries in runtime_glue.cpp call ``Scheduler::claims_node``
 // / ``Scheduler::dispatch_node`` / ``Scheduler::observe_topk_moe`` /
 // ``Scheduler::claims_tensor`` directly.
 
 // ─── Live precision dial accessors ─────────────────────────────────
-// Score-table snapshot + replace, used by qwen3/qwen3_runtime_glue.cpp's
+// Score-table snapshot + replace, used by qwen3/runtime_glue.cpp's
 // streamllm_set_score_table / streamllm_get_score_table extern-C
 // entry points. Concrete impl on MoEScheduler.
 //

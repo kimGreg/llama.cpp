@@ -23,6 +23,12 @@
 // `streamllm_ext` (see src/CMakeLists.txt:63). Returns false if no
 // streamllm runtime is installed — in that case the call is a no-op.
 extern "C" bool streamllm_set_score_table(const float * thresholds, int n_thresh);
+extern "C" bool streamllm_schedule_active(void);
+namespace streamllm_ext {
+bool streamllm_schedule_get(
+    std::vector<int> *                out_thresholds,
+    std::vector<std::vector<float>> * out_dials);
+}
 
 // Parse a CSV float list. Returns empty vector on any parse failure.
 static std::vector<float> parse_phase_thresholds_csv(const char * csv) {
@@ -489,15 +495,44 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     };
 
     // Gradual-schedule adaptive dial wiring (StreamLLM).
-    // STREAMLLM_SCHEDULE_THRESHOLDS=t1,t2,...,tN  (ascending ints)
-    // STREAMLLM_SCHEDULE_DIALS=dial0;dial1;...;dialN  (N+1 dials,
-    // each a comma-separated thresholds list).  If both schedule and
-    // phase-aware env vars are present, schedule wins (sets the dial
-    // last and tracks transitions via the per-token observer; the
-    // phase observer would just no-op on the first transition since
-    // the prev_state still matches).
-    const char * sch_thr_csv  = std::getenv("STREAMLLM_SCHEDULE_THRESHOLDS");
-    const char * sch_dial_csv = std::getenv("STREAMLLM_SCHEDULE_DIALS");
+    //
+    // Two ingestion paths:
+    //   (1) Runtime HTTP API — POST /streamllm/schedule populates
+    //       streamllm-ext's mutable schedule state. We check
+    //       streamllm_schedule_active() first; if set, we read via
+    //       streamllm_schedule_get and skip env-var parsing.
+    //   (2) Environment fallback — STREAMLLM_SCHEDULE_THRESHOLDS=t1,
+    //       ...,tN and STREAMLLM_SCHEDULE_DIALS=dial0;...;dialN. Read
+    //       once at sampler init when (1) is empty.
+    //
+    // If schedule is enabled by either path, phase-aware is skipped
+    // (one dial-driver at a time).
+    bool sch_from_api = false;
+    std::vector<int> sch_api_thr;
+    std::vector<std::vector<float>> sch_api_dials;
+    if (streamllm_schedule_active()) {
+        sch_from_api = streamllm_ext::streamllm_schedule_get(&sch_api_thr, &sch_api_dials);
+    }
+    if (sch_from_api) {
+        result->schedule_enabled    = true;
+        result->schedule_thresholds = std::move(sch_api_thr);
+        result->schedule_dials      = std::move(sch_api_dials);
+        result->n_tokens_generated  = 0;
+        result->schedule_next_idx   = 0;
+        const bool ok = streamllm_set_score_table(
+            result->schedule_dials[0].data(),
+            (int) result->schedule_dials[0].size());
+        LOG_INF("streamllm schedule (HTTP API): %zu transition(s); "
+                "primed dial[0]=%s\n",
+                result->schedule_thresholds.size(),
+                ok ? "ok" : "no-op (no runtime)");
+    }
+    const char * sch_thr_csv  = !sch_from_api ? std::getenv("STREAMLLM_SCHEDULE_THRESHOLDS") : nullptr;
+    const char * sch_dial_csv = !sch_from_api ? std::getenv("STREAMLLM_SCHEDULE_DIALS")      : nullptr;
+    // Treat empty strings as unset — the orchestrator may clear env
+    // explicitly when using the HTTP API path.
+    if (sch_thr_csv  && !sch_thr_csv[0])  sch_thr_csv  = nullptr;
+    if (sch_dial_csv && !sch_dial_csv[0]) sch_dial_csv = nullptr;
     if (sch_thr_csv && sch_dial_csv) {
         auto parse_int_csv = [](const char * s) {
             std::vector<int> out;

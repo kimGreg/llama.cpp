@@ -4,9 +4,14 @@
 #   cmake -B build -DGGML_CUDA=ON -DSTREAMLLM_EXT=ON ...
 #
 # Layout:
-#   core/            framework (vram_pool, runtime, ggml-cuda hook, scheduler trait)
-#   decoder/anybcq/  AnyBCQ kernels and chunk format
-#   qwen3/           Qwen3-MoE scheduler and cache policy
+#   core/             framework (vram_pool, runtime, ggml-cuda hook, scheduler trait)
+#   decoder/anybcq/   AnyBCQ kernels and chunk format
+#   moe/common/       shared MoE runtime utilities (scheduler, matmul_comp, fused
+#                     kernels, dispatch, residency, runtime_glue) — architecture-neutral
+#   moe/qwen3/        Qwen3-MoE executor
+#   moe/deepseek_moe/ DeepSeek-MoE V1 executor (stub today; delegates to common base)
+#   moe/gemma_4/      Gemma 4 MoE executor (stub today; delegates to common base)
+#   moe/qwen3_6/      placeholder for Qwen3.6-MoE — reuses qwen3_moe at runtime
 cmake_minimum_required(VERSION 3.18)
 
 message(STATUS "streamllm-ext: enabled")
@@ -21,7 +26,7 @@ set(STREAMLLM_EXT_SOURCES
     core/stream_reader.cpp
     core/runtime.cpp
     core/executor.cpp
-    qwen3/qwen3_moe_scheduler.cpp
+    moe/common/moe_scheduler.cpp
     decoder/anybcq/upstream_layout.cpp
     decoder/anybcq/tensor.cpp
     decoder/ss_anybcq/upstream_layout.cpp
@@ -29,14 +34,17 @@ set(STREAMLLM_EXT_SOURCES
 
 # ggml-cuda hook glue. Requires GGML_CUDA=ON (the hook signature takes
 # a cudaStream_t); CPU-only builds skip it and the loader stub never fires.
-# qwen3_moe_dispatch.cpp holds the actual hook bodies (called by the
-# scheduler) and likewise needs the CUDA driver headers.
+# moe/common/dispatch.cpp holds the actual hook bodies (called by the
+# scheduler) and likewise needs the CUDA driver headers.  Per-arch
+# executor files (moe/{qwen3,deepseek_moe,gemma_4}/executor.cpp) are
+# added at the end; the common base class lives in moe/qwen3/executor.cpp
+# today and is subclassed by the per-arch files.
 if (GGML_CUDA)
     list(APPEND STREAMLLM_EXT_SOURCES
-        qwen3/qwen3_runtime_glue.cpp
-        qwen3/qwen3_moe_dispatch.cpp
-        qwen3/qwen3_moe_matmul_comp.cpp
-        qwen3/qwen3_moe_executor.cpp
+        moe/common/runtime_glue.cpp
+        moe/common/dispatch.cpp
+        moe/common/matmul_comp.cpp
+        moe/qwen3/qwen3_executor.cpp
     )
 endif()
 
@@ -51,7 +59,7 @@ if (GGML_CUDA)
         decoder/anybcq/kernels/chunked_matmul_gemm.cu
         decoder/anybcq/chunked_matmul.cu
         decoder/ss_anybcq/chunked_matmul.cu
-        qwen3/qwen3_moe_fused.cu
+        moe/common/fused_kernels.cu
     )
 endif()
 
@@ -63,7 +71,11 @@ target_include_directories(streamllm_ext PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq/kernels
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/ss_anybcq
-    ${CMAKE_CURRENT_SOURCE_DIR}/qwen3
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe/qwen3
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe/deepseek_moe
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe/gemma_4
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe/qwen3_6
 )
 
 # Link against ggml for gguf_* symbols. The full `llama` lib isn't

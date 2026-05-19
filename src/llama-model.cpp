@@ -20,7 +20,7 @@
 #include "ggml-cpp.h"
 
 #if defined(STREAMLLM_EXT_ENABLED)
-#include "qwen3_runtime_glue.h"
+#include "runtime_glue.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -4631,8 +4631,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_post_norm_1 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_1, "weight", i), {n_embd}, 0);
                             layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
 
-                            // MoE FFN
-                            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, 0);
+                            // MoE FFN — accept either the fused
+                            // ``ffn_gate_up_exps`` (default Gemma 4
+                            // GGUF) or separate ``ffn_gate_exps`` +
+                            // ``ffn_up_exps`` (what streamllm-ext's
+                            // chunked_encoder writes, since AnyBCQ
+                            // calibrates the two matmuls
+                            // independently).
+                            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
                             layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
 
                             // per-expert scale will be loaded as down_exps_s at the end of the current switch case

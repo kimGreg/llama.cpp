@@ -5,19 +5,18 @@
 // ggml-cuda hook registration, score-policy live-dial entry points,
 // per-op extern-C shims — funnels into model-specific behavior.
 
-#include "qwen3_runtime_glue.h"
+#include "runtime_glue.h"
 #include "launch_diag.h"
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "stream_reader.h"
-#include "executor.h"
+#include "qwen3_executor.h"
 #include "anybcq_gemm.h"
 
-#include "qwen3_moe_dispatch.h"
-#include "qwen3_moe_scheduler.h"  // qwen3::scheduler_* free-fn shims
-#include "qwen3_moe_executor.h"   // Qwen3MoEAnyBcqExecutor + registration
+#include "dispatch.h"
+#include "moe_scheduler.h"  // qwen3::scheduler_* free-fn shims
 #include "decoder/anybcq/chunked_matmul.h"  // anybcq counters (constraint 7)
-#include "qwen3_moe_residency.h"  // MoEResidencyTracker eviction counters
+#include "residency.h"  // MoEResidencyTracker eviction counters
 
 #include <ggml.h>
 #include <gguf.h>
@@ -137,6 +136,17 @@ bool install_for_gguf(const char * gguf_path) {
     if (ctx == nullptr) return false;
 
     auto reader_opt = StreamReader::from_gguf(ctx, gguf_path);
+    // Read general.architecture before freeing the gguf context — we
+    // use it post-bind to pick the SwiGLU activation that matches the
+    // model.  Default empty string means "use executor default" (SiLU).
+    std::string gguf_arch;
+    {
+        const int64_t kid = gguf_find_key(ctx, "general.architecture");
+        if (kid >= 0) {
+            const char * s = gguf_get_val_str(ctx, kid);
+            if (s) gguf_arch = s;
+        }
+    }
     gguf_free(ctx);
     if (!reader_opt) {
         // No streamllm.* block — stock GGUF, leave default dispatch alone.
@@ -229,6 +239,24 @@ bool install_for_gguf(const char * gguf_path) {
     g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
     g_required_runtime_was_true = reader.global().required_runtime;
 
+    // Per-arch activation install.  Today's only executor is the
+    // Qwen3-MoE AnyBCQ one but its SwiGLU stage supports SiLU/GELU
+    // selection — we pick based on the GGUF arch so a streamllm-
+    // encoded Gemma-4 (LLM_ARCH_GEMMA4) gets the right elementwise
+    // op without a per-arch executor.
+    if (auto * exec_qwen3 =
+            dynamic_cast<qwen3::Qwen3MoEAnyBcqExecutor *>(g_executor.get())) {
+        if (gguf_arch == "gemma4") {
+            exec_qwen3->set_activation(qwen3::Activation::GELU);
+        } else {
+            exec_qwen3->set_activation(qwen3::Activation::SiLU);
+        }
+        std::fprintf(stderr,
+            "streamllm-ext: gguf_arch='%s' → activation=%s\n",
+            gguf_arch.c_str(),
+            exec_qwen3->activation() == qwen3::Activation::GELU ? "GELU" : "SiLU");
+    }
+
     std::fprintf(stderr,
         "streamllm-ext: runtime ready "
         "(scheduler=%s, executor=%s, pool %.1f / %.1f MB used)\n",
@@ -284,7 +312,7 @@ bool install_for_gguf(const char * gguf_path) {
 
 // ---------------------------------------------------------------------
 // Mode A milestone 1, S1 — model-scoped executor binding APIs.
-// See qwen3_runtime_glue.h for the contract.
+// See runtime_glue.h for the contract.
 
 ModelExecutor * current_executor() {
     std::lock_guard<std::mutex> lk(g_runtime_mu);
@@ -362,6 +390,75 @@ extern "C" uint64_t streamllm_replay_score_table_version(void) {
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return 0;
     return g_runtime->replay_score_table_version();
+}
+
+// ── Runtime-mutable gradual-schedule state ────────────────────────────
+//
+// Lives in this TU so the HTTP route in tools/server can wire to the
+// extern-C setters and the common-sampler observer in common/sampling
+// can call streamllm_schedule_get on init.  Mutex-guarded; the writers
+// are HTTP handlers (very low frequency) and the reader is per-request
+// common_sampler_init (also low frequency).
+namespace {
+std::mutex                            g_schedule_mu;
+bool                                  g_schedule_active_v = false;
+std::vector<int>                      g_schedule_thresholds_v;
+std::vector<std::vector<float>>       g_schedule_dials_v;
+}  // anon
+
+extern "C" bool streamllm_schedule_set(
+    const int *   thresholds, int n_thresh,
+    const float * dials_flat, const int * dial_lens, int n_dials)
+{
+    if (thresholds == nullptr || dials_flat == nullptr || dial_lens == nullptr) {
+        return false;
+    }
+    if (n_thresh < 0 || n_dials <= 0 || n_dials != n_thresh + 1) {
+        return false;
+    }
+    // Validate strictly-ascending thresholds.
+    for (int i = 1; i < n_thresh; ++i) {
+        if (thresholds[i] <= thresholds[i - 1]) return false;
+    }
+    // Copy out under lock.
+    std::vector<int> new_thr(thresholds, thresholds + n_thresh);
+    std::vector<std::vector<float>> new_dials;
+    new_dials.reserve((size_t) n_dials);
+    int off = 0;
+    for (int d = 0; d < n_dials; ++d) {
+        const int len = dial_lens[d];
+        if (len <= 0) return false;
+        new_dials.emplace_back(dials_flat + off, dials_flat + off + len);
+        off += len;
+    }
+    std::lock_guard<std::mutex> lk(g_schedule_mu);
+    g_schedule_thresholds_v = std::move(new_thr);
+    g_schedule_dials_v      = std::move(new_dials);
+    g_schedule_active_v     = true;
+    return true;
+}
+
+extern "C" void streamllm_schedule_clear(void) {
+    std::lock_guard<std::mutex> lk(g_schedule_mu);
+    g_schedule_active_v = false;
+    g_schedule_thresholds_v.clear();
+    g_schedule_dials_v.clear();
+}
+
+extern "C" bool streamllm_schedule_active(void) {
+    std::lock_guard<std::mutex> lk(g_schedule_mu);
+    return g_schedule_active_v;
+}
+
+bool streamllm_schedule_get(
+    std::vector<int> *                out_thresholds,
+    std::vector<std::vector<float>> * out_dials)
+{
+    std::lock_guard<std::mutex> lk(g_schedule_mu);
+    if (!g_schedule_active_v) return false;
+    if (out_thresholds) *out_thresholds = g_schedule_thresholds_v;
+    if (out_dials)      *out_dials      = g_schedule_dials_v;
+    return true;
 }
 
 // streamllm_claims_tensor extern-C was retired with the fusion_skip

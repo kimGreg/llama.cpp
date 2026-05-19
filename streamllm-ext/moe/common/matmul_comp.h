@@ -33,9 +33,9 @@
 #pragma once
 
 #include "computation.h"
-#include "qwen3_moe_fused.h"   // MoeExpertTable
+#include "fused_kernels.h"   // MoeExpertTable
 #include "vram_pool.h"          // StreamHandle / EventHandle
-#include "scheduler.h"          // streamllm_ext::Scheduler
+#include "moe_scheduler.h"          // streamllm_ext::Scheduler
 
 #include <cuda_runtime.h>
 

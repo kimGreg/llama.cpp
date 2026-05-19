@@ -8,7 +8,7 @@
 
 #include "launch_diag.h"
 #include "runtime.h"           // StreamllmRuntime, UpstreamLayoutDevice
-#include "qwen3_moe_fused.h"   // refresh_q_bias_for_anyprec_launch,
+#include "fused_kernels.h"   // refresh_q_bias_for_anyprec_launch,
                                 // naver_gemv_moe_launch
 
 #include <cuda_runtime.h>

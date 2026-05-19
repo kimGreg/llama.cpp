@@ -123,23 +123,36 @@ void naver_gemv_moe_launch(
     int                    group_size,
     int                    shared_x,
     StreamHandle           stream);
-// Mode A milestone 1, S6 — element-wise SwiGLU * up gate.
+// Mode A milestone 1, S6 — element-wise gated activation * up.
 //
 //   slot_gate [N] f32 — gate matmul output (per-slot, flattened)
 //   slot_up   [N] f32 — up   matmul output (per-slot, flattened)
-//   slot_out  [N] f32 — output: silu(slot_gate) * slot_up
+//   slot_out  [N] f32 — output: act(slot_gate) * slot_up
 //
-// Where silu(x) = x / (1 + exp(-x)). Element-wise, no shape dependence;
-// flatten the [n_tokens, n_used, n_ff] tensors to N = n_tokens*n_used*n_ff.
+// Activation choices:
+//   - SiLU (default): silu(x) = x / (1 + exp(-x))   — Qwen3-MoE, DeepSeek2
+//   - GELU         : gelu(x) = 0.5x(1 + tanh(√(2/π)(x + 0.044715 x³)))
+//                                                    — Gemma 4 MoE
+//
+// Same formula as ggml_cuda_op_{silu,gelu}_single so the streamllm
+// path stays bit-equivalent with build_moe_ffn when the activation
+// matches.  Element-wise, no shape dependence; flatten the
+// [n_tokens, n_used, n_ff] tensors to N = n_tokens*n_used*n_ff.
 // slot_out may alias slot_gate or slot_up. All device-resident, on
 // ``stream``. Used by Qwen3MoEAnyBcqExecutor::forward_moe_layer between
 // the gate/up chunked matmuls and the down chunked matmul.
+enum class Activation : uint8_t {
+    SiLU = 0,
+    GELU = 1,
+};
+
 void launch_swiglu_mul(
     const float * slot_gate,
     const float * slot_up,
     float *       slot_out,
     std::size_t   N,
-    StreamHandle  stream);
+    StreamHandle  stream,
+    Activation    act = Activation::SiLU);
 
 // Mode A milestone 1, S4 — weighted reduce over the per-top-k slot axis.
 //
@@ -166,7 +179,7 @@ void launch_weighted_reduce_slots(
 
 // Capture-mode planning kernel — populates ``planes_per_eid_d`` from
 // (ids, weights, probs, dial) entirely on the device. Mirrors the
-// host-side ``MoEMatMulComp::plan`` logic in qwen3_moe_matmul_comp.cpp
+// host-side ``MoEMatMulComp::plan`` logic in matmul_comp.cpp
 // (per-expert max gate score → chunks_for_gate → planes_for_chunks),
 // so the eager and capture paths produce the same prec_per_eid_d for
 // the same (routing, dial). Used by Qwen3MoEAnyBcqExecutor's

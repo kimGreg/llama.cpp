@@ -59,7 +59,7 @@ struct ChunkHandle {
 // Host-side validation (Qwen3MoEAnyBcqExecutor::validate_required_set_)
 // checks ``chunk_state(wid, cid) >= POINTER_TABLE_READY`` for every
 // chunk the kernel will read, before launching the fused MoE op.
-// The device-side M1 required-non-null trap (qwen3_moe_fused.cu) is the
+// The device-side M1 required-non-null trap (fused_kernels.cu) is the
 // final guard; Step 6 catches misses earlier with a useful message.
 enum class ChunkState : uint8_t {
     NOT_RESIDENT        = 0,   // not in the pool

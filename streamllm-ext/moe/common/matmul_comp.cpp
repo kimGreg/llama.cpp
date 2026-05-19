@@ -1,7 +1,7 @@
 // streamllm-ext / qwen3 — MoEMatMulComp implementation.
 //
 // Lifts the LOAD walk and kernel-launch glue from
-// ``qwen3_moe_dispatch.cpp`` into the three ChunkedComputation
+// ``dispatch.cpp`` into the three ChunkedComputation
 // virtuals.  ``Runtime::run`` orchestrates the captured sequence of
 // (D2H pre_inputs → host-fn that calls plan → cudaStreamWaitEvent →
 // captured kernels in execute) — same code under cuda-graph capture
@@ -14,10 +14,10 @@
 // q_bias refresh, and the fused MoE GEMV launch all live in
 // ``decoder/anybcq/chunked_matmul.cu``.
 
-#include "qwen3_moe_matmul_comp.h"
+#include "matmul_comp.h"
 
-#include "qwen3_moe_dispatch.h"   // moe_dispatch::scratch_for_stream
-#include "qwen3_moe_scheduler.h"  // qwen3::scheduler_plan_for_expert_with_chunks
+#include "dispatch.h"   // moe_dispatch::scratch_for_stream
+#include "moe_scheduler.h"  // qwen3::scheduler_plan_for_expert_with_chunks
 #include "launch_diag.h"          // launch_diag counters
 #include "runtime.h"
 #include "runtime_diag.h"

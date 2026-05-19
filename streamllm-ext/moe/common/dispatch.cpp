@@ -2,23 +2,23 @@
 //
 // Architecturally these belong with the scheduler: dispatch logic
 // (graph introspection, gate-score reading, per-(t, u) plan, chunk
-// fan-out, kernel launch) is model-specific. qwen3/qwen3_runtime_glue.cpp
+// fan-out, kernel launch) is model-specific. qwen3/runtime_glue.cpp
 // keeps lifecycle (install_for_gguf / clear) and the extern-C shims
 // that ggml-cuda calls; those shims forward through
 // Scheduler::handle_*, which lands here.
 
-#include "qwen3_moe_dispatch.h"
+#include "dispatch.h"
 
-#include "qwen3_runtime_glue.h"   // g_runtime + g_runtime_mu (internal externs)
-#include "qwen3_moe_matmul_comp.h" // MoEMatMulComp + scheduler_lookup_moe_comp
+#include "runtime_glue.h"   // g_runtime + g_runtime_mu (internal externs)
+#include "matmul_comp.h" // MoEMatMulComp + scheduler_lookup_moe_comp
 #include "runtime.h"
 #include "runtime_diag.h"
 #include "stream_reader.h"
-#include "scheduler.h"
-#include "qwen3_moe_scheduler.h"  // qwen3::scheduler_* typed accessors
+#include "moe_scheduler.h"
+#include "moe_scheduler.h"  // qwen3::scheduler_* typed accessors
 #include "anybcq_gemv.h"
 #include "anybcq_gemm.h"
-#include "qwen3_moe_fused.h"        // MoeExpertTable + qwen3::naver_gemv_moe_launch
+#include "fused_kernels.h"        // MoeExpertTable + qwen3::naver_gemv_moe_launch
 #include "chunked_matmul.h"   // ss_anybcq::chunk_matmul_*for_wid
 #include "streamllm_nvtx.h"
 
@@ -92,7 +92,7 @@ MoEProfile g_moe_profile;
 
 // Per-stream scratch for F32↔F16 cast bridges + ids/precision device
 // buffers used by the fused MoE kernel.  ``StreamScratch`` itself is
-// declared in qwen3_moe_dispatch.h so MoEMatMulComp::execute can read
+// declared in dispatch.h so MoEMatMulComp::execute can read
 // its fields without a TU-private re-definition.
 std::mutex g_scratch_mu;
 std::unordered_map<cudaStream_t, moe_dispatch::StreamScratch> g_scratch;
@@ -308,7 +308,7 @@ void print_profile_if_enabled() {
 }
 
 
-// Mode A M1 dense-managed clear-fail (see qwen3_runtime_glue.cpp's
+// Mode A M1 dense-managed clear-fail (see runtime_glue.cpp's
 // streamllm_try_cuda_mul_mat). The previous dense streaming body
 // ``handle_mul_mat_impl`` was retired in the post-M1 cleanup pass —
 // any future dense streaming lands as a separate DenseExecutor on
@@ -319,7 +319,7 @@ void print_profile_if_enabled() {
 // S8 (Mode A): ``handle_mul_mat_id_impl`` was retired together with
 // the per-canonical ``forward_moe_block`` virtual it called and the
 // scheduler ``dispatch_node`` rail that called it. Managed MoE
-// dispatch lives entirely on the sentinel rail (qwen3_runtime_glue.cpp
+// dispatch lives entirely on the sentinel rail (runtime_glue.cpp
 // ``streamllm_pre_op`` → ``forward_moe_layer``).
 
 // Step 3 (Milestone 1): counter shim — the executor's forward_moe_block

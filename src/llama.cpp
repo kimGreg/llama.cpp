@@ -16,7 +16,7 @@
 #include "gguf.h"
 
 #if defined(STREAMLLM_EXT_ENABLED)
-#include "qwen3_runtime_glue.h"
+#include "runtime_glue.h"
 #endif
 
 #include <algorithm>

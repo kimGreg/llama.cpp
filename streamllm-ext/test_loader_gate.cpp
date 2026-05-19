@@ -36,7 +36,7 @@
 
 #include "core/stream_reader.h"
 #include "core/executor.h"
-#include "qwen3/qwen3_moe_executor.h"
+#include "qwen3/executor.h"
 
 #include <ggml.h>
 #include <gguf.h>

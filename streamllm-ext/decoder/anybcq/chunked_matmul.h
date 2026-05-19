@@ -38,7 +38,7 @@
 
 #pragma once
 
-#include "qwen3_moe_fused.h"   // MoeExpertTable, naver_gemv_moe_launch decl
+#include "fused_kernels.h"   // MoeExpertTable, naver_gemv_moe_launch decl
 #include "vram_pool.h"         // StreamHandle
 
 #include <cstddef>

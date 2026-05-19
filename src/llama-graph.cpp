@@ -1343,6 +1343,39 @@ llm_moe_router_output llm_build_moe_routing_softmax_topk(
     return { selected_experts, probs, weights };
 }
 
+ggml_tensor * llm_build_moe_sentinel_pre_routed(
+    ggml_context * ctx,
+    ggml_tensor *  cur,
+    ggml_tensor *  ids,
+    ggml_tensor *  probs,
+    ggml_tensor *  weights,
+    int            il)
+{
+    // ``ggml_dup(cur)`` gives the F32 [n_embd, n_tokens] op node whose
+    // default backend executor would memcpy src[0] → dst. The runtime
+    // ``pre_op_hook`` claims it by name and writes layer_out into
+    // ``dst`` from ``forward_moe_layer`` instead. src[1..3] are
+    // manually wired so the graph allocator schedules ids/probs/
+    // weights ahead of the sentinel — by the time the hook fires,
+    // all three are resident on the compute stream.
+    ggml_tensor * sentinel = ggml_dup(ctx, cur);
+    sentinel->src[1] = ids;
+    sentinel->src[2] = probs;
+    sentinel->src[3] = weights;
+
+    // **DO NOT** route this through ``llm_graph_context::cb()`` here
+    // or in the caller. ``cb()`` invokes ``ggml_format_name`` which
+    // overwrites the name buffer and would rename the sentinel out of
+    // the ``"streamllm.moe_layer_*"`` namespace the dispatch hook
+    // matches on. The cgraph audit catches it; not introducing the
+    // rename in the first place is faster.
+    char name[64];
+    std::snprintf(name, sizeof(name), "streamllm.moe_layer_%d", il);
+    ggml_set_name(sentinel, name);
+
+    return sentinel;
+}
+
 ggml_tensor * llm_build_moe_sentinel(
     ggml_context * ctx,
     ggml_tensor *  cur,
@@ -1356,30 +1389,8 @@ ggml_tensor * llm_build_moe_sentinel(
     // ``build_moe_ffn``'s simple-SOFTMAX routing path.
     auto router = llm_build_moe_routing_softmax_topk(
         ctx, logits, n_expert, n_expert_used, norm_w);
-
-    // ``ggml_dup(cur)`` gives the F32 [n_embd, n_tokens] op node whose
-    // default backend executor would memcpy src[0] → dst. The runtime
-    // ``pre_op_hook`` claims it by name and writes layer_out into
-    // ``dst`` from ``forward_moe_layer`` instead. src[1..3] are
-    // manually wired so the graph allocator schedules ids/probs/
-    // weights ahead of the sentinel — by the time the hook fires,
-    // all three are resident on the compute stream.
-    ggml_tensor * sentinel = ggml_dup(ctx, cur);
-    sentinel->src[1] = router.ids;
-    sentinel->src[2] = router.probs;
-    sentinel->src[3] = router.weights;
-
-    // **DO NOT** route this through ``llm_graph_context::cb()`` here
-    // or in the caller. ``cb()`` invokes ``ggml_format_name`` which
-    // overwrites the name buffer and would rename the sentinel out of
-    // the ``"streamllm.moe_layer_*"`` namespace the dispatch hook
-    // matches on. The cgraph audit catches it; not introducing the
-    // rename in the first place is faster.
-    char name[64];
-    std::snprintf(name, sizeof(name), "streamllm.moe_layer_%d", il);
-    ggml_set_name(sentinel, name);
-
-    return sentinel;
+    return llm_build_moe_sentinel_pre_routed(
+        ctx, cur, router.ids, router.probs, router.weights, il);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(

@@ -4,25 +4,25 @@
 // moe_dispatch::handle_mul_mat_id_impl. The executor now owns the
 // canonical Mode A flow (current-batch routing → plan → reserve → load
 // → wait → kernel → release). The per-op hook entry point in
-// qwen3_runtime_glue.cpp::streamllm_try_cuda_mul_mat_id reaches us
+// runtime_glue.cpp::streamllm_try_cuda_mul_mat_id reaches us
 // directly; the legacy scheduler.dispatch_node path (used when a
 // managed MUL_MAT_ID surfaces through the dense-matmul hook) reaches
-// us through the thin shim that survives in qwen3_moe_dispatch.cpp.
+// us through the thin shim that survives in dispatch.cpp.
 //
 // `rt_` is set once at bind_to_model time and is read-only from then
 // on — the body does NOT take g_runtime_mu. The runtime's internal
 // state (pool, scheduler, layouts) carries its own thread-safety.
 
-#include "qwen3_moe_executor.h"
-#include "qwen3_moe_dispatch.h"        // scratch_for_stream, topk_weights_lookup, profile_inc_hook_calls
-#include "qwen3_moe_fused.h"           // launch_swiglu_mul, launch_weighted_reduce_slots
-#include "qwen3_moe_matmul_comp.h"     // MoEMatMulComp, MoEInput/Output
-#include "qwen3_moe_scheduler.h"       // qwen3::scheduler_* helpers
+#include "qwen3_executor.h"
+#include "dispatch.h"        // scratch_for_stream, topk_weights_lookup, profile_inc_hook_calls
+#include "fused_kernels.h"           // launch_swiglu_mul, launch_weighted_reduce_slots
+#include "matmul_comp.h"     // MoEMatMulComp, MoEInput/Output
+#include "moe_scheduler.h"       // qwen3::scheduler_* helpers
 #include "computation.h"               // ChunkPlan, ChunkKey
 #include "launch_diag.h"               // launch_diag counters
 #include "vram_pool.h"                 // ChunkState
 #include "runtime.h"
-#include "scheduler.h"
+#include "moe_scheduler.h"
 
 #include <chrono>
 
@@ -504,7 +504,7 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_three_canonicals_(
     gate_comp.execute(in_gate, out_gate, stream_h);
     up_comp.execute(in_up, out_up, stream_h);
 
-    // ── Phase 3: SwiGLU: slot_b ← silu(slot_a) * slot_b.
+    // ── Phase 3: gated activation: slot_b ← act(slot_a) * slot_b.
     {
         const size_t N_swiglu =
             (size_t) n_tokens * (size_t) n_used * (size_t) n_ff;
@@ -512,7 +512,7 @@ bool Qwen3MoEAnyBcqExecutor::dispatch_three_canonicals_(
             (const float *) slot_a_data,
             (const float *) slot_b_data,
             (float *)       slot_b_data,
-            N_swiglu, stream_h);
+            N_swiglu, stream_h, activation_);
     }
     // ── Phase 4: Down matmul → slot_a (reused buffer).
     down_comp.execute(in_down, out_down, stream_h);

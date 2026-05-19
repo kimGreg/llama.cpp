@@ -22,7 +22,7 @@
 
 #pragma once
 
-#include "executor.h"
+#include "qwen3_executor.h"
 
 #include <cuda_runtime.h>
 
@@ -38,8 +38,8 @@ namespace streamllm_ext {
 
 class StreamllmRuntime;
 
-// Internal — owned by qwen3/qwen3_runtime_glue.cpp (install_for_gguf / clear).
-// Read by qwen3/qwen3_moe_dispatch.cpp and qwen3/qwen3_moe_executor.cpp
+// Internal — owned by qwen3/runtime_glue.cpp (install_for_gguf / clear).
+// Read by qwen3/dispatch.cpp and qwen3/executor.cpp
 // under g_runtime_mu so the active runtime + executor are reachable from
 // the scheduler-side dispatch bodies and the executor shim. Not part of
 // the extension's public API.
@@ -170,5 +170,35 @@ extern "C" bool streamllm_user_node_claims(
 // ``ggml_cuda_set_streamllm_score_version_hook``; the cgraph cache
 // reads it once per compute and forces re-capture on any change.
 extern "C" uint64_t streamllm_replay_score_table_version(void);
+
+// ── Runtime-mutable gradual-schedule state ────────────────────────────
+//
+// The common-sampler observer in common/sampling.cpp reads this on
+// each common_sampler_init when the runtime API has been populated;
+// otherwise it falls back to the STREAMLLM_SCHEDULE_* env vars. The
+// HTTP route POST /streamllm/schedule writes via streamllm_schedule_set.
+//
+// Wire format (C-friendly):
+//   thresholds : ascending int array of length n_thresh (generated-
+//                token breakpoints).
+//   dials_flat : packed float array, length = sum(dial_lens[i]).
+//   dial_lens  : per-dial threshold-count array of length n_dials.
+//   n_dials    = n_thresh + 1.
+//
+// Return false on shape/order violations.  Empty state (after
+// streamllm_schedule_clear or before any set) is signalled by
+// streamllm_schedule_active() == false.
+extern "C" bool streamllm_schedule_set(
+    const int *   thresholds, int n_thresh,
+    const float * dials_flat, const int * dial_lens, int n_dials);
+extern "C" void streamllm_schedule_clear(void);
+extern "C" bool streamllm_schedule_active(void);
+
+// Bulk fetch the active schedule (output reference args; pass nullptr
+// to skip a field).  Always populates from the same atomic snapshot.
+// Caller passes in/out vectors; returns false if no schedule is set.
+bool streamllm_schedule_get(
+    std::vector<int> *                       out_thresholds,
+    std::vector<std::vector<float>> *        out_dials);
 
 } // namespace streamllm_ext
