@@ -350,6 +350,30 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
             host_n_chunks_per_expert_[eid] = required_chunks;
         }
     }
+    // Optional one-line K̄ dump per layer (process-wide static guard so
+    // each layer only logs once).  Used by the τ-sweep to recover the
+    // empirical effective K̄ that the dynamic dispatcher chooses given
+    // the live max-gate distribution — the offline ``A``-based proxy
+    // (in plot_kld_vs_kbar.py) underestimates it.
+    if (const char * s = std::getenv("STREAMLLM_LOG_KBAR")) {
+        if (s[0] && s[0] != '0' && layer_index_ >= 0 && layer_index_ < 256) {
+            static std::atomic<bool> dumped[256] = {};
+            if (!dumped[layer_index_].exchange(true)) {
+                long sum_k = 0, n = 0;
+                for (auto & kv : chunks_by_expert) {
+                    sum_k += kv.second;
+                    ++n;
+                }
+                const double kbar = n > 0 ? (double) sum_k / n : 0.0;
+                std::fprintf(stderr,
+                    "streamllm-ext kbar L=%d  active_experts=%ld  K_mean=%.3f  "
+                    "max_gate=%.6g\n",
+                    layer_index_, n, kbar,
+                    chunks_by_expert.empty() ? 0.0 :
+                        (double) max_gate_by_expert.begin()->second);
+            }
+        }
+    }
     for (int t = 0; t < n_tokens; ++t) {
         for (int u = 0; u < n_used; ++u) {
             const int eid = ids_pinned_[(size_t) t * n_used + u];
