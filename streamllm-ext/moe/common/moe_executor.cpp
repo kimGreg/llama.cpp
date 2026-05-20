@@ -25,6 +25,7 @@
 #include "moe_scheduler.h"
 
 #include <chrono>
+#include <vector>
 
 #include <ggml.h>
 #include <cuda_runtime.h>
@@ -500,9 +501,54 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
         launch_diag::note_dispatch_one_canonical(ns_total - 2 * (ns_total / 3));
     }
 
+    // Diagnostic dump hook (STREAMLLM_DEBUG_MOE_LAYER=<L>): on the
+    // FIRST call for the target layer, sync after each compute phase
+    // and dump the first 8 floats of (a) layer_in for token 0, (b)
+    // ids/weights for token 0, (c) gate output, (d) gated activation,
+    // (e) down output, (f) layer_out.  Single-shot per process, gated
+    // by env, so it's free in production builds.
+    const char * dbg_env = std::getenv("STREAMLLM_DEBUG_MOE_LAYER");
+    const int dbg_layer = dbg_env ? std::atoi(dbg_env) : -1;
+    static std::atomic<bool> dbg_dumped{false};
+    const bool do_dump = dbg_layer == layer_idx &&
+                          !dbg_dumped.exchange(true);
+    auto dump_buf = [&](const char * tag, const void * dev, int n_floats) {
+        std::vector<float> hbuf((size_t) n_floats, 0.0f);
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(hbuf.data(), dev, (size_t) n_floats * sizeof(float),
+                    cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "[dbg L=%d] %-18s [", layer_idx, tag);
+        for (int i = 0; i < n_floats; ++i) {
+            std::fprintf(stderr, " %+ .6e", hbuf[i]);
+        }
+        std::fprintf(stderr, " ]\n");
+    };
+    auto dump_ids = [&](const char * tag, const void * dev, int n_ints) {
+        std::vector<int32_t> hbuf((size_t) n_ints, 0);
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(hbuf.data(), dev, (size_t) n_ints * sizeof(int32_t),
+                    cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "[dbg L=%d] %-18s [", layer_idx, tag);
+        for (int i = 0; i < n_ints; ++i) std::fprintf(stderr, " %d", hbuf[i]);
+        std::fprintf(stderr, " ]\n");
+    };
+    if (do_dump) {
+        std::fprintf(stderr,
+            "[dbg L=%d] forward_moe_layer entry: n_tokens=%d n_used=%d "
+            "n_ff=%d n_embd=%d\n",
+            layer_idx, n_tokens, n_used, n_ff, n_embd);
+        dump_buf("layer_in[t0,:8]", cur_3d->data, 8);
+        dump_ids("ids[t0,:n_used]", ids->data, n_used);
+        // weights is [1, n_used, n_tokens] — for token 0, first n_used live
+        // contiguously at offset 0.
+        dump_buf("weights[t0,:n_used]", weights->data, n_used);
+    }
+
     // ── Phase 1+2: Gate + Up matmul, each as its own launch.
     gate_comp.execute(in_gate, out_gate, stream_h);
+    if (do_dump) dump_buf("gate_out[t0,u0,:8]", slot_a_data, 8);
     up_comp.execute(in_up, out_up, stream_h);
+    if (do_dump) dump_buf("up_out[t0,u0,:8]", slot_b_data, 8);
 
     // ── Phase 3: gated activation: slot_b ← act(slot_a) * slot_b.
     {
@@ -514,14 +560,17 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
             (float *)       slot_b_data,
             N_swiglu, stream_h, activation_);
     }
+    if (do_dump) dump_buf("gated[t0,u0,:8]", slot_b_data, 8);
     // ── Phase 4: Down matmul → slot_a (reused buffer).
     down_comp.execute(in_down, out_down, stream_h);
+    if (do_dump) dump_buf("down_out[t0,u0,:8]", slot_a_data, 8);
     // ── Phase 5: weighted reduce slot_a → layer_out.
     qwen3::launch_weighted_reduce_slots(
         (const float *) slot_a_data,
         (const float *) weights->data,
         (float *)       layer_out->data,
         n_tokens, n_used, n_embd, stream_h);
+    if (do_dump) dump_buf("layer_out[t0,:8]", layer_out->data, 8);
 
     // ── Phase 6: release the union of reserved chunks.
     release_all();
