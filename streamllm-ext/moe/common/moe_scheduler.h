@@ -118,4 +118,63 @@ uint64_t            scheduler_score_table_version    (const Scheduler & sched);
 const float *       scheduler_score_thresholds_device(const Scheduler & sched);
 bool                scheduler_allow_capture          (const Scheduler & sched);
 
+// ─── Static per-(layer, expert) chunk-count override ───────────────
+// Optional override of the score-threshold-derived chunk count, used
+// by the offline budget-solver layout (experiments/4_layout_solver/).
+// When a table is loaded, MoEMatMulComp's Pass-2 chunk-count compute
+// substitutes ``static_layout_for(layer, expert)`` for any expert
+// whose entry is non-zero; falls back to the existing
+// chunks_for_gate(g) path otherwise.
+//
+// Wire format: a flat uint8 array of length n_layers × n_experts in
+// row-major (layer-major) order.  Entry [L*E + e] ∈ {1, …,
+// max_n_chunks_} means "expert e in layer L always uses that many
+// chunks"; 0 means "no override (use threshold path)".
+//
+// Sets bump score_table_version_ to invalidate captured CUDA graphs,
+// reusing the existing dial-swap invalidation mechanism.
+bool   scheduler_set_static_layout(
+    Scheduler &                  sched,
+    const std::vector<uint8_t> & flat_table,
+    int                          n_layers,
+    int                          n_experts);
+void   scheduler_clear_static_layout(Scheduler & sched);
+uint8_t scheduler_static_layout_for(const Scheduler & sched, int layer, int expert);
+bool   scheduler_has_static_layout(const Scheduler & sched);
+
+// ─── Dynamic per-dispatch K decision (rung 2) ──────────────────────
+// Replaces the offline static layout with a per-(layer, expert)
+// decision made each dispatch, using BOTH the live gate score and
+// the per-(L, e, K) expert-output residual profile baked into the
+// GGUF as ``streamllm.expert_residuals.{R, K_min, K_max}``.
+//
+// Decision rule (see experiments/3_layout_sweep/PROBLEM.md rung 2):
+//   K_chosen[L, e]  =  largest K ∈ [K_min, K_max]
+//                       s.t.   g² · (R[L, e, K-1] - R[L, e, K])  >  τ
+//                       else   K_min
+// where g is the per-expert max gate score over the current batch
+// and τ is the global error-gain tolerance (STREAMLLM_DYNAMIC_TAU).
+//
+// R is stored in layer-major order, length = n_layers · n_experts · n_K
+// where n_K = K_max − K_min + 1.
+bool   scheduler_set_dynamic_residuals(
+    Scheduler &              sched,
+    const std::vector<float> & R_flat,
+    int                      n_layers,
+    int                      n_experts,
+    int                      K_min,
+    int                      K_max);
+void   scheduler_clear_dynamic_residuals(Scheduler & sched);
+bool   scheduler_has_dynamic_residuals(const Scheduler & sched);
+// Returns the K chosen for (layer, expert) given the live gate score
+// and the active tolerance ``tau``.  Returns 0 when residuals aren't
+// loaded so the caller knows to fall back to the threshold path.
+int    scheduler_dynamic_K_for(const Scheduler & sched,
+                                 int layer, int expert,
+                                 float gate_score, float tau);
+// Active τ tolerance (read from STREAMLLM_DYNAMIC_TAU at construct
+// time, mutable later via /streamllm/dynamic_tau HTTP).
+float  scheduler_dynamic_tau(const Scheduler & sched);
+void   scheduler_set_dynamic_tau(Scheduler & sched, float tau);
+
 }}  // namespace streamllm_ext::qwen3

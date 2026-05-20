@@ -421,6 +421,103 @@ public:
             " | %zu pinned chunks resident, %zu on-demand chunks available\n",
             total_pinned, total_on_demand);
 
+        // ── Optional: load a static per-(layer, expert) chunk-count
+        // override from a binary file at startup. Format:
+        //   uint32_t n_layers  (LE)
+        //   uint32_t n_experts (LE)
+        //   uint8_t  table[n_layers * n_experts]   row-major (layer-major)
+        // Used by the offline budget-knapsack solver
+        // (experiments/4_layout_solver/) so llama-perplexity (which has
+        // no HTTP) can consume layouts.  No file → no override.
+        if (const char * path = std::getenv("STREAMLLM_STATIC_LAYOUT_FILE")) {
+            std::FILE * f = std::fopen(path, "rb");
+            if (f == nullptr) {
+                std::fprintf(stderr,
+                    "streamllm-scheduler[moe]: STREAMLLM_STATIC_LAYOUT_FILE=%s "
+                    "fopen failed: %s\n", path, std::strerror(errno));
+            } else {
+                uint32_t hdr[2] = {0, 0};
+                if (std::fread(hdr, sizeof(uint32_t), 2, f) != 2) {
+                    std::fprintf(stderr,
+                        "streamllm-scheduler[moe]: layout file too short\n");
+                    std::fclose(f);
+                } else {
+                    const int n_lay = (int) hdr[0];
+                    const int n_exp = (int) hdr[1];
+                    if (n_lay > 0 && n_exp > 0 && n_lay <= 256 && n_exp <= 4096) {
+                        const size_t n = (size_t) n_lay * (size_t) n_exp;
+                        std::vector<uint8_t> tbl(n);
+                        if (std::fread(tbl.data(), 1, n, f) == n) {
+                            this->set_static_layout(tbl, n_lay, n_exp);
+                        } else {
+                            std::fprintf(stderr,
+                                "streamllm-scheduler[moe]: short read on layout "
+                                "(want %zu bytes)\n", n);
+                        }
+                    } else {
+                        std::fprintf(stderr,
+                            "streamllm-scheduler[moe]: bad layout header "
+                            "n_layers=%d n_experts=%d (sanity bound: <= 256, "
+                            "<= 4096)\n", n_lay, n_exp);
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+
+        // Optional dynamic-dispatch residuals — STREAMLLM_DYNAMIC_RESIDUALS_FILE
+        // overrides everything when present (mostly for dev / when the
+        // GGUF didn't carry residuals).  Binary format:
+        //   uint32_t n_layers
+        //   uint32_t n_experts
+        //   uint32_t K_min
+        //   uint32_t K_max
+        //   float32  R[n_layers * n_experts * (K_max - K_min + 1)]
+        if (const char * path = std::getenv("STREAMLLM_DYNAMIC_RESIDUALS_FILE")) {
+            std::FILE * f = std::fopen(path, "rb");
+            if (f == nullptr) {
+                std::fprintf(stderr,
+                    "streamllm-scheduler[moe]: STREAMLLM_DYNAMIC_RESIDUALS_FILE=%s "
+                    "fopen failed: %s\n", path, std::strerror(errno));
+            } else {
+                uint32_t hdr[4] = {0, 0, 0, 0};
+                if (std::fread(hdr, sizeof(uint32_t), 4, f) != 4) {
+                    std::fprintf(stderr,
+                        "streamllm-scheduler[moe]: residuals file header short\n");
+                    std::fclose(f);
+                } else {
+                    const int n_lay = (int) hdr[0];
+                    const int n_exp = (int) hdr[1];
+                    const int Kmn   = (int) hdr[2];
+                    const int Kmx   = (int) hdr[3];
+                    const int nK    = Kmx - Kmn + 1;
+                    if (n_lay > 0 && n_exp > 0 && Kmn >= 0 && nK > 0 &&
+                        n_lay <= 256 && n_exp <= 4096 && nK <= 16) {
+                        const size_t n = (size_t) n_lay * n_exp * nK;
+                        std::vector<float> R(n);
+                        if (std::fread(R.data(), sizeof(float), n, f) == n) {
+                            this->set_dynamic_residuals(R, n_lay, n_exp, Kmn, Kmx);
+                        } else {
+                            std::fprintf(stderr,
+                                "streamllm-scheduler[moe]: short read on residuals "
+                                "(want %zu floats)\n", n);
+                        }
+                    } else {
+                        std::fprintf(stderr,
+                            "streamllm-scheduler[moe]: bad residuals header "
+                            "L=%d E=%d K=[%d, %d]\n", n_lay, n_exp, Kmn, Kmx);
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+        // STREAMLLM_DYNAMIC_TAU initial value (mutable later via the
+        // HTTP /streamllm/dynamic_tau endpoint).
+        if (const char * s = std::getenv("STREAMLLM_DYNAMIC_TAU")) {
+            dynamic_tau_.store((float)std::atof(s),
+                                  std::memory_order_relaxed);
+        }
+
         // Eagerly build all per-canonical MoeExpertTable instances now,
         // so the first mul_mat_id hook call doesn't pay the build cost
         // (~3 H2Ds × n_canonicals). Tables are slab-allocated via
@@ -1140,6 +1237,125 @@ public:
     const float * score_thresholds_device() const { return score_thresholds_d_; }
     bool          allow_capture()           const { return allow_capture_; }
 
+    // ── Static per-(layer, expert) chunk-count override ─────────────
+    // See moe_scheduler.h for wire format. 0 / unset = no override.
+    bool set_static_layout(const std::vector<uint8_t> & flat_table,
+                            int n_layers, int n_experts) {
+        if (n_layers <= 0 || n_experts <= 0) return false;
+        if ((int)flat_table.size() != n_layers * n_experts) return false;
+        {
+            std::lock_guard<std::mutex> lk(score_table_mu_);
+            static_layout_ = flat_table;
+            static_layout_n_layers_ = n_layers;
+            static_layout_n_experts_ = n_experts;
+            // Bump under the same lock so cgraph cache invalidates.
+            score_table_version_.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::fprintf(stderr,
+            "streamllm-scheduler[moe]: static_layout SET — n_layers=%d n_experts=%d, "
+            "non-zero entries=%zu / %d\n",
+            n_layers, n_experts,
+            (size_t)std::count_if(flat_table.begin(), flat_table.end(),
+                                   [](uint8_t v){ return v != 0; }),
+            n_layers * n_experts);
+        return true;
+    }
+    void clear_static_layout() {
+        std::lock_guard<std::mutex> lk(score_table_mu_);
+        static_layout_.clear();
+        static_layout_n_layers_ = 0;
+        static_layout_n_experts_ = 0;
+        score_table_version_.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint8_t static_layout_for(int layer, int expert) const {
+        // Lock-free read of the flat table. Atomicity hazard: a swap
+        // between set_static_layout's resize and the index read is
+        // possible. We accept it — the consumer just re-runs on the
+        // next cgraph build after cgraph cache invalidation.
+        if (static_layout_n_layers_ == 0) return 0;
+        if (layer < 0 || layer >= static_layout_n_layers_) return 0;
+        if (expert < 0 || expert >= static_layout_n_experts_) return 0;
+        const size_t idx = (size_t) layer * (size_t) static_layout_n_experts_
+                            + (size_t) expert;
+        if (idx >= static_layout_.size()) return 0;
+        return static_layout_[idx];
+    }
+    bool has_static_layout() const {
+        return static_layout_n_layers_ > 0 && !static_layout_.empty();
+    }
+
+    // ── Dynamic per-dispatch K decision (rung 2) ────────────────────
+    // Residual-aware per-dispatch K via the local-FFN-output-L2² gain
+    // criterion.  See moe_scheduler.h for the rule + header comment.
+    bool set_dynamic_residuals(const std::vector<float> & R_flat,
+                                 int n_layers, int n_experts,
+                                 int K_min, int K_max) {
+        if (n_layers <= 0 || n_experts <= 0) return false;
+        const int n_K = K_max - K_min + 1;
+        if (n_K <= 0) return false;
+        if ((int)R_flat.size() != n_layers * n_experts * n_K) return false;
+        {
+            std::lock_guard<std::mutex> lk(score_table_mu_);
+            dynamic_R_ = R_flat;
+            dynamic_n_layers_  = n_layers;
+            dynamic_n_experts_ = n_experts;
+            dynamic_K_min_     = K_min;
+            dynamic_K_max_     = K_max;
+            // Bump the same version atomic so any captured cgraph
+            // invalidates (the dispatch decision encodes into the
+            // grid/launch shape).
+            score_table_version_.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::fprintf(stderr,
+            "streamllm-scheduler[moe]: dynamic_residuals SET — n_layers=%d "
+            "n_experts=%d K∈[%d, %d]  (τ=%.6g)\n",
+            n_layers, n_experts, K_min, K_max, dynamic_tau_.load());
+        return true;
+    }
+    void clear_dynamic_residuals() {
+        std::lock_guard<std::mutex> lk(score_table_mu_);
+        dynamic_R_.clear();
+        dynamic_n_layers_  = 0;
+        dynamic_n_experts_ = 0;
+        dynamic_K_min_     = 0;
+        dynamic_K_max_     = 0;
+        score_table_version_.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool has_dynamic_residuals() const {
+        return dynamic_n_layers_ > 0 && !dynamic_R_.empty();
+    }
+    int dynamic_K_for(int layer, int expert, float gate_score) const {
+        if (dynamic_n_layers_ == 0) return 0;
+        if (layer < 0 || layer >= dynamic_n_layers_) return 0;
+        if (expert < 0 || expert >= dynamic_n_experts_) return 0;
+        const int n_K = dynamic_K_max_ - dynamic_K_min_ + 1;
+        const size_t base = ((size_t) layer * dynamic_n_experts_
+                              + (size_t) expert) * (size_t) n_K;
+        if (base + (size_t) n_K > dynamic_R_.size()) return 0;
+        const float tau = dynamic_tau_.load(std::memory_order_relaxed);
+        const float g2  = gate_score * gate_score;
+        // R is monotone non-increasing in K, so the marginal gain
+        // (R[K-1] − R[K]) is positive; choose the largest K such
+        // that g²·(R[K-1]−R[K]) > τ, else K_min.
+        int K_chosen = dynamic_K_min_;
+        for (int ki = 1; ki < n_K; ++ki) {
+            const float R_prev = dynamic_R_[base + (size_t)(ki - 1)];
+            const float R_here = dynamic_R_[base + (size_t)ki];
+            const float gain   = g2 * (R_prev - R_here);
+            if (gain > tau) {
+                K_chosen = dynamic_K_min_ + ki;
+            }
+        }
+        return K_chosen;
+    }
+    float dynamic_tau() const {
+        return dynamic_tau_.load(std::memory_order_relaxed);
+    }
+    void set_dynamic_tau(float tau) {
+        dynamic_tau_.store(tau, std::memory_order_relaxed);
+        score_table_version_.fetch_add(1, std::memory_order_relaxed);
+    }
+
 private:
     static int read_int_env(const char * name, int fallback) {
         const char * s = getenv(name);
@@ -1182,6 +1398,30 @@ private:
     // swaps (HTTP score_table swap, phase-aware reasoning→generation
     // transition).
     std::atomic<uint64_t> score_table_version_{0};
+
+    // Static per-(layer, expert) chunk-count override. Loaded via
+    // /streamllm/static_layout. Length = n_layers * n_experts, row-major
+    // (layer-major). 0 = no override; > 0 = use this many chunks for the
+    // expert. Protected by score_table_mu_ on writes; reads use a
+    // best-effort lock-free path (see static_layout_for()) since a stale
+    // read just produces an obsolete kernel-input that the cgraph cache
+    // will invalidate on the next compute step.
+    std::vector<uint8_t> static_layout_;
+    int                  static_layout_n_layers_ = 0;
+    int                  static_layout_n_experts_ = 0;
+
+    // ── Dynamic per-dispatch residuals (rung 2) ─────────────────────
+    // ``streamllm.expert_residuals.R``-style flat array stored in
+    // layer-major order, length n_layers · n_experts · n_K where
+    // n_K = K_max − K_min + 1.  Read at install time from the GGUF
+    // (or via STREAMLLM_DYNAMIC_RESIDUALS_FILE during dev).  τ is
+    // mutable at runtime via HTTP / env var.
+    std::vector<float>   dynamic_R_;
+    int                  dynamic_n_layers_  = 0;
+    int                  dynamic_n_experts_ = 0;
+    int                  dynamic_K_min_     = 0;
+    int                  dynamic_K_max_     = 0;
+    std::atomic<float>   dynamic_tau_{0.0f};
 
     // STREAMLLM_ALLOW_CAPTURE=1: opt-in to CUDA-graph capture for the
     // managed cgraph. Only legal when the operator has set
@@ -1445,6 +1685,63 @@ const float * scheduler_score_thresholds_device(const Scheduler & sched) {
 
 bool scheduler_allow_capture(const Scheduler & sched) {
     return static_cast<const MoEScheduler &>(sched).allow_capture();
+}
+
+bool scheduler_set_static_layout(
+    Scheduler &                  sched,
+    const std::vector<uint8_t> & flat_table,
+    int                          n_layers,
+    int                          n_experts)
+{
+    return as_moe(sched).set_static_layout(flat_table, n_layers, n_experts);
+}
+void scheduler_clear_static_layout(Scheduler & sched) {
+    as_moe(sched).clear_static_layout();
+}
+uint8_t scheduler_static_layout_for(const Scheduler & sched, int layer, int expert) {
+    return static_cast<const MoEScheduler &>(sched).static_layout_for(layer, expert);
+}
+bool scheduler_has_static_layout(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).has_static_layout();
+}
+
+// ─── Dynamic per-dispatch residuals (rung 2) ───────────────────────
+bool scheduler_set_dynamic_residuals(
+    Scheduler &                sched,
+    const std::vector<float> & R_flat,
+    int                        n_layers,
+    int                        n_experts,
+    int                        K_min,
+    int                        K_max)
+{
+    return as_moe(sched).set_dynamic_residuals(
+        R_flat, n_layers, n_experts, K_min, K_max);
+}
+void scheduler_clear_dynamic_residuals(Scheduler & sched) {
+    as_moe(sched).clear_dynamic_residuals();
+}
+bool scheduler_has_dynamic_residuals(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).has_dynamic_residuals();
+}
+int scheduler_dynamic_K_for(const Scheduler & sched,
+                              int layer, int expert,
+                              float gate_score, float tau) {
+    // ``tau`` is a per-call override of the scheduler's stored tau —
+    // useful for the http endpoint to swap in a value without
+    // invalidating the captured cgraph.  Most call sites pass NaN
+    // (or 0) and want the stored value; that's the dynamic_K_for
+    // overload below.  Today we always honour ``tau`` and ignore the
+    // stored value, since the matmul_comp callsite reads tau from
+    // the scheduler at plan time anyway.
+    (void) tau;
+    return static_cast<const MoEScheduler &>(sched)
+        .dynamic_K_for(layer, expert, gate_score);
+}
+float scheduler_dynamic_tau(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dynamic_tau();
+}
+void scheduler_set_dynamic_tau(Scheduler & sched, float tau) {
+    as_moe(sched).set_dynamic_tau(tau);
 }
 
 MoEMatMulComp * scheduler_lookup_moe_comp(

@@ -293,9 +293,57 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
 
     // ── Pass 2: per-expert CHUNK count.  Writes directly into
     // host_n_chunks_per_expert_[eid] (size n_experts).
+    //
+    // Path A (static layout): if scheduler has a per-(layer, expert)
+    // override loaded (via /streamllm/static_layout), use that.  This
+    // is the offline-knapsack-solver output — chunk count chosen to
+    // satisfy a per-layer byte budget while minimising the predicted
+    // expert-output residual.  See experiments/4_layout_solver/.
+    //
+    // Path B (threshold-based): the existing path —
+    // chunks_for_gate(max_gate) → required_chunks.  Used when no
+    // static layout is loaded (default).
+    // Three paths in priority order:
+    //   A. static layout  — offline knapsack (experiments/3_layout_sweep
+    //      mode=static).  K[L, e] is fixed.
+    //   B. dynamic dispatch — per-dispatch K decision via residual
+    //      marginal-gain criterion (PROBLEM.md rung 2; mode=dynamic).
+    //      K[L, e, batch] depends on the per-batch max gate score
+    //      AND the per-(L, e, K) residual curve.
+    //   C. legacy threshold — chunks_for_gate(g) using the
+    //      score-threshold table.  Used when neither static layout
+    //      nor dynamic residuals are loaded.
+    const bool use_static  = qwen3::scheduler_has_static_layout(*sched_);
+    const bool use_dynamic = !use_static
+                              && qwen3::scheduler_has_dynamic_residuals(*sched_);
     for (int eid : unique_experts) {
-        const int required_chunks =
-            chunks_for_gate(max_gate_by_expert[eid]);
+        int required_chunks;
+        if (use_static && layer_index_ >= 0) {
+            const uint8_t lyt =
+                qwen3::scheduler_static_layout_for(*sched_, layer_index_, eid);
+            if (lyt > 0) {
+                required_chunks = (int) lyt;
+                if (required_chunks < 1)            required_chunks = 1;
+                if (required_chunks > n_chunks_max) required_chunks = n_chunks_max;
+            } else {
+                required_chunks =
+                    chunks_for_gate(max_gate_by_expert[eid]);
+            }
+        } else if (use_dynamic && layer_index_ >= 0) {
+            const float g = max_gate_by_expert[eid];
+            const int K_dyn = qwen3::scheduler_dynamic_K_for(
+                *sched_, layer_index_, eid, g, /*tau_unused=*/0.0f);
+            if (K_dyn > 0) {
+                required_chunks = K_dyn;
+                if (required_chunks < 1)            required_chunks = 1;
+                if (required_chunks > n_chunks_max) required_chunks = n_chunks_max;
+            } else {
+                required_chunks = chunks_for_gate(g);
+            }
+        } else {
+            required_chunks =
+                chunks_for_gate(max_gate_by_expert[eid]);
+        }
         chunks_by_expert[eid] = required_chunks;
         if (host_n_chunks_per_expert_ != nullptr &&
             eid >= 0 && eid < n_experts_) {
