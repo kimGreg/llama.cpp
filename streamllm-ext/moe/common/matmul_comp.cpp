@@ -350,25 +350,33 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
             host_n_chunks_per_expert_[eid] = required_chunks;
         }
     }
-    // Optional one-line K̄ dump per layer (process-wide static guard so
-    // each layer only logs once).  Used by the τ-sweep to recover the
-    // empirical effective K̄ that the dynamic dispatcher chooses given
-    // the live max-gate distribution — the offline ``A``-based proxy
-    // (in plot_kld_vs_kbar.py) underestimates it.
+    // Running-average K̄ across all dispatches per layer.  Dump at
+    // dispatch counts {1, 256, 512, 1024, …}.  Each dispatch (matmul-
+    // canonical call inside the per-layer MoE forward) contributes
+    // ``Σ K_e / |active experts|`` to the running mean.  The final
+    // line (highest dispatch count) is the cleanest empirical K̄ over
+    // the calibration corpus.
     if (const char * s = std::getenv("STREAMLLM_LOG_KBAR")) {
         if (s[0] && s[0] != '0' && layer_index_ >= 0 && layer_index_ < 256) {
-            static std::atomic<bool> dumped[256] = {};
-            if (!dumped[layer_index_].exchange(true)) {
-                long sum_k = 0, n = 0;
-                for (auto & kv : chunks_by_expert) {
-                    sum_k += kv.second;
-                    ++n;
-                }
-                const double kbar = n > 0 ? (double) sum_k / n : 0.0;
+            static std::atomic<uint64_t> sum_k_per_layer[256] = {};
+            static std::atomic<uint64_t> sum_experts_per_layer[256] = {};
+            static std::atomic<uint64_t> dispatches_per_layer[256] = {};
+            uint64_t dispatch_k = 0;
+            for (auto & kv : chunks_by_expert) dispatch_k += (uint64_t) kv.second;
+            const uint64_t s_sum  = sum_k_per_layer[layer_index_].fetch_add(
+                dispatch_k, std::memory_order_relaxed) + dispatch_k;
+            const uint64_t s_e    = sum_experts_per_layer[layer_index_].fetch_add(
+                (uint64_t) chunks_by_expert.size(), std::memory_order_relaxed)
+                + (uint64_t) chunks_by_expert.size();
+            const uint64_t d_count = dispatches_per_layer[layer_index_].fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (d_count == 1 || (d_count & 0xff) == 0) {
+                const double kbar = s_e > 0 ? (double) s_sum / (double) s_e : 0.0;
                 std::fprintf(stderr,
-                    "streamllm-ext kbar L=%d  active_experts=%ld  K_mean=%.3f  "
-                    "max_gate=%.6g\n",
-                    layer_index_, n, kbar,
+                    "streamllm-ext kbar L=%d  dispatches=%lu  active_experts=%zu  "
+                    "K_mean=%.3f  max_gate=%.6g\n",
+                    layer_index_, (unsigned long) d_count,
+                    chunks_by_expert.size(), kbar,
                     chunks_by_expert.empty() ? 0.0 :
                         (double) max_gate_by_expert.begin()->second);
             }
