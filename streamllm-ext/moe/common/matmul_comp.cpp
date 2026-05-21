@@ -316,12 +316,16 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     const bool use_static  = qwen3::scheduler_has_static_layout(*sched_);
     const bool use_dynamic = !use_static
                               && qwen3::scheduler_has_dynamic_residuals(*sched_);
-    // K̄-budget allocator: when set, replace per-expert τ-walk with a
-    // single per-dispatch knapsack on top of the residuals table.
+    // K̄- or ε-budget allocator: either dial triggers the per-dispatch
+    // DP knapsack.  ε wins precedence inside the allocator itself
+    // (moe_scheduler.cpp); here we just need to know whether to
+    // route into it.
     const float dyn_kbar = use_dynamic
         ? qwen3::scheduler_dynamic_kbar(*sched_) : 0.0f;
-    const bool use_dynamic_kbar =
-        use_dynamic && dyn_kbar > 0.0f && layer_index_ >= 0;
+    const float dyn_eps  = use_dynamic
+        ? qwen3::scheduler_dynamic_eps (*sched_) : 0.0f;
+    const bool use_dynamic_alloc =
+        use_dynamic && (dyn_kbar > 0.0f || dyn_eps > 0.0f) && layer_index_ >= 0;
     // STREAMLLM_UNIFORM_K=N: ablation knob — force K[e] = N for every
     // active expert this dispatch.  Bypasses both dynamic-K̄ and the
     // legacy threshold path.  Used by the uniform baseline rows of
@@ -350,7 +354,7 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
             }
         }
     } else
-    if (use_dynamic_kbar) {
+    if (use_dynamic_alloc) {
         // ── Path B': K̄-budget knapsack across all unique active
         // experts in this dispatch.  One allocator call → K_out vector
         // sized exactly to ``unique_experts``.

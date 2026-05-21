@@ -522,13 +522,21 @@ public:
             dynamic_tau_.store((float)std::atof(s),
                                   std::memory_order_relaxed);
         }
-        // STREAMLLM_DYNAMIC_KBAR: per-dispatch budget knob — when set,
-        // the allocator pins exactly B_local = round(n_active × kbar)
-        // chunks per dispatch, distributed across active experts by
-        // greedy g²·ΔR.  K̄ becomes the dial.
+        // STREAMLLM_DYNAMIC_KBAR (ablation): per-dispatch chunk-budget
+        // knob — pins exactly B_local = round(n_active × kbar) chunks
+        // per dispatch via the DP knapsack.  K̄ becomes the dial.
         if (const char * s = std::getenv("STREAMLLM_DYNAMIC_KBAR")) {
             dynamic_kbar_.store((float)std::atof(s),
                                    std::memory_order_relaxed);
+        }
+        // STREAMLLM_DYNAMIC_EPS (production): per-dispatch error-budget
+        // knob — allocator picks the smallest Σ K[e] such that the
+        // predicted Σ g²·R[K[e]] ≤ ε.  Effective K̄ is observed per
+        // dispatch.  Wins precedence over KBAR when both are set
+        // (PROBLEM.md §8).
+        if (const char * s = std::getenv("STREAMLLM_DYNAMIC_EPS")) {
+            dynamic_eps_.store((float)std::atof(s),
+                                  std::memory_order_relaxed);
         }
 
         // Eagerly build all per-canonical MoeExpertTable instances now,
@@ -1417,6 +1425,13 @@ public:
         dynamic_kbar_.store(kbar, std::memory_order_relaxed);
         score_table_version_.fetch_add(1, std::memory_order_relaxed);
     }
+    float dynamic_eps() const {
+        return dynamic_eps_.load(std::memory_order_relaxed);
+    }
+    void set_dynamic_eps(float eps) {
+        dynamic_eps_.store(eps, std::memory_order_relaxed);
+        score_table_version_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Per-dispatch K̄-budget allocator (PROBLEM.md §5).
     //
@@ -1448,8 +1463,16 @@ public:
                                     const std::vector<float> & gates,
                                     std::vector<int>         & K_out) const {
         if (dynamic_n_layers_ == 0) return false;
+        // Mode dispatch (PROBLEM.md §3, §8):
+        //   eps  > 0  → ε-budget (production): pick smallest B s.t.
+        //               dp[n][B] ≤ ε.
+        //   kbar > 0  → K̄-budget (ablation):  pin B = round(n × K̄).
+        //   neither   → allocator inactive; caller falls back.
+        const float eps  = dynamic_eps_ .load(std::memory_order_relaxed);
         const float kbar = dynamic_kbar_.load(std::memory_order_relaxed);
-        if (!(kbar > 0.0f)) return false;
+        const bool use_eps  = eps  > 0.0f;
+        const bool use_kbar = !use_eps && kbar > 0.0f;
+        if (!use_eps && !use_kbar) return false;
         const int n = (int) experts.size();
         if (n == 0) return false;
         if ((int) gates.size() != n) return false;
@@ -1461,12 +1484,20 @@ public:
         const int n_K   = K_max - K_min + 1;
         if (n_K <= 1) return true;
 
-        // Target budget. Round-to-nearest, clamp to [n·K_min, n·K_max].
-        long target_l = (long) std::lrint((double) n * (double) kbar);
-        if (target_l < (long) n * K_min) target_l = (long) n * K_min;
-        if (target_l > (long) n * K_max) target_l = (long) n * K_max;
-        const int target = (int) target_l;
-        const int B1 = target + 1;
+        // In ε-mode we need the full DP table up to n·K_max so we can
+        // find the smallest reachable B; in K̄-mode we only need up to
+        // the target.  Unified upper bound: n·K_max.
+        const int Bhi = n * K_max;
+        const int B1  = Bhi + 1;
+
+        // K̄-mode target (clamped).
+        int target = 0;
+        if (use_kbar) {
+            long t = (long) std::lrint((double) n * (double) kbar);
+            if (t < (long) n * K_min) t = (long) n * K_min;
+            if (t > (long) n * K_max) t = (long) n * K_max;
+            target = (int) t;
+        }
 
         // Pre-compute the cost table  C[i, K] = gᵢ² · R[L, eᵢ, K]
         // for K ∈ [K_min, K_max].  Hot-loop access is contiguous over K.
@@ -1517,9 +1548,22 @@ public:
             dp_prev.swap(dp_cur);
         }
 
-        // Backtrack from dp_prev[target] (cell holds the final-row min).
-        if (dp_prev[target] < INF) {
-            int b = target;
+        // Dial dispatch — pick the target B cell.
+        int target_b = -1;
+        if (use_kbar) {
+            target_b = target;
+        } else {  // use_eps
+            // Walk b from n·K_min up; take first b with dp[n][b] ≤ ε.
+            const int b_lo = n * K_min;
+            for (int b = b_lo; b <= Bhi; ++b) {
+                if (dp_prev[b] <= eps) { target_b = b; break; }
+            }
+            if (target_b < 0) target_b = Bhi;   // ε unreachable — full pin
+        }
+
+        // Backtrack from dp_prev[target_b].
+        if (dp_prev[target_b] < INF) {
+            int b = target_b;
             for (int i = n - 1; i >= 0; --i) {
                 const int K_i = (int) trace[(size_t) i * B1 + (size_t) b];
                 K_out[i] = K_i;
@@ -1548,13 +1592,17 @@ public:
             }
             check_sum += K_i;
         }
-        // DP commits to the full budget — there is no "early out" the
-        // way greedy could have.  Hard equality.
-        if (check_sum != (long) target) {
+        // DP commits to the picked budget cell — hard equality.
+        // In K̄-mode this equals the configured target; in ε-mode it
+        // is the smallest reachable B satisfying Σ g²·R[K] ≤ ε.
+        if (check_sum != (long) target_b) {
             std::fprintf(stderr,
                 "streamllm-allocator: invariant 1 violated — "
-                "Σ K[e]=%ld, expected target=%d (K̄=%g n=%d)\n",
-                check_sum, target, (double) kbar, n);
+                "Σ K[e]=%ld, expected target_b=%d "
+                "(mode=%s, K̄=%g ε=%g n=%d)\n",
+                check_sum, target_b,
+                use_eps ? "eps" : "kbar",
+                (double) kbar, (double) eps, n);
             GGML_ABORT("streamllm-allocator: budget not enforced");
         }
 
@@ -1574,10 +1622,14 @@ public:
             for (int i = 0; i < n; ++i) order[i] = i;
             std::sort(order.begin(), order.end(),
                        [&](int a, int b) { return gates[a] > gates[b]; });
-            const int K_unif = (int) std::lrint((double) kbar);
+            // Uniform-K reference for the diagnostic ratio.  Pick the
+            // K that matches the current effective K̄ so the comparison
+            // is fair across modes.
+            const double Kbar_eff = (double) target_b / (double) n;
+            const int K_unif = (int) std::lrint(Kbar_eff);
             const int K_unif_c =
                 std::max(K_min, std::min(K_max, K_unif));
-            double err_greedy = 0.0, err_uniform = 0.0;
+            double err_dp = 0.0, err_uniform = 0.0;
             for (int i = 0; i < n; ++i) {
                 const int e = experts[i];
                 if (e < 0 || e >= dynamic_n_experts_) continue;
@@ -1585,17 +1637,21 @@ public:
                                        + (size_t) e) * (size_t) n_K;
                 const float g = gates[i];
                 const float gg = g * g;
-                const int idx_g = K_out[i]    - K_min;
-                const int idx_u = K_unif_c - K_min;
+                const int idx_g = K_out[i]   - K_min;
+                const int idx_u = K_unif_c   - K_min;
                 if (base + (size_t) idx_g < dynamic_R_.size())
-                    err_greedy  += gg * (double) dynamic_R_[base + (size_t) idx_g];
+                    err_dp      += gg * (double) dynamic_R_[base + (size_t) idx_g];
                 if (base + (size_t) idx_u < dynamic_R_.size())
                     err_uniform += gg * (double) dynamic_R_[base + (size_t) idx_u];
             }
             std::fprintf(stderr,
-                "streamllm-alloc L=%d n=%d K̄=%g  err_greedy=%.6g  err_uniform(K=%d)=%.6g  ratio=%.3f\n",
-                layer, n, (double) kbar, err_greedy, K_unif_c, err_uniform,
-                err_uniform > 0 ? err_greedy / err_uniform : 0.0);
+                "streamllm-alloc L=%d n=%d mode=%s  K̄_eff=%.3f  B=%d  "
+                "err_dp=%.6g  err_uniform(K=%d)=%.6g  ratio=%.3f\n",
+                layer, n,
+                use_eps ? "eps" : "kbar",
+                Kbar_eff, target_b,
+                err_dp, K_unif_c, err_uniform,
+                err_uniform > 0 ? err_dp / err_uniform : 0.0);
             std::fprintf(stderr, "  experts↓gate ");
             for (int j = 0; j < n && j < 16; ++j) {
                 const int i = order[j];
@@ -1672,12 +1728,17 @@ private:
     int                  dynamic_K_min_     = 0;
     int                  dynamic_K_max_     = 0;
     std::atomic<float>   dynamic_tau_{0.0f};
-    // K̄ knob (STREAMLLM_DYNAMIC_KBAR).  When set, the per-dispatch
-    // allocator interprets the local budget as
+    // K̄ knob (STREAMLLM_DYNAMIC_KBAR, ablation): when set the
+    // per-dispatch allocator pins exactly
     //   B_local = round(n_active_experts × kbar)
-    // and runs a greedy knapsack on g²·ΔR to fill it.  When 0, the
-    // per-expert τ walk is used instead (legacy path).
+    // chunks, distributed by DP on Σ g²·R[K[e]].
     std::atomic<float>   dynamic_kbar_{0.0f};
+    // ε knob (STREAMLLM_DYNAMIC_EPS, production): when set the
+    // allocator picks the smallest B such that
+    //   min_K  Σ g[e]² · R[L, e, K[e]]  ≤  ε
+    // Effective K̄ is observed (= B / n_active).  Wins precedence
+    // over KBAR when both are non-zero.
+    std::atomic<float>   dynamic_eps_{0.0f};
 
     // STREAMLLM_ALLOW_CAPTURE=1: opt-in to CUDA-graph capture for the
     // managed cgraph. Only legal when the operator has set
@@ -2010,6 +2071,12 @@ float scheduler_dynamic_kbar(const Scheduler & sched) {
 }
 void scheduler_set_dynamic_kbar(Scheduler & sched, float kbar) {
     as_moe(sched).set_dynamic_kbar(kbar);
+}
+float scheduler_dynamic_eps(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dynamic_eps();
+}
+void scheduler_set_dynamic_eps(Scheduler & sched, float eps) {
+    as_moe(sched).set_dynamic_eps(eps);
 }
 bool scheduler_allocate_dispatch_budget(const Scheduler &        sched,
                                           int                      layer,

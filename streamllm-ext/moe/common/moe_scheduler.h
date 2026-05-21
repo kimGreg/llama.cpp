@@ -177,13 +177,19 @@ int    scheduler_dynamic_K_for(const Scheduler & sched,
 float  scheduler_dynamic_tau(const Scheduler & sched);
 void   scheduler_set_dynamic_tau(Scheduler & sched, float tau);
 
-// K̄-budget per-dispatch allocator.  When kbar > 0, the runtime picks
+// K̄-budget per-dispatch allocator (ablation).  When kbar > 0, the
+// runtime pins exactly
 //   B_local = round(|experts| × kbar)
-// total chunks per dispatch and distributes them across the active
-// experts by greedy g²·ΔR.  Returns false when residuals aren't
-// loaded or kbar is 0 (caller falls back to the τ / threshold path).
+// total chunks per dispatch via DP on Σ g²·R[K[e]].
 float  scheduler_dynamic_kbar(const Scheduler & sched);
 void   scheduler_set_dynamic_kbar(Scheduler & sched, float kbar);
+// ε-budget per-dispatch allocator (production).  When eps > 0, the
+// runtime picks the smallest B such that
+//   min over K[] of Σ g[e]² · R[L, e, K[e]]  ≤  eps
+// Effective K̄ is observed (= B / |experts|).  eps takes precedence
+// over kbar when both are non-zero.  See PROBLEM.md §3.
+float  scheduler_dynamic_eps (const Scheduler & sched);
+void   scheduler_set_dynamic_eps (Scheduler & sched, float eps);
 bool   scheduler_allocate_dispatch_budget(
     const Scheduler &          sched,
     int                        layer,
