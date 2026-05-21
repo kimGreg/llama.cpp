@@ -1418,37 +1418,31 @@ public:
         score_table_version_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Per-dispatch K̄-budget allocator.  For one MoE matmul dispatch:
+    // Per-dispatch K̄-budget allocator (PROBLEM.md §5).
+    //
     //   n        = experts.size() = number of unique active experts
     //   B_local  = round(n × kbar)   chunks total to spend this dispatch
     //
-    // Initialises every K_out[i] = K_min (n × K_min chunks spent), then
-    // hands out the remaining (B_local − n·K_min) chunks one at a time
-    // to whichever active expert currently has the highest *marginal*
-    // gain g²·ΔR(K→K+1).  Returns true when residuals are loaded and
-    // ``kbar > 0`` (caller uses K_out); false otherwise (caller falls
-    // back to the τ / threshold path).
+    // Solves the multi-choice 0/1 knapsack
     //
-    // Implementation: thread-local flat arrays + linear scan for the
-    // argmax (NO heap, NO std::priority_queue, NO per-call allocation
-    // after the first dispatch).  Cost analysis at production scale:
+    //   minimise   Σᵢ gᵢ² · R[L, eᵢ, Kᵢ]
+    //   over       Kᵢ ∈ {K_min, …, K_max}    for i = 1..n
+    //   s.t.       Σᵢ Kᵢ  =  B_local                (hard equality)
     //
-    //   batch=1 generation, Qwen3 (top_k=8, K_range=5):
-    //     n ≤ 8, B_remaining ≤ 8·(K_max−K_min) = 32 increments
-    //     work per increment = O(n) = O(8) compare-and-track
-    //     total per dispatch = 8 × 32 = 256 float compares ≈ 0.5 μs
-    //     × 3 matmuls/layer × 48 layers = ≈ 70 μs per token
-    //     → ~0.2 % of a 30 t/s decode token budget
+    // via O(n × B × K_range) dynamic programming.  Optimal regardless
+    // of whether R[L, e, K] is monotone-non-increasing in K (greedy
+    // would lose on non-monotone curves — see commit msg / PROBLEM.md
+    // §3.2 caveat).
     //
-    //   prefill batch=64, top_k=8 → up to n=128 active experts:
-    //     work per dispatch = 128 × (128·4) = ≈ 65 k compares ≈ 100 μs
-    //     × 144 dispatches = ≈ 15 ms per prefill batch
-    //     vs. ~40 ms of GPU MoE compute for that batch → ~3 %
+    // Implementation: two rolling float buffers (dp_prev, dp_cur) +
+    // a (n × (B+1)) trace table of int8 K-choices.  All thread-local
+    // so no allocation per dispatch after warm-up.
     //
-    // For the workload that actually motivates this experiment
-    // (per-token decode at b=1 ub=1 for the KLD sweep), overhead is
-    // demonstrably in the sub-microsecond range — well below kernel
-    // launch noise.
+    // Cost analysis at production scale:
+    //   decode b=1, Qwen3 (top_k=8, K_range=7, B≤64):
+    //     ~8 × 64 × 7 = 3.6 k float ops/dispatch ≈ 2 μs
+    //     × 144 dispatches/token = ≈ 300 μs/token
+    //     → ~1 % of a 30 t/s decode budget.
     bool allocate_dispatch_budget(int layer,
                                     const std::vector<int>   & experts,
                                     const std::vector<float> & gates,
@@ -1468,59 +1462,146 @@ public:
         if (n_K <= 1) return true;
 
         // Target budget. Round-to-nearest, clamp to [n·K_min, n·K_max].
-        long target = (long) std::lrint((double) n * (double) kbar);
-        if (target < (long) n * K_min) target = (long) n * K_min;
-        if (target > (long) n * K_max) target = (long) n * K_max;
-        long remaining = target - (long) n * K_min;
-        if (remaining <= 0) return true;
+        long target_l = (long) std::lrint((double) n * (double) kbar);
+        if (target_l < (long) n * K_min) target_l = (long) n * K_min;
+        if (target_l > (long) n * K_max) target_l = (long) n * K_max;
+        const int target = (int) target_l;
+        const int B1 = target + 1;
 
-        // Thread-local scratch — sized once per worker thread, reused
-        // every dispatch.  Holds the marginal-gain of going from each
-        // expert's current K to K+1, plus the current K_idx.
-        thread_local std::vector<float> tls_next_gain;
-        thread_local std::vector<int>   tls_next_ki;
-        tls_next_gain.assign(n, 0.0f);
-        tls_next_ki.assign(n, 1);
-
-        auto gain_of = [&](int eidx, int ki) -> float {
-            const int e = experts[eidx];
-            if (e < 0 || e >= dynamic_n_experts_) return 0.0f;
+        // Pre-compute the cost table  C[i, K] = gᵢ² · R[L, eᵢ, K]
+        // for K ∈ [K_min, K_max].  Hot-loop access is contiguous over K.
+        thread_local std::vector<float> tls_C;
+        tls_C.assign((size_t) n * n_K, 0.0f);
+        for (int i = 0; i < n; ++i) {
+            const int e = experts[i];
+            if (e < 0 || e >= dynamic_n_experts_) continue;
             const size_t base = ((size_t) layer * dynamic_n_experts_
                                   + (size_t) e) * (size_t) n_K;
-            if (base + (size_t) ki >= dynamic_R_.size()) return 0.0f;
-            const float R_prev = dynamic_R_[base + (size_t)(ki - 1)];
-            const float R_here = dynamic_R_[base + (size_t)ki];
-            const float dR = R_prev - R_here;
-            const float g  = gates[eidx];
-            return g * g * (dR > 0.0f ? dR : 0.0f);
-        };
-        for (int i = 0; i < n; ++i) {
-            tls_next_gain[i] = gain_of(i, 1);
+            const float g  = gates[i];
+            const float gg = g * g;
+            for (int k = 0; k < n_K; ++k) {
+                const size_t pos = base + (size_t) k;
+                const float r = (pos < dynamic_R_.size()) ? dynamic_R_[pos] : 0.0f;
+                tls_C[(size_t) i * n_K + (size_t) k] = gg * r;
+            }
         }
 
-        // Greedy: scan, pick argmax, increment, advance to next gain.
-        // We continue handing out slots even when all remaining gains
-        // are 0 — the caller committed to spending B_local chunks
-        // (matching uniform/static semantics).  Ties broken by lower
-        // index (stable).
-        while (remaining > 0) {
-            int   best_i    = -1;
-            float best_gain = -1.0f;
-            for (int i = 0; i < n; ++i) {
-                if (tls_next_ki[i] >= n_K) continue;   // already at K_max
-                if (tls_next_gain[i] > best_gain) {
-                    best_gain = tls_next_gain[i];
-                    best_i    = i;
+        // DP.  dp[b] = min Σ g²·R over first i experts spending b chunks.
+        // We use INF = 1e30f as "unreachable".
+        constexpr float INF = 1e30f;
+        thread_local std::vector<float>   dp_prev, dp_cur;
+        thread_local std::vector<uint8_t> trace;   // K choice per (i, b)
+        dp_prev.assign((size_t) B1, INF);
+        dp_cur .resize((size_t) B1);
+        trace  .assign((size_t) n * B1, 0);
+        dp_prev[0] = 0.0f;
+
+        for (int i = 0; i < n; ++i) {
+            std::fill(dp_cur.begin(), dp_cur.end(), INF);
+            const float * Ci = &tls_C[(size_t) i * n_K];
+            uint8_t * trace_i = &trace[(size_t) i * B1];
+            for (int b_prev = 0; b_prev < B1; ++b_prev) {
+                const float dp_p = dp_prev[b_prev];
+                if (dp_p >= INF) continue;
+                for (int k = 0; k < n_K; ++k) {
+                    const int K_val = K_min + k;
+                    const int b_new = b_prev + K_val;
+                    if (b_new >= B1) break;
+                    const float cost = dp_p + Ci[k];
+                    if (cost < dp_cur[b_new]) {
+                        dp_cur[b_new] = cost;
+                        trace_i[b_new] = (uint8_t) K_val;
+                    }
                 }
             }
-            if (best_i < 0) break;   // every expert at K_max
-            K_out[best_i] = K_min + tls_next_ki[best_i];
-            tls_next_ki[best_i] += 1;
-            remaining -= 1;
-            tls_next_gain[best_i] =
-                (tls_next_ki[best_i] < n_K)
-                    ? gain_of(best_i, tls_next_ki[best_i])
-                    : -1.0f;
+            dp_prev.swap(dp_cur);
+        }
+
+        // Backtrack from dp_prev[target] (cell holds the final-row min).
+        if (dp_prev[target] < INF) {
+            int b = target;
+            for (int i = n - 1; i >= 0; --i) {
+                const int K_i = (int) trace[(size_t) i * B1 + (size_t) b];
+                K_out[i] = K_i;
+                b -= K_i;
+            }
+        }
+        // else: DP couldn't reach target (shouldn't happen given the
+        // [n·K_min, n·K_max] clamp). Sanity check below catches it.
+
+        // ── Runtime sanity check — PROBLEM.md §10 invariants ──
+        // Hard-enforced because the rest of the dispatch pipeline
+        // (kernel grid dims, per-expert chunk pointer tables) assumes
+        // these without re-checking; a silent budget violation here
+        // produces wrong reconstructions, not a crash.  Cost: one
+        // pass + 2 ints — negligible vs the kernel launch that
+        // follows.
+        long check_sum = 0;
+        for (int i = 0; i < n; ++i) {
+            const int K_i = K_out[i];
+            if (K_i < K_min || K_i > K_max) {
+                std::fprintf(stderr,
+                    "streamllm-allocator: invariant 2 violated — "
+                    "K[%d]=%d outside [%d, %d]\n",
+                    i, K_i, K_min, K_max);
+                GGML_ABORT("streamllm-allocator: per-expert K out of range");
+            }
+            check_sum += K_i;
+        }
+        // DP commits to the full budget — there is no "early out" the
+        // way greedy could have.  Hard equality.
+        if (check_sum != (long) target) {
+            std::fprintf(stderr,
+                "streamllm-allocator: invariant 1 violated — "
+                "Σ K[e]=%ld, expected target=%d (K̄=%g n=%d)\n",
+                check_sum, target, (double) kbar, n);
+            GGML_ABORT("streamllm-allocator: budget not enforced");
+        }
+
+        // ── Optional per-layer first-dispatch dump for diagnosis.
+        // STREAMLLM_LOG_ALLOC=1 emits one log line per (layer × first
+        // dispatch encountered) with the gate distribution, the
+        // chosen K[], the greedy total cost Σ g²·R[K], and the
+        // uniform-baseline cost Σ g²·R[K̄] for comparison.  Used to
+        // pinpoint where greedy diverges from uniform.
+        static std::atomic<bool> alloc_log_layer_seen[256] = {};
+        const char * log_env = std::getenv("STREAMLLM_LOG_ALLOC");
+        if (log_env && log_env[0] && log_env[0] != '0' &&
+            layer >= 0 && layer < 256 &&
+            !alloc_log_layer_seen[layer].exchange(true)) {
+            // Sort experts by gate desc for readability.
+            std::vector<int> order(n);
+            for (int i = 0; i < n; ++i) order[i] = i;
+            std::sort(order.begin(), order.end(),
+                       [&](int a, int b) { return gates[a] > gates[b]; });
+            const int K_unif = (int) std::lrint((double) kbar);
+            const int K_unif_c =
+                std::max(K_min, std::min(K_max, K_unif));
+            double err_greedy = 0.0, err_uniform = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const int e = experts[i];
+                if (e < 0 || e >= dynamic_n_experts_) continue;
+                const size_t base = ((size_t) layer * dynamic_n_experts_
+                                       + (size_t) e) * (size_t) n_K;
+                const float g = gates[i];
+                const float gg = g * g;
+                const int idx_g = K_out[i]    - K_min;
+                const int idx_u = K_unif_c - K_min;
+                if (base + (size_t) idx_g < dynamic_R_.size())
+                    err_greedy  += gg * (double) dynamic_R_[base + (size_t) idx_g];
+                if (base + (size_t) idx_u < dynamic_R_.size())
+                    err_uniform += gg * (double) dynamic_R_[base + (size_t) idx_u];
+            }
+            std::fprintf(stderr,
+                "streamllm-alloc L=%d n=%d K̄=%g  err_greedy=%.6g  err_uniform(K=%d)=%.6g  ratio=%.3f\n",
+                layer, n, (double) kbar, err_greedy, K_unif_c, err_uniform,
+                err_uniform > 0 ? err_greedy / err_uniform : 0.0);
+            std::fprintf(stderr, "  experts↓gate ");
+            for (int j = 0; j < n && j < 16; ++j) {
+                const int i = order[j];
+                std::fprintf(stderr, " e%d:g=%.3f→K=%d", experts[i], gates[i], K_out[i]);
+            }
+            std::fprintf(stderr, "\n");
         }
         return true;
     }

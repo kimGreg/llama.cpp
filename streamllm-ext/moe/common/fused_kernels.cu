@@ -833,6 +833,31 @@ __global__ void k_plan_per_expert_kbar(
             s_K[best_e] += 1;
             remaining   -= 1;
         }
+
+        // ── Runtime sanity check — PROBLEM.md §10 invariants.
+        // GPU side mirrors the CPU allocator's asserts.  On violation
+        // we trap; the host-side launcher detects via cudaGetLastError
+        // and aborts.  Cost: linear pass + 2 ints, all in 1 thread.
+        long check_sum = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            if (!s_active[e]) continue;
+            const int K_i = s_K[e];
+            if (K_i < K_min || K_i > K_max) {
+                printf("streamllm-allocator[gpu]: K[%d]=%d outside "
+                        "[%d, %d] at layer (kbar=%g)\n",
+                        e, K_i, K_min, K_max, (double) kbar);
+                __trap();
+            }
+            check_sum += K_i;
+        }
+        const long expected = target - remaining;
+        if (check_sum != expected) {
+            printf("streamllm-allocator[gpu]: Σ K[e]=%ld != "
+                    "expected=%ld (target=%ld remaining=%ld n_active=%d kbar=%g)\n",
+                    check_sum, expected, target, remaining, n_active,
+                    (double) kbar);
+            __trap();
+        }
     }
     __syncthreads();
 

@@ -322,10 +322,34 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
         ? qwen3::scheduler_dynamic_kbar(*sched_) : 0.0f;
     const bool use_dynamic_kbar =
         use_dynamic && dyn_kbar > 0.0f && layer_index_ >= 0;
+    // STREAMLLM_UNIFORM_K=N: ablation knob — force K[e] = N for every
+    // active expert this dispatch.  Bypasses both dynamic-K̄ and the
+    // legacy threshold path.  Used by the uniform baseline rows of
+    // the K̄ sweep (PROBLEM.md §11 — uniform is a comparison anchor,
+    // not a production allocator).
+    int uniform_k_override = 0;
+    if (const char * s = std::getenv("STREAMLLM_UNIFORM_K")) {
+        uniform_k_override = std::atoi(s);
+        if (uniform_k_override < 1) uniform_k_override = 0;
+        if (uniform_k_override > n_chunks_max) uniform_k_override = n_chunks_max;
+    }
 
     // Wall-clock the dynamic K-decision loop so we can report overhead.
     auto _decision_t0 = std::chrono::steady_clock::now();
 
+    if (uniform_k_override > 0) {
+        // ── Path U: uniform-K ablation override.  Force every active
+        // expert to the configured K, bypassing all dynamic/static
+        // logic.  Used to draw the uniform-K baseline curve in the
+        // K̄ sweep.
+        for (int eid : unique_experts) {
+            chunks_by_expert[eid] = uniform_k_override;
+            if (host_n_chunks_per_expert_ != nullptr &&
+                eid >= 0 && eid < n_experts_) {
+                host_n_chunks_per_expert_[eid] = uniform_k_override;
+            }
+        }
+    } else
     if (use_dynamic_kbar) {
         // ── Path B': K̄-budget knapsack across all unique active
         // experts in this dispatch.  One allocator call → K_out vector
