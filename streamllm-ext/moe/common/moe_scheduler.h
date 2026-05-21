@@ -177,4 +177,26 @@ int    scheduler_dynamic_K_for(const Scheduler & sched,
 float  scheduler_dynamic_tau(const Scheduler & sched);
 void   scheduler_set_dynamic_tau(Scheduler & sched, float tau);
 
+// K̄-budget per-dispatch allocator.  When kbar > 0, the runtime picks
+//   B_local = round(|experts| × kbar)
+// total chunks per dispatch and distributes them across the active
+// experts by greedy g²·ΔR.  Returns false when residuals aren't
+// loaded or kbar is 0 (caller falls back to the τ / threshold path).
+float  scheduler_dynamic_kbar(const Scheduler & sched);
+void   scheduler_set_dynamic_kbar(Scheduler & sched, float kbar);
+bool   scheduler_allocate_dispatch_budget(
+    const Scheduler &          sched,
+    int                        layer,
+    const std::vector<int>   & experts,
+    const std::vector<float> & gates,
+    std::vector<int>         & K_out);
+// Device-side mirror of dynamic_R_, K_min, K_max — populated by the
+// scheduler when STREAMLLM_ALLOW_CAPTURE=1 AND residuals are loaded.
+// Read by the capture-mode K̄-knapsack plan kernel
+// (launch_plan_per_expert_kbar).  Returns nullptr / 0 / 0 outside
+// capture mode.
+const float * scheduler_dynamic_R_device(const Scheduler & sched);
+int           scheduler_dynamic_K_min   (const Scheduler & sched);
+int           scheduler_dynamic_K_max   (const Scheduler & sched);
+
 }}  // namespace streamllm_ext::qwen3

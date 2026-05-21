@@ -217,5 +217,39 @@ void launch_plan_per_expert_planes(
     int *           planes_per_eid_d,
     StreamHandle    stream);
 
+// ─── Capture-mode K̄-knapsack plan kernel ──────────────────────────
+// Same role as launch_plan_per_expert_planes but for the rung-2
+// per-dispatch budget allocator: total chunks = round(n_active × kbar),
+// distributed across active experts by greedy g²·ΔR.  Reads the
+// residuals table on device (uploaded by the scheduler at install
+// time) and writes ``planes_per_eid_d`` entirely on device — no host
+// round-trip, capture-safe.
+//
+// One block, n_expert ≤ 256 threads.  Shared-memory budget ≈
+//   n_expert × (4 + 4 + 4)  +  n_expert × n_K × 4   ≤ 4 KB for the
+// Qwen3 case (128 expert × 6 K).
+//
+//   R_d            [n_layers × n_expert × n_K]   f32 — residual table.
+//   K_min, K_max                              int  — index range in R.
+//   layer_index                                int  — row of R to use.
+//   kbar                                       f32 — budget multiplier.
+void launch_plan_per_expert_kbar(
+    const int32_t * ids_d,
+    const float *   weights_d,
+    const float *   probs_d,
+    const float *   R_d,
+    int             K_min,
+    int             K_max,
+    int             layer_index,
+    float           kbar,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             n_chunks_max,
+    int             base_p,
+    bool            any_precision,
+    int *           planes_per_eid_d,
+    StreamHandle    stream);
+
 }  // namespace qwen3
 }  // namespace streamllm_ext

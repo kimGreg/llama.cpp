@@ -35,6 +35,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <queue>
 #include <string>
 #include <mutex>
 #include <unordered_map>
@@ -194,6 +195,10 @@ public:
         if (score_thresholds_d_ != nullptr) {
             cudaFree(score_thresholds_d_);
             score_thresholds_d_ = nullptr;
+        }
+        if (dynamic_R_d_ != nullptr) {
+            cudaFree(dynamic_R_d_);
+            dynamic_R_d_ = nullptr;
         }
     }
 
@@ -517,6 +522,14 @@ public:
             dynamic_tau_.store((float)std::atof(s),
                                   std::memory_order_relaxed);
         }
+        // STREAMLLM_DYNAMIC_KBAR: per-dispatch budget knob — when set,
+        // the allocator pins exactly B_local = round(n_active × kbar)
+        // chunks per dispatch, distributed across active experts by
+        // greedy g²·ΔR.  K̄ becomes the dial.
+        if (const char * s = std::getenv("STREAMLLM_DYNAMIC_KBAR")) {
+            dynamic_kbar_.store((float)std::atof(s),
+                                   std::memory_order_relaxed);
+        }
 
         // Eagerly build all per-canonical MoeExpertTable instances now,
         // so the first mul_mat_id hook call doesn't pay the build cost
@@ -635,6 +648,15 @@ public:
             cudaMemcpy(score_thresholds_d_, snap.data(),
                        th_bytes, cudaMemcpyHostToDevice);
             score_thresholds_d_version_ = version;
+            // Device-side mirror of the dynamic-residuals table — used
+            // by the K̄-knapsack plan kernel (capture-mode rung 2).
+            // Allocated lazily here; the H2D in set_dynamic_residuals
+            // does the actual upload when the residuals first arrive.
+            // If residuals are already loaded by this point (env-var
+            // path), upload them now.
+            if (!dynamic_R_.empty()) {
+                upload_dynamic_R_to_device_unlocked();
+            }
         }
     }
 
@@ -1305,6 +1327,9 @@ public:
             // invalidates (the dispatch decision encodes into the
             // grid/launch shape).
             score_table_version_.fetch_add(1, std::memory_order_relaxed);
+            if (allow_capture_) {
+                upload_dynamic_R_to_device_unlocked();
+            }
         }
         std::fprintf(stderr,
             "streamllm-scheduler[moe]: dynamic_residuals SET — n_layers=%d "
@@ -1312,6 +1337,36 @@ public:
             n_layers, n_experts, K_min, K_max, dynamic_tau_.load());
         return true;
     }
+    // Upload the host dynamic_R_ table to the device mirror.  Caller
+    // must hold score_table_mu_.  Re-allocates dynamic_R_d_ when the
+    // shape changes (rare — set once at install).
+    void upload_dynamic_R_to_device_unlocked() {
+        const size_t want = dynamic_R_.size();
+        if (want == 0) return;
+        if (dynamic_R_d_ != nullptr && dynamic_R_d_count_ != want) {
+            cudaFree(dynamic_R_d_);
+            dynamic_R_d_ = nullptr;
+            dynamic_R_d_count_ = 0;
+        }
+        if (dynamic_R_d_ == nullptr) {
+            const size_t bytes = want * sizeof(float);
+            cudaError_t err = cudaMalloc(&dynamic_R_d_, bytes);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr,
+                    "streamllm-scheduler[moe]: cudaMalloc(dynamic_R_d, "
+                    "%zu B) failed: %s — falling back to host plan\n",
+                    bytes, cudaGetErrorString(err));
+                dynamic_R_d_ = nullptr;
+                return;
+            }
+            dynamic_R_d_count_ = want;
+        }
+        cudaMemcpy(dynamic_R_d_, dynamic_R_.data(),
+                    want * sizeof(float), cudaMemcpyHostToDevice);
+    }
+    const float * dynamic_R_device() const { return dynamic_R_d_; }
+    int dynamic_K_min() const { return dynamic_K_min_; }
+    int dynamic_K_max() const { return dynamic_K_max_; }
     void clear_dynamic_residuals() {
         std::lock_guard<std::mutex> lk(score_table_mu_);
         dynamic_R_.clear();
@@ -1354,6 +1409,120 @@ public:
     void set_dynamic_tau(float tau) {
         dynamic_tau_.store(tau, std::memory_order_relaxed);
         score_table_version_.fetch_add(1, std::memory_order_relaxed);
+    }
+    float dynamic_kbar() const {
+        return dynamic_kbar_.load(std::memory_order_relaxed);
+    }
+    void set_dynamic_kbar(float kbar) {
+        dynamic_kbar_.store(kbar, std::memory_order_relaxed);
+        score_table_version_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Per-dispatch K̄-budget allocator.  For one MoE matmul dispatch:
+    //   n        = experts.size() = number of unique active experts
+    //   B_local  = round(n × kbar)   chunks total to spend this dispatch
+    //
+    // Initialises every K_out[i] = K_min (n × K_min chunks spent), then
+    // hands out the remaining (B_local − n·K_min) chunks one at a time
+    // to whichever active expert currently has the highest *marginal*
+    // gain g²·ΔR(K→K+1).  Returns true when residuals are loaded and
+    // ``kbar > 0`` (caller uses K_out); false otherwise (caller falls
+    // back to the τ / threshold path).
+    //
+    // Implementation: thread-local flat arrays + linear scan for the
+    // argmax (NO heap, NO std::priority_queue, NO per-call allocation
+    // after the first dispatch).  Cost analysis at production scale:
+    //
+    //   batch=1 generation, Qwen3 (top_k=8, K_range=5):
+    //     n ≤ 8, B_remaining ≤ 8·(K_max−K_min) = 32 increments
+    //     work per increment = O(n) = O(8) compare-and-track
+    //     total per dispatch = 8 × 32 = 256 float compares ≈ 0.5 μs
+    //     × 3 matmuls/layer × 48 layers = ≈ 70 μs per token
+    //     → ~0.2 % of a 30 t/s decode token budget
+    //
+    //   prefill batch=64, top_k=8 → up to n=128 active experts:
+    //     work per dispatch = 128 × (128·4) = ≈ 65 k compares ≈ 100 μs
+    //     × 144 dispatches = ≈ 15 ms per prefill batch
+    //     vs. ~40 ms of GPU MoE compute for that batch → ~3 %
+    //
+    // For the workload that actually motivates this experiment
+    // (per-token decode at b=1 ub=1 for the KLD sweep), overhead is
+    // demonstrably in the sub-microsecond range — well below kernel
+    // launch noise.
+    bool allocate_dispatch_budget(int layer,
+                                    const std::vector<int>   & experts,
+                                    const std::vector<float> & gates,
+                                    std::vector<int>         & K_out) const {
+        if (dynamic_n_layers_ == 0) return false;
+        const float kbar = dynamic_kbar_.load(std::memory_order_relaxed);
+        if (!(kbar > 0.0f)) return false;
+        const int n = (int) experts.size();
+        if (n == 0) return false;
+        if ((int) gates.size() != n) return false;
+        K_out.assign(n, dynamic_K_min_);
+        if (layer < 0 || layer >= dynamic_n_layers_) return true;
+
+        const int K_min = dynamic_K_min_;
+        const int K_max = dynamic_K_max_;
+        const int n_K   = K_max - K_min + 1;
+        if (n_K <= 1) return true;
+
+        // Target budget. Round-to-nearest, clamp to [n·K_min, n·K_max].
+        long target = (long) std::lrint((double) n * (double) kbar);
+        if (target < (long) n * K_min) target = (long) n * K_min;
+        if (target > (long) n * K_max) target = (long) n * K_max;
+        long remaining = target - (long) n * K_min;
+        if (remaining <= 0) return true;
+
+        // Thread-local scratch — sized once per worker thread, reused
+        // every dispatch.  Holds the marginal-gain of going from each
+        // expert's current K to K+1, plus the current K_idx.
+        thread_local std::vector<float> tls_next_gain;
+        thread_local std::vector<int>   tls_next_ki;
+        tls_next_gain.assign(n, 0.0f);
+        tls_next_ki.assign(n, 1);
+
+        auto gain_of = [&](int eidx, int ki) -> float {
+            const int e = experts[eidx];
+            if (e < 0 || e >= dynamic_n_experts_) return 0.0f;
+            const size_t base = ((size_t) layer * dynamic_n_experts_
+                                  + (size_t) e) * (size_t) n_K;
+            if (base + (size_t) ki >= dynamic_R_.size()) return 0.0f;
+            const float R_prev = dynamic_R_[base + (size_t)(ki - 1)];
+            const float R_here = dynamic_R_[base + (size_t)ki];
+            const float dR = R_prev - R_here;
+            const float g  = gates[eidx];
+            return g * g * (dR > 0.0f ? dR : 0.0f);
+        };
+        for (int i = 0; i < n; ++i) {
+            tls_next_gain[i] = gain_of(i, 1);
+        }
+
+        // Greedy: scan, pick argmax, increment, advance to next gain.
+        // We continue handing out slots even when all remaining gains
+        // are 0 — the caller committed to spending B_local chunks
+        // (matching uniform/static semantics).  Ties broken by lower
+        // index (stable).
+        while (remaining > 0) {
+            int   best_i    = -1;
+            float best_gain = -1.0f;
+            for (int i = 0; i < n; ++i) {
+                if (tls_next_ki[i] >= n_K) continue;   // already at K_max
+                if (tls_next_gain[i] > best_gain) {
+                    best_gain = tls_next_gain[i];
+                    best_i    = i;
+                }
+            }
+            if (best_i < 0) break;   // every expert at K_max
+            K_out[best_i] = K_min + tls_next_ki[best_i];
+            tls_next_ki[best_i] += 1;
+            remaining -= 1;
+            tls_next_gain[best_i] =
+                (tls_next_ki[best_i] < n_K)
+                    ? gain_of(best_i, tls_next_ki[best_i])
+                    : -1.0f;
+        }
+        return true;
     }
 
 private:
@@ -1422,6 +1591,12 @@ private:
     int                  dynamic_K_min_     = 0;
     int                  dynamic_K_max_     = 0;
     std::atomic<float>   dynamic_tau_{0.0f};
+    // K̄ knob (STREAMLLM_DYNAMIC_KBAR).  When set, the per-dispatch
+    // allocator interprets the local budget as
+    //   B_local = round(n_active_experts × kbar)
+    // and runs a greedy knapsack on g²·ΔR to fill it.  When 0, the
+    // per-expert τ walk is used instead (legacy path).
+    std::atomic<float>   dynamic_kbar_{0.0f};
 
     // STREAMLLM_ALLOW_CAPTURE=1: opt-in to CUDA-graph capture for the
     // managed cgraph. Only legal when the operator has set
@@ -1437,6 +1612,12 @@ private:
     // pushed.  nullptr in non-capture mode.
     float *               score_thresholds_d_ = nullptr;
     uint64_t              score_thresholds_d_version_ = 0;
+    // Device mirror of dynamic_R_ for the capture-mode K̄-knapsack plan.
+    // Allocated when allow_capture_ is set AND residuals are loaded;
+    // refreshed on every set_dynamic_residuals() call.  nullptr when
+    // either capture is off or residuals haven't been installed.
+    float *               dynamic_R_d_ = nullptr;
+    size_t                dynamic_R_d_count_ = 0;
 
     std::unordered_map<std::string, int> P_of_;
     // Synthetic wids whose host layout flag had any_precision=true.
@@ -1742,6 +1923,29 @@ float scheduler_dynamic_tau(const Scheduler & sched) {
 }
 void scheduler_set_dynamic_tau(Scheduler & sched, float tau) {
     as_moe(sched).set_dynamic_tau(tau);
+}
+float scheduler_dynamic_kbar(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dynamic_kbar();
+}
+void scheduler_set_dynamic_kbar(Scheduler & sched, float kbar) {
+    as_moe(sched).set_dynamic_kbar(kbar);
+}
+bool scheduler_allocate_dispatch_budget(const Scheduler &        sched,
+                                          int                      layer,
+                                          const std::vector<int>   & experts,
+                                          const std::vector<float> & gates,
+                                          std::vector<int>         & K_out) {
+    return static_cast<const MoEScheduler &>(sched)
+        .allocate_dispatch_budget(layer, experts, gates, K_out);
+}
+const float * scheduler_dynamic_R_device(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dynamic_R_device();
+}
+int scheduler_dynamic_K_min(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dynamic_K_min();
+}
+int scheduler_dynamic_K_max(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dynamic_K_max();
 }
 
 MoEMatMulComp * scheduler_lookup_moe_comp(

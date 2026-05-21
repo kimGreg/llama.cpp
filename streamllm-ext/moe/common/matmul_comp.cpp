@@ -316,6 +316,44 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     const bool use_static  = qwen3::scheduler_has_static_layout(*sched_);
     const bool use_dynamic = !use_static
                               && qwen3::scheduler_has_dynamic_residuals(*sched_);
+    // K̄-budget allocator: when set, replace per-expert τ-walk with a
+    // single per-dispatch knapsack on top of the residuals table.
+    const float dyn_kbar = use_dynamic
+        ? qwen3::scheduler_dynamic_kbar(*sched_) : 0.0f;
+    const bool use_dynamic_kbar =
+        use_dynamic && dyn_kbar > 0.0f && layer_index_ >= 0;
+
+    // Wall-clock the dynamic K-decision loop so we can report overhead.
+    auto _decision_t0 = std::chrono::steady_clock::now();
+
+    if (use_dynamic_kbar) {
+        // ── Path B': K̄-budget knapsack across all unique active
+        // experts in this dispatch.  One allocator call → K_out vector
+        // sized exactly to ``unique_experts``.
+        std::vector<float> gates(unique_experts.size());
+        for (size_t i = 0; i < unique_experts.size(); ++i) {
+            gates[i] = max_gate_by_expert[unique_experts[i]];
+        }
+        std::vector<int> K_out;
+        const bool ok = qwen3::scheduler_allocate_dispatch_budget(
+            *sched_, layer_index_, unique_experts, gates, K_out);
+        for (size_t i = 0; i < unique_experts.size(); ++i) {
+            const int eid = unique_experts[i];
+            int required_chunks;
+            if (ok) {
+                required_chunks = K_out[i];
+            } else {
+                required_chunks = chunks_for_gate(gates[i]);
+            }
+            if (required_chunks < 1)            required_chunks = 1;
+            if (required_chunks > n_chunks_max) required_chunks = n_chunks_max;
+            chunks_by_expert[eid] = required_chunks;
+            if (host_n_chunks_per_expert_ != nullptr &&
+                eid >= 0 && eid < n_experts_) {
+                host_n_chunks_per_expert_[eid] = required_chunks;
+            }
+        }
+    } else
     for (int eid : unique_experts) {
         int required_chunks;
         if (use_static && layer_index_ >= 0) {
@@ -350,6 +388,18 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
             host_n_chunks_per_expert_[eid] = required_chunks;
         }
     }
+    // Capture the per-dispatch decision-loop time so we can budget the
+    // dynamic dispatcher's CPU overhead vs static / threshold paths.
+    const auto _decision_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _decision_t0).count();
+    // Per-layer running-total of decision time so the final dump reports
+    // average ns/decision-call.
+    static std::atomic<uint64_t> decision_ns_per_layer[256] = {};
+    if (layer_index_ >= 0 && layer_index_ < 256) {
+        decision_ns_per_layer[layer_index_].fetch_add(
+            (uint64_t) _decision_ns, std::memory_order_relaxed);
+    }
+
     // Running-average K̄ across all dispatches per layer.  Dump at
     // dispatch counts {1, 256, 512, 1024, …}.  Each dispatch (matmul-
     // canonical call inside the per-layer MoE forward) contributes
@@ -372,13 +422,18 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
                 1, std::memory_order_relaxed) + 1;
             if (d_count == 1 || (d_count & 0xff) == 0) {
                 const double kbar = s_e > 0 ? (double) s_sum / (double) s_e : 0.0;
+                const uint64_t total_ns =
+                    decision_ns_per_layer[layer_index_].load(std::memory_order_relaxed);
+                const double avg_decision_us =
+                    d_count > 0 ? (double) total_ns / (double) d_count / 1000.0 : 0.0;
                 std::fprintf(stderr,
                     "streamllm-ext kbar L=%d  dispatches=%lu  active_experts=%zu  "
-                    "K_mean=%.3f  max_gate=%.6g\n",
+                    "K_mean=%.3f  max_gate=%.6g  decision_us/dispatch=%.3f\n",
                     layer_index_, (unsigned long) d_count,
                     chunks_by_expert.size(), kbar,
                     chunks_by_expert.empty() ? 0.0 :
-                        (double) max_gate_by_expert.begin()->second);
+                        (double) max_gate_by_expert.begin()->second,
+                    avg_decision_us);
             }
         }
     }
@@ -542,26 +597,53 @@ void MoEMatMulComp::execute(const ComputationInput & in_base,
         sched_ != nullptr &&
         qwen3::scheduler_allow_capture(*sched_);
     if (capture_path) {
-        const float * thresholds_d =
-            qwen3::scheduler_score_thresholds_device(*sched_);
-        const int n_tiers =
-            qwen3::scheduler_score_n_tiers(*sched_);
         const auto * layout = any_layout_;
-        if (layout != nullptr && thresholds_d != nullptr) {
-            qwen3::launch_plan_per_expert_planes(
-                /*ids_d=*/        (const int32_t *) sc->ids_d,
-                /*weights_d=*/    in.weights ? (const float *) in.weights->data : nullptr,
-                /*probs_d=*/      in.probs   ? (const float *) in.probs->data   : nullptr,
-                /*thresholds_d=*/ thresholds_d,
-                n_tokens,
-                n_used,
-                n_experts_,
-                n_tiers,
+        // Capture-mode rung-2: when dynamic residuals + K̄ are loaded,
+        // run the on-device knapsack instead of the threshold plan.
+        // Falls back to the threshold path if either is missing.
+        const float * R_d =
+            qwen3::scheduler_dynamic_R_device(*sched_);
+        const float   dyn_kbar = qwen3::scheduler_dynamic_kbar(*sched_);
+        const bool use_kbar =
+            R_d != nullptr && dyn_kbar > 0.0f &&
+            layout != nullptr && layer_index_ >= 0;
+        if (use_kbar) {
+            qwen3::launch_plan_per_expert_kbar(
+                /*ids_d=*/      (const int32_t *) sc->ids_d,
+                /*weights_d=*/  in.weights ? (const float *) in.weights->data : nullptr,
+                /*probs_d=*/    in.probs   ? (const float *) in.probs->data   : nullptr,
+                /*R_d=*/        R_d,
+                /*K_min=*/      qwen3::scheduler_dynamic_K_min(*sched_),
+                /*K_max=*/      qwen3::scheduler_dynamic_K_max(*sched_),
+                /*layer_index=*/layer_index_,
+                /*kbar=*/       dyn_kbar,
+                n_tokens, n_used, n_experts_,
                 /*n_chunks_max=*/ n_chunks_,
                 layout->base_precision > 0 ? layout->base_precision : 1,
                 layout->any_precision,
                 (int *) prec_per_eid_d_,
                 stream_h);
+        } else {
+            const float * thresholds_d =
+                qwen3::scheduler_score_thresholds_device(*sched_);
+            const int n_tiers =
+                qwen3::scheduler_score_n_tiers(*sched_);
+            if (layout != nullptr && thresholds_d != nullptr) {
+                qwen3::launch_plan_per_expert_planes(
+                    /*ids_d=*/        (const int32_t *) sc->ids_d,
+                    /*weights_d=*/    in.weights ? (const float *) in.weights->data : nullptr,
+                    /*probs_d=*/      in.probs   ? (const float *) in.probs->data   : nullptr,
+                    /*thresholds_d=*/ thresholds_d,
+                    n_tokens,
+                    n_used,
+                    n_experts_,
+                    n_tiers,
+                    /*n_chunks_max=*/ n_chunks_,
+                    layout->base_precision > 0 ? layout->base_precision : 1,
+                    layout->any_precision,
+                    (int *) prec_per_eid_d_,
+                    stream_h);
+            }
         }
     }
 

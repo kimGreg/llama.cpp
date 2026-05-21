@@ -718,4 +718,173 @@ void launch_plan_per_expert_planes(
         planes_per_eid_d);
 }
 
+// ─── K̄-knapsack plan kernel (capture-mode) ────────────────────────
+//
+// One block does the entire per-dispatch allocation:
+//   Phase 1 (parallel across threads):
+//     scan (n_tokens × n_used) ids → per-expert max gate score, active-flag.
+//   Phase 2 (single thread):
+//     B_local = round(n_active × kbar);
+//     K[e]    = active[e] ? K_min : 0;     used = Σ K[e];
+//     while (used < B_local):
+//        e*   = argmax over active experts with K[e]<K_max of g²·ΔR;
+//        if e* < 0: break;
+//        K[e*] += 1; used += 1;
+//   Phase 3 (parallel):
+//     planes_per_eid_d[e] = any_precision ? base_p + K[e] - 1 : K[e]
+//
+// Shared mem layout (sized for n_expert ≤ 256 and n_K ≤ 8):
+//   s_max_g  [N]   float    — per-expert max gate
+//   s_active [N]   int      — 0/1 routed flag
+//   s_K      [N]   int      — current K per expert (== chunks pinned)
+namespace {
+
+constexpr int K_KBAR_N_EXPERT_MAX = 256;
+constexpr int K_KBAR_N_K_MAX      = 8;
+
+__global__ void k_plan_per_expert_kbar(
+    const int32_t * __restrict__ ids,
+    const float   * __restrict__ weights,
+    const float   * __restrict__ probs,
+    const float   * __restrict__ R,    // [n_expert × n_K] slice for this layer
+    int n_tokens,
+    int n_used,
+    int n_expert,
+    int n_K,
+    int K_min,
+    int K_max,
+    float kbar,
+    int n_chunks_max,
+    int base_p,
+    int any_precision,
+    int * __restrict__ planes_per_eid)
+{
+    __shared__ float s_max_g [K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_active[K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_K     [K_KBAR_N_EXPERT_MAX];
+
+    const int tid = (int) threadIdx.x;
+    // Init.
+    for (int e = tid; e < n_expert; e += (int) blockDim.x) {
+        s_max_g [e] = 0.0f;
+        s_active[e] = 0;
+        s_K     [e] = 0;
+    }
+    __syncthreads();
+
+    // Phase 1: per-expert max gate.
+    const int total = n_tokens * n_used;
+    for (int idx = tid; idx < total; idx += (int) blockDim.x) {
+        const int e = ids[idx];
+        if (e < 0 || e >= n_expert) continue;
+        s_active[e] = 1;
+        float g;
+        if (weights != nullptr) {
+            g = weights[idx];
+        } else if (probs != nullptr) {
+            const int t = idx / n_used;
+            g = probs[t * n_expert + e];
+        } else {
+            const int u = idx % n_used;
+            g = 0.45f - 0.05f * (float) u;
+            if (g < 0.05f) g = 0.05f;
+        }
+        if (g < 0.0f) g = 0.0f;
+        // Atomic max via __float_as_uint trick (gates non-negative here).
+        atomicMax((unsigned int *) &s_max_g[e], __float_as_uint(g));
+    }
+    __syncthreads();
+
+    // Phase 2: knapsack — single thread.  n_expert ≤ 128 × n_K ≤ 6
+    // → 128 × 4 = 512 compares total. Sub-microsecond.
+    if (tid == 0) {
+        int n_active = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            if (s_active[e]) {
+                s_K[e] = K_min;
+                ++n_active;
+            }
+        }
+        const long target = (long) lrintf((float) n_active * kbar);
+        long used = (long) n_active * (long) K_min;
+        long remaining = target - used;
+
+        while (remaining > 0) {
+            int   best_e = -1;
+            float best_g = -1.0f;
+            for (int e = 0; e < n_expert; ++e) {
+                if (!s_active[e]) continue;
+                if (s_K[e] >= K_max) continue;
+                // ki = s_K[e] - K_min + 1 = next plane index ≥ 1
+                const int ki = s_K[e] - K_min + 1;
+                if (ki >= n_K) continue;
+                const float R_prev = R[e * n_K + (ki - 1)];
+                const float R_here = R[e * n_K + ki];
+                float dR = R_prev - R_here;
+                if (dR < 0.0f) dR = 0.0f;
+                const float g  = s_max_g[e];
+                const float gain = g * g * dR;
+                if (gain > best_g) {
+                    best_g = gain;
+                    best_e = e;
+                }
+            }
+            if (best_e < 0) break;
+            s_K[best_e] += 1;
+            remaining   -= 1;
+        }
+    }
+    __syncthreads();
+
+    // Phase 3: emit planes_per_eid.  Unrouted experts → n_chunks_max
+    // (matches the threshold-path "unrouted=full precision" semantics
+    // and the host pre-fill in MoEMatMulComp::on_install).
+    for (int e = tid; e < n_expert; e += (int) blockDim.x) {
+        int chunks = s_active[e] ? s_K[e] : n_chunks_max;
+        if (chunks < 1)            chunks = 1;
+        if (chunks > n_chunks_max) chunks = n_chunks_max;
+        int planes = any_precision ? (base_p + chunks - 1) : chunks;
+        if (planes < 1) planes = 1;
+        planes_per_eid[e] = planes;
+    }
+}
+
+}  // anon
+
+void launch_plan_per_expert_kbar(
+    const int32_t * ids_d,
+    const float   * weights_d,
+    const float   * probs_d,
+    const float   * R_d,
+    int             K_min,
+    int             K_max,
+    int             layer_index,
+    float           kbar,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             n_chunks_max,
+    int             base_p,
+    bool            any_precision,
+    int *           planes_per_eid_d,
+    StreamHandle    stream)
+{
+    if (n_expert <= 0 || planes_per_eid_d == nullptr) return;
+    if (ids_d == nullptr || R_d == nullptr)            return;
+    if (n_tokens <= 0 || n_used <= 0)                  return;
+    if (K_max <= K_min)                                 return;
+    if (!(kbar > 0.0f))                                 return;
+    if (n_expert > K_KBAR_N_EXPERT_MAX)                 return;
+    const int n_K = K_max - K_min + 1;
+    if (n_K > K_KBAR_N_K_MAX)                           return;
+    // R_d points at the full table; slice to layer_index.
+    const float * R_layer = R_d + (size_t) layer_index * n_expert * n_K;
+    k_plan_per_expert_kbar<<<1, 256, 0, (cudaStream_t) stream>>>(
+        ids_d, weights_d, probs_d, R_layer,
+        n_tokens, n_used, n_expert, n_K,
+        K_min, K_max, kbar,
+        n_chunks_max, base_p, any_precision ? 1 : 0,
+        planes_per_eid_d);
+}
+
 }}  // namespace streamllm_ext::qwen3
