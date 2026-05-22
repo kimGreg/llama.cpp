@@ -129,6 +129,9 @@ struct UpstreamLayoutHost {
                                        // chunk_planes[i].disk_chunk_bytes
 
     bool any_precision = false;
+    bool direct_matrix = false;
+    bool direct_expert_block = false;
+    int32_t direct_ggml_type = 0;
     int32_t base_precision   = 0;  // any-prec: chunk 0's precision tier
     int32_t target_precision = 0;  // any-prec: = n_chunks-1 + base_precision
 
@@ -144,6 +147,17 @@ struct UpstreamLayoutHost {
         size_t  ker_off_qbias;
     };
     std::vector<ChunkPlanes> chunk_planes;
+
+    struct ExpertBlockRecord {
+        int32_t kind = 0;      // 0 gate, 1 up, 2 down
+        int32_t ggml_type = 0;
+        int64_t ne[4] = {1, 1, 1, 1};
+        size_t  offset = 0;   // relative to the uploaded chunk payload
+        size_t  nbytes = 0;
+    };
+    int32_t direct_layer = -1;
+    int32_t direct_expert = -1;
+    ExpertBlockRecord expert_records[3];
 
     // Encoder-registered callbacks (see typedefs above). ``build_*``
     // sets these so core's move_chunk can invoke them blindly.

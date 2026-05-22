@@ -29,6 +29,7 @@ set(STREAMLLM_EXT_SOURCES
     moe/common/moe_scheduler.cpp
     decoder/anybcq/upstream_layout.cpp
     decoder/anybcq/tensor.cpp
+    decoder/direct_matrix/tensor.cpp
     decoder/ss_anybcq/upstream_layout.cpp
 )
 
@@ -73,6 +74,7 @@ target_include_directories(streamllm_ext PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/anybcq/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/decoder/direct_matrix
     ${CMAKE_CURRENT_SOURCE_DIR}/decoder/ss_anybcq
     ${CMAKE_CURRENT_SOURCE_DIR}/moe/common
     ${CMAKE_CURRENT_SOURCE_DIR}/moe/qwen3
@@ -234,4 +236,3 @@ if (GGML_CUDA)
     add_executable(streamllm-microbench test_microbench.cpp)
     target_link_libraries(streamllm-microbench PRIVATE streamllm_ext ggml CUDA::cudart)
 endif()
-

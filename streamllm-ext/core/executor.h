@@ -35,6 +35,11 @@ public:
     // and encoder can evolve in lockstep.
     virtual const char * name() const = 0;
 
+    // Baseline executors that hydrate managed tensors for stock ggml
+    // operators return true here. Arch builders should emit the normal
+    // MoE graph for them instead of the sentinel executor graph.
+    virtual bool uses_stock_moe_graph() const { return false; }
+
     // One-time setup at install.  ``rt`` is the owning runtime;
     // ``reader`` is the parsed streamllm.* metadata; ``gguf_path``
     // is the file the managed tensors live in (for SSD-stream).
@@ -84,6 +89,12 @@ public:
                                     const ggml_tensor *        weights,
                                     ggml_tensor *              layer_out,
                                     int                        layer_idx) = 0;
+
+    // Optional eager hook for stock GGML_OP_MUL_MAT_ID nodes. Called by
+    // streamllm_pre_op before CUDA dispatch; return false so the stock op
+    // still executes after any tensor/id hydration.
+    virtual bool prepare_moe_mul_mat_id(StreamHandle,
+                                        ggml_tensor *) { return false; }
 
     // Optional model-tensor binding (Mode A milestone 1, criterion 5).
     // Future-proof plumbing — M1 correctness does NOT depend on it

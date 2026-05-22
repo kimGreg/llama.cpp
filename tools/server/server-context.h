@@ -129,6 +129,11 @@ struct server_routes {
     // using the snapshot it took at entry, so output never tears.
     server_http_context::handler_t post_streamllm_score_table;
     server_http_context::handler_t get_streamllm_score_table;
+    // streamllm-ext static-layout override. POST body:
+    //   {"n_layers":48, "n_experts":128, "table":[..flat uint8 row-major..]}
+    // or {"clear": true}. See experiments/4_layout_solver/.
+    server_http_context::handler_t post_streamllm_static_layout;
+    server_http_context::handler_t get_streamllm_static_layout;
     // Schedule API — runtime-mutable token-count-keyed dial sequence
     // (generalises score_table + phase-aware).  POST a JSON body with
     // {"thresholds":[int,...], "dials":[[float,...], ...]} where

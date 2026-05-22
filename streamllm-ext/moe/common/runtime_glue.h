@@ -82,6 +82,7 @@ extern std::unique_ptr<ModelExecutor>        g_executor;
 ModelExecutor * current_executor();
 void            bind_model_slot(void ** streamllm_executor_slot);
 void            unbind_model_slot(void ** streamllm_executor_slot);
+bool            executor_uses_stock_moe_graph(void * streamllm_executor);
 
 // Build a global StreamllmRuntime from ``gguf_path`` if the file carries
 // streamllm.* metadata, and register the ggml-cuda hook. Idempotent on

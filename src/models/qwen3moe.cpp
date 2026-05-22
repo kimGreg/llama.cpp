@@ -1,5 +1,9 @@
 #include "models.h"
 
+#if defined(STREAMLLM_EXT_ENABLED)
+#include "runtime_glue.h"
+#endif
+
 llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -76,7 +80,13 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         cb(cur, "ffn_norm", il);
 
         ggml_tensor * moe_out = nullptr;
-        if (model.streamllm_executor != nullptr) {
+        const bool streamllm_stock_moe =
+#if defined(STREAMLLM_EXT_ENABLED)
+            streamllm_ext::executor_uses_stock_moe_graph(model.streamllm_executor);
+#else
+            false;
+#endif
+        if (model.streamllm_executor != nullptr && !streamllm_stock_moe) {
             // Mode A (StreamLLM M1) — emit a single per-layer sentinel
             // via the shared helper; runtime's pre_op_hook routes it to
             // forward_moe_layer. Managed Qwen3-MoE no longer surfaces

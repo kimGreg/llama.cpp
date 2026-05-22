@@ -16,6 +16,7 @@
 // S8 (Mode A): qwen3_graph_instrumenter retired with the legacy
 // MUL_MAT_ID dispatch surface; the include is gone.
 #include "tensor.h"   // anybcq::AnyBCQFamilyTensor (per-tensor pointer-table accessors)
+#include "decoder/direct_matrix/tensor.h"
 
 // (using-decl for qwen3::GraphInstrumenter retired in S8.)
 
@@ -123,6 +124,14 @@ UpstreamLayoutHost read_one(const StreamReader & reader,
         throw std::runtime_error("scheduler: layout missing for " + name);
     }
     auto raw = pread_range(gguf_path, layout->tensor_offset, layout->tensor_nbytes);
+    if (reader.global().encoder == "direct_matrix") {
+        return direct_matrix::build_upstream_layout_direct_matrix(
+            *layout, raw.data());
+    }
+    if (reader.global().encoder == "direct_expert_block") {
+        return direct_matrix::build_upstream_layout_direct_expert_block(
+            *layout, raw.data());
+    }
     try {
         return build_upstream_layout_host(
             *layout, raw.data(), reader.global().group_size);
@@ -289,6 +298,7 @@ public:
             UpstreamLayoutHost host = read_one(reader, gguf_path, name);
             const int P = host.n_chunks;
             const bool any_prec = host.any_precision;
+            const bool direct_matrix = host.direct_matrix;
             // Snapshot before std::move(host) so the host LRU has a
             // consistent per-tensor byte size for cap accounting.
             // SsAnybcq: every chunk shares ``bytes_per_chunk`` (this is
@@ -310,7 +320,15 @@ public:
             // on demand after release_host_bytes.
             register_chunk_io_from_layout(rt, reader, name);
 
-            if (!any_prec) {
+            if (direct_matrix) {
+                // Direct-matrix baseline: one native GGML expert matrix
+                // per chunk, no q_bias/fixed-meta upload. The active expert
+                // chunk streams on demand through the same pool path.
+                base_plans_.emplace(name, Plan{
+                    /*chunks=*/{},
+                    /*moves =*/{}
+                });
+            } else if (!any_prec) {
                 // SsAnybcq layout: upload q_bias once at install (small,
                 // hot — every kernel call reads it). Plane chunks load on
                 // demand. Plan = q_bias only at steady state.
@@ -1477,10 +1495,20 @@ public:
         if (n == 0) return false;
         if ((int) gates.size() != n) return false;
         K_out.assign(n, dynamic_K_min_);
-        if (layer < 0 || layer >= dynamic_n_layers_) return true;
+        // Invalid layer → caller falls back to gate-threshold path.
+        if (layer < 0 || layer >= dynamic_n_layers_) return false;
 
         const int K_min = dynamic_K_min_;
         const int K_max = dynamic_K_max_;
+        // Guard: K range must be sane before DP tables are allocated.
+        if (K_min < 0 || K_max < K_min) {
+            GGML_ABORT("streamllm-allocator: invalid K range [%d, %d]",
+                       K_min, K_max);
+        }
+        if (K_max > 255) {
+            GGML_ABORT("streamllm-allocator: K_max=%d exceeds uint8_t trace capacity",
+                       K_max);
+        }
         const int n_K   = K_max - K_min + 1;
         if (n_K <= 1) return true;
 
@@ -1505,15 +1533,23 @@ public:
         tls_C.assign((size_t) n * n_K, 0.0f);
         for (int i = 0; i < n; ++i) {
             const int e = experts[i];
-            if (e < 0 || e >= dynamic_n_experts_) continue;
+            if (e < 0 || e >= dynamic_n_experts_) {
+                // Unknown expert — caller should fall back; return false so
+                // the gate-threshold path takes over rather than silently
+                // treating cost as 0 and biasing the budget.
+                return false;
+            }
             const size_t base = ((size_t) layer * dynamic_n_experts_
                                   + (size_t) e) * (size_t) n_K;
             const float g  = gates[i];
             const float gg = g * g;
             for (int k = 0; k < n_K; ++k) {
                 const size_t pos = base + (size_t) k;
-                const float r = (pos < dynamic_R_.size()) ? dynamic_R_[pos] : 0.0f;
-                tls_C[(size_t) i * n_K + (size_t) k] = gg * r;
+                if (pos >= dynamic_R_.size()) {
+                    // R table shape mismatch — same fallback as above.
+                    return false;
+                }
+                tls_C[(size_t) i * n_K + (size_t) k] = gg * dynamic_R_[pos];
             }
         }
 

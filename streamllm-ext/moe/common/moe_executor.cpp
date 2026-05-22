@@ -444,7 +444,7 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                 auto submit_plan = [&](const ChunkPlan & pl) {
                     for (const auto & k : pl.load_set) {
                         if (rt_->pool().is_resident(k.wid, k.cid)) continue;
-                        rt_->submit_async_load(k.wid, k.cid, batch);
+                        rt_->submit_async_load(k.wid, k.cid, batch, stream_h);
                     }
                 };
                 submit_plan(plan_gate);
@@ -457,7 +457,7 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                     for (const auto & k : pl.load_set) {
                         if (rt_->pool().is_resident(k.wid, k.cid)) continue;
                         rt_->move_chunk(k.wid, k.cid, Tier::RAM, Tier::VRAM,
-                                        /*compute_stream=*/nullptr);
+                                        stream_h);
                     }
                 };
                 move_plan(plan_gate);
@@ -501,16 +501,32 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
         launch_diag::note_dispatch_one_canonical(ns_total - 2 * (ns_total / 3));
     }
 
-    // Diagnostic dump hook (STREAMLLM_DEBUG_MOE_LAYER=<L>): on the
-    // FIRST call for the target layer, write full-vector binary dumps
-    // for each compute phase under /tmp/dbg_moe_L<L>_<tag>.bin.  Plus
-    // a stderr summary line per tag.  Single-shot per process; free
-    // when the env var is unset.
+    // Diagnostic dump hook (STREAMLLM_DEBUG_MOE_LAYER=<L>[,<L>...]):
+    // accepts a comma-separated list of layer indices.  On the FIRST
+    // call for EACH target layer, write full-vector binary dumps for
+    // each compute phase under /tmp/dbg_moe_L<L>_<tag>.bin.  Plus a
+    // stderr summary line per tag.  Per-layer atomic guards so each
+    // target fires exactly once per process.
     const char * dbg_env = std::getenv("STREAMLLM_DEBUG_MOE_LAYER");
-    const int dbg_layer = dbg_env ? std::atoi(dbg_env) : -1;
-    static std::atomic<bool> dbg_dumped{false};
-    const bool do_dump = dbg_layer == layer_idx &&
-                          !dbg_dumped.exchange(true);
+    bool dbg_matches_this_layer = false;
+    if (dbg_env != nullptr) {
+        const char * p = dbg_env;
+        while (*p) {
+            char * end = nullptr;
+            long v = std::strtol(p, &end, 10);
+            if (end == p) break;
+            if ((int) v == layer_idx) { dbg_matches_this_layer = true; break; }
+            p = end;
+            while (*p == ',' || *p == ' ') ++p;
+        }
+    }
+    // Per-layer once-guard via 64-element static array (covers up to
+    // 64 MoE layers — Qwen3-30B has 48).
+    static std::atomic<bool> dbg_dumped_per_layer[64] = {};
+    bool do_dump = false;
+    if (dbg_matches_this_layer && layer_idx >= 0 && layer_idx < 64) {
+        do_dump = !dbg_dumped_per_layer[layer_idx].exchange(true);
+    }
     auto dump_buf = [&](const char * tag, const void * dev, int n_floats) {
         std::vector<float> hbuf((size_t) n_floats, 0.0f);
         cudaStreamSynchronize(stream);

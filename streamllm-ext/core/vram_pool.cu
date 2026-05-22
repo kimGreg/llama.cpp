@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -33,6 +34,7 @@ VramChunkPool::VramChunkPool(size_t capacity_bytes, int device, bool copy_stream
       device_(device),
       arena_(nullptr),
       copy_stream_(nullptr),
+      force_sync_h2d_(false),
       latest_compute_event_(nullptr),
       capture_fork_event_(nullptr)
 {
@@ -49,6 +51,9 @@ VramChunkPool::VramChunkPool(size_t capacity_bytes, int device, bool copy_stream
             cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking),
             "cudaStreamCreateWithFlags");
         copy_stream_ = (StreamHandle)s;
+    }
+    if (const char * sync = std::getenv("STREAMLLM_SYNC_H2D")) {
+        force_sync_h2d_ = std::atoi(sync) != 0;
     }
     check_cuda(cudaSetDevice(prev), "cudaSetDevice(restore)");
 
@@ -136,11 +141,26 @@ void VramChunkPool::launch_copy_(
     StreamHandle compute_stream_opt)
 {
     char * dst = (char *)arena_ + dst_offset;
-    if (copy_stream_ == nullptr) {
+    if (copy_stream_ == nullptr || force_sync_h2d_) {
         // Sync path — blocking memcpy on current stream.
         check_cuda(
             cudaMemcpy(dst, src, nbytes, cudaMemcpyHostToDevice),
             "cudaMemcpy(H2D sync)");
+        if (copy_stream_ != nullptr) {
+            cudaEvent_t ev;
+            if (!event_free_list_.empty()) {
+                ev = (cudaEvent_t)event_free_list_.back();
+                event_free_list_.pop_back();
+            } else {
+                check_cuda(
+                    cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+                    "cudaEventCreate(ready)");
+            }
+            check_cuda(cudaEventRecord(ev, (cudaStream_t)copy_stream_),
+                       "cudaEventRecord(ready sync)");
+            out_event = (EventHandle)ev;
+            return;
+        }
         out_event = nullptr;
         return;
     }

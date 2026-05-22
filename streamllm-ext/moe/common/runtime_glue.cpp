@@ -114,6 +114,11 @@ size_t estimate_pool_bytes(const StreamReader & r) {
     for (const auto & name : r.managed_tensor_names()) {
         const auto * L = r.layout(name);
         if (L == nullptr) continue;
+        if (r.global().encoder == "direct_expert_block" ||
+            r.global().encoder == "direct_matrix") {
+            for (uint32_t b : L->chunk_bytes) total += (size_t) b;
+            continue;
+        }
         int32_t M  = (int32_t)L->shape[0];
         int32_t K  = L->padded_m;
         int32_t P  = (int32_t)L->chunk_bytes.size();
@@ -237,6 +242,9 @@ bool install_for_gguf(const char * gguf_path) {
             "streamllm-ext: executor '" + exec_name + "' not registered");
     }
     g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
+    if (g_executor->uses_stock_moe_graph()) {
+        g_streamllm_allow_capture.store(false, std::memory_order_relaxed);
+    }
     g_required_runtime_was_true = reader.global().required_runtime;
 
     // Per-arch activation is now set in the executor subclass's
@@ -342,6 +350,11 @@ void unbind_model_slot(void ** streamllm_executor_slot) {
     *streamllm_executor_slot = nullptr;
 }
 
+bool executor_uses_stock_moe_graph(void * streamllm_executor) {
+    auto * exec = reinterpret_cast<ModelExecutor *>(streamllm_executor);
+    return exec != nullptr && exec->uses_stock_moe_graph();
+}
+
 // ---------------------------------------------------------------------
 
 extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
@@ -362,9 +375,8 @@ extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     // on_install assert). Skip the per-node claim so ggml-cuda can
     // capture the cgraph; dial swaps are picked up by the score-
     // version hook, which invalidates the cached graph.
-    if (g_streamllm_allow_capture.load(std::memory_order_relaxed)) {
-        return false;
-    }
+    const bool allow_capture =
+        g_streamllm_allow_capture.load(std::memory_order_relaxed);
     // Sentinel nodes (Mode A S5) are unambiguously claimed by name
     // and don't need a scheduler hop. Recognising them here keeps
     // the user-node-claims contract tight even if the scheduler's
@@ -375,6 +387,12 @@ extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     }
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return false;
+    if (g_executor && g_executor->uses_stock_moe_graph()) {
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr) {
+            return g_runtime->scheduler().claims_tensor(node->src[0]);
+        }
+    }
+    if (allow_capture) return false;
     return g_runtime->scheduler().claims_node(node);
 }
 
@@ -550,6 +568,45 @@ bool streamllm_get_score_table(
     return true;
 }
 
+// ── Static per-(layer, expert) chunk-count override (extern-C) ─────
+// See moe_scheduler.h. flat_table is a length-(n_layers * n_experts)
+// uint8 array, row-major (layer-major). Entries: 0 = no override (fall
+// back to threshold path); > 0 = use this many chunks for the expert.
+extern "C" bool streamllm_set_static_layout(
+    const unsigned char * flat_table, int n_layers, int n_experts)
+{
+    if (flat_table == nullptr || n_layers <= 0 || n_experts <= 0) return false;
+    const size_t n = (size_t) n_layers * (size_t) n_experts;
+    std::vector<uint8_t> table(flat_table, flat_table + n);
+    StreamllmRuntime * rt = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_runtime_mu);
+        rt = g_runtime.get();
+    }
+    if (rt == nullptr) return false;
+    return qwen3::scheduler_set_static_layout(
+        rt->scheduler(), table, n_layers, n_experts);
+}
+
+extern "C" void streamllm_clear_static_layout(void) {
+    StreamllmRuntime * rt = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_runtime_mu);
+        rt = g_runtime.get();
+    }
+    if (rt != nullptr) qwen3::scheduler_clear_static_layout(rt->scheduler());
+}
+
+extern "C" int streamllm_has_static_layout(void) {
+    StreamllmRuntime * rt = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_runtime_mu);
+        rt = g_runtime.get();
+    }
+    if (rt == nullptr) return 0;
+    return qwen3::scheduler_has_static_layout(rt->scheduler()) ? 1 : 0;
+}
+
 
 void clear() {
     std::lock_guard<std::mutex> lk(g_runtime_mu);
@@ -722,6 +779,19 @@ extern "C" bool streamllm_pre_op(
     // pre_op_hook deliberately does NOT claim it at compute time.
     // No silent legacy path remains reachable.
     if (dst == nullptr) return false;
+
+    if (dst->op == GGML_OP_MUL_MAT_ID) {
+        ModelExecutor * exec = nullptr;
+        StreamllmRuntime * rt = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_runtime_mu);
+            rt = g_runtime.get();
+            exec = g_executor.get();
+        }
+        if (rt != nullptr && exec != nullptr && exec->uses_stock_moe_graph()) {
+            return exec->prepare_moe_mul_mat_id((StreamHandle) stream, dst);
+        }
+    }
 
     static constexpr const char * kSentinelPrefix = "streamllm.moe_layer_";
     constexpr size_t kSentinelPrefixLen = 20; // strlen("streamllm.moe_layer_")

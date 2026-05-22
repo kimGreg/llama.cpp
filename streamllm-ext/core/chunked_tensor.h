@@ -35,6 +35,8 @@
 
 namespace streamllm_ext {
 
+struct UpstreamLayoutHost;
+
 // Per-chunk (per-tensor) ABC. The pool calls ``disk_to_kernel`` on
 // the SSD-stream path and ``after_load`` once the kernel-format
 // bytes have been uploaded to VRAM. The scheduler / kernel calls
@@ -51,6 +53,13 @@ public:
 
     // Chunk count.
     virtual int n_chunks() const = 0;
+
+    virtual UpstreamLayoutHost & host() = 0;
+    virtual const UpstreamLayoutHost & host() const = 0;
+
+    virtual void set_device_state(void ** d_qw_ptrs,
+                                  void ** d_alpha_ptrs,
+                                  void ** d_qbias_slot) = 0;
 
     // Per-chunk byte sizes. ``disk_bytes`` = bytes to pread; may be
     // variable per chunk (any-prec). ``kernel_bytes`` = bytes the

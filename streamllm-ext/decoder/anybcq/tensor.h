@@ -46,8 +46,8 @@ public:
                          StreamHandle stream) override;
 
     // ─── Encoder-private accessors ─────────────────────────────
-    UpstreamLayoutHost &       host()       { return host_; }
-    const UpstreamLayoutHost & host() const { return host_; }
+    UpstreamLayoutHost &       host() override       { return host_; }
+    const UpstreamLayoutHost & host() const override { return host_; }
 
     // Bind the per-plane device pointer tables. Called once at install
     // by the runtime after slab-allocating the three buffers.  The
@@ -59,7 +59,7 @@ public:
     //                    pointer); ignored for ss_anybcq.
     void set_device_state(void ** d_qw_ptrs,
                           void ** d_alpha_ptrs,
-                          void ** d_qbias_slot);
+                          void ** d_qbias_slot) override;
     void ** d_qw_ptrs()    const { return d_qw_ptrs_; }
     void ** d_alpha_ptrs() const { return d_alpha_ptrs_; }
     void ** d_qbias_slot() const { return d_qbias_slot_; }

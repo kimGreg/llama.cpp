@@ -264,6 +264,7 @@ private:
     int          device_;
     void *       arena_;
     StreamHandle copy_stream_;
+    bool         force_sync_h2d_;
     EventHandle  latest_compute_event_;  // set by record_compute_event
     EventHandle  capture_fork_event_;    // persistent; used to fork copy_stream into a CUDA graph capture
     std::vector<EventHandle> pending_event_destroys_;  // events deferred for destroy until after capture

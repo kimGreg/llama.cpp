@@ -44,6 +44,15 @@ extern "C" bool streamllm_schedule_set(
 extern "C" void streamllm_schedule_clear(void);
 extern "C" bool streamllm_schedule_active(void);
 
+// streamllm-ext static-layout API. /streamllm/static_layout POST
+// accepts a flat (n_layers * n_experts) uint8 array; entries override
+// the per-(layer, expert) chunk count, falling back to the threshold
+// path on 0/unset entries.  See experiments/4_layout_solver/.
+extern "C" bool streamllm_set_static_layout(
+    const unsigned char * flat_table, int n_layers, int n_experts);
+extern "C" void streamllm_clear_static_layout(void);
+extern "C" int  streamllm_has_static_layout(void);
+
 // /streamllm/stats accessors. Each is a single atomic read from the
 // streamllm-ext runtime; safe to call at high frequency.
 extern "C" {
@@ -4240,6 +4249,98 @@ void server_routes::init_routes() {
             return res;
         }
         res->ok({{"thresholds", th}});
+        return res;
+    };
+
+    // streamllm-ext: static per-(layer, expert) chunk-count layout
+    // override. Used by the offline budget-knapsack solver
+    // (experiments/4_layout_solver/). POST body forms:
+    //   {"clear": true}                                  → clear override
+    //   {"n_layers":48, "n_experts":128, "table":[ints]} → set override
+    // The table is a flat length-(n_layers * n_experts) uint8 array,
+    // row-major (layer-major).  Entries 0 = no override (fall back to
+    // threshold path); > 0 = use that many chunks for that expert.
+    this->post_streamllm_static_layout = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        // Probe runtime: no streamllm runtime → 404 with the same
+        // contract as /streamllm/score_table.
+        {
+            std::vector<float> probe;
+            if (!streamllm_get_score_table(probe)) {
+                res->error(format_error_response(
+                    "streamllm runtime not active — no model with "
+                    "required_runtime=true is loaded.",
+                    ERROR_TYPE_NOT_FOUND));
+                return res;
+            }
+        }
+        const json body = json::parse(req.body);
+        if (body.is_object() && body.value("clear", false)) {
+            streamllm_clear_static_layout();
+            res->ok({{"status", "cleared"}});
+            return res;
+        }
+        if (!body.is_object()
+            || !body.contains("n_layers") || !body["n_layers"].is_number_integer()
+            || !body.contains("n_experts") || !body["n_experts"].is_number_integer()
+            || !body.contains("table") || !body["table"].is_array())
+        {
+            res->error(format_error_response(
+                "body must be either {\"clear\":true} or "
+                "{\"n_layers\": int, \"n_experts\": int, "
+                "\"table\": [n_layers*n_experts uint8 entries, row-major]}",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const int n_layers  = body["n_layers"].get<int>();
+        const int n_experts = body["n_experts"].get<int>();
+        const auto & arr = body["table"];
+        if ((int) arr.size() != n_layers * n_experts) {
+            res->error(format_error_response(
+                "table length must equal n_layers * n_experts",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<unsigned char> flat;
+        flat.reserve((size_t) n_layers * (size_t) n_experts);
+        for (const auto & v : arr) {
+            const int x = v.get<int>();
+            if (x < 0 || x > 255) {
+                res->error(format_error_response(
+                    "table entries must be uint8 in [0, 255]",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            flat.push_back((unsigned char) x);
+        }
+        if (!streamllm_set_static_layout(flat.data(), n_layers, n_experts)) {
+            res->error(format_error_response(
+                "streamllm: set_static_layout rejected the table "
+                "(check n_layers > 0, n_experts > 0, length matches)",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok({
+            {"n_layers", n_layers},
+            {"n_experts", n_experts},
+            {"status",   "applied"},
+        });
+        return res;
+    };
+
+    this->get_streamllm_static_layout = [this](const server_http_req &) {
+        auto res = create_response(true);
+        {
+            std::vector<float> probe;
+            if (!streamllm_get_score_table(probe)) {
+                res->error(format_error_response(
+                    "streamllm runtime not active.",
+                    ERROR_TYPE_NOT_FOUND));
+                return res;
+            }
+        }
+        const bool loaded = streamllm_has_static_layout() != 0;
+        res->ok({{"loaded", loaded}});
         return res;
     };
 

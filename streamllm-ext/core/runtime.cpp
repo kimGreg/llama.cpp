@@ -16,7 +16,8 @@
 // Concrete ChunkedTensor that Entry holds. The runtime needs the full
 // type to construct + dereference it (.host(), .d_qw_ptrs(), etc.) —
 // the runtime header forward-declares it.
-#include "tensor.h"
+#include "decoder/anybcq/tensor.h"
+#include "decoder/direct_matrix/tensor.h"
 
 namespace streamllm_ext {
 // Keep the framework's chunks-per-tensor cap aligned with the AnyBCQ
@@ -276,12 +277,12 @@ void StreamllmRuntime::register_layout(const std::string & wid,
             install_bytes, std::memory_order_relaxed);
     }
 
-    // Wrap the parsed layout in the appropriate ChunkedTensor subclass
-    // (any-prec → anybcq::AnyBCQTensor, ss_anybcq → ss_anybcq::
-    // SsAnybcqTensor). The decoder's wrap_host_in_tensor is the one
-    // place encoder typing is materialised — Entry holds the abstract
-    // family base from here on.
-    e.tensor = wrap_host_in_tensor(wid, std::move(host));
+    if (host.direct_matrix) {
+        e.tensor = std::unique_ptr<ChunkedTensor>(
+            new direct_matrix::DirectMatrixTensor(wid, std::move(host)));
+    } else {
+        e.tensor = wrap_host_in_tensor(wid, std::move(host));
+    }
     e.dev    = dev;
 
     // Populate the dispatch-side layout fields up-front from the host
@@ -416,10 +417,7 @@ anybcq::AnyBCQFamilyTensor *
 StreamllmRuntime::tensor_anybcq(const std::string & wid) const {
     auto it = entries_.find(wid);
     if (it == entries_.end()) return nullptr;
-    // Entry::tensor is currently always an AnyBCQFamilyTensor — Step
-    // 7 (KV cache) will introduce non-AnyBCQ tensors at which point
-    // a dynamic_cast becomes mandatory here.
-    return it->second.tensor.get();
+    return dynamic_cast<anybcq::AnyBCQFamilyTensor *>(it->second.tensor.get());
 }
 
 void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid,
@@ -528,6 +526,7 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
     // through pool_->load below (which copies from src_ptr); per-call
     // so concurrent async pread workers don't share state.
     std::vector<uint8_t> xform_scratch;
+    bool src_ptr_is_ephemeral = false;
 
     if (cid == kCidQBias) {
         src_ptr = host.q_bias.data();
@@ -556,6 +555,7 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
                                      host.chunks[p].end());
                 src_ptr = xform_scratch.data();
                 nbytes  = xform_scratch.size();
+                src_ptr_is_ephemeral = true;
                 diag::record_move_event(diag::MoveEvent::DramHit);
                 diag::record_move_event(diag::MoveEvent::CacheSnapshot);
             }
@@ -708,6 +708,7 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             // scratch sizing); use the actual per-chunk size for the
             // pool load.
             nbytes  = kernel_chunk_bytes;
+            src_ptr_is_ephemeral = true;
             // Stash for profile attribution after pool_->load below.
             mc_profile_pread_ns = pread_ns;
             mc_profile_active   = prof;
@@ -756,6 +757,21 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
         }
         DiagSpan _l(diag::MoveSite::PoolLoadEnqueue);
         h = pool_->load(wid, cid, src_ptr, nbytes, compute_stream);
+    }
+    if (src_ptr_is_ephemeral && h.ready_event != nullptr) {
+        // ``src_ptr`` points into xform_scratch, a function-local buffer.
+        // The pool copy stream may still be DMA-reading it after
+        // pool_->load returns.  Keep the buffer alive until the H2D event
+        // fires; otherwise the next allocator reuse can corrupt the
+        // transfer and surface as an illegal memory access in a later
+        // CUDA call.
+        cudaError_t e_sync = cudaEventSynchronize((cudaEvent_t) h.ready_event);
+        if (e_sync != cudaSuccess) {
+            throw std::runtime_error(
+                "StreamllmRuntime::move_chunk: H2D wait failed for " + wid +
+                " (cid=" + std::to_string(cid) + "): " +
+                cudaGetErrorString(e_sync));
+        }
     }
     if (mc_profile_active) {
         auto dt = std::chrono::steady_clock::now() - t_pool_start;
@@ -834,7 +850,7 @@ bool StreamllmRuntime::submit_async_load(const std::string & wid, int cid) {
     if (io_workers_.empty()) return false;
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        io_queue_.push_back(AsyncLoadRequest{wid, cid, nullptr});
+        io_queue_.push_back(AsyncLoadRequest{wid, cid, nullptr, nullptr});
         io_in_flight_.fetch_add(1, std::memory_order_relaxed);
     }
     io_cv_work_.notify_one();
@@ -843,7 +859,8 @@ bool StreamllmRuntime::submit_async_load(const std::string & wid, int cid) {
 
 bool StreamllmRuntime::submit_async_load(
     const std::string & wid, int cid,
-    std::shared_ptr<std::atomic<uint32_t>> batch_remaining)
+    std::shared_ptr<std::atomic<uint32_t>> batch_remaining,
+    StreamHandle compute_stream)
 {
     if (io_workers_.empty()) return false;
     if (batch_remaining) {
@@ -852,7 +869,8 @@ bool StreamllmRuntime::submit_async_load(
     {
         std::lock_guard<std::mutex> lk(io_mu_);
         io_queue_.push_back(
-            AsyncLoadRequest{wid, cid, std::move(batch_remaining)});
+            AsyncLoadRequest{wid, cid, compute_stream,
+                             std::move(batch_remaining)});
         io_in_flight_.fetch_add(1, std::memory_order_relaxed);
     }
     io_cv_work_.notify_one();
@@ -914,7 +932,7 @@ void StreamllmRuntime::io_worker_loop_() {
             try {
                 (void) move_chunk(req.wid, req.cid,
                                    Tier::RAM, Tier::VRAM,
-                                   /*compute_stream=*/nullptr);
+                                   req.compute_stream);
             } catch (const std::exception & e) {
                 static std::atomic<uint64_t> err_count{0};
                 uint64_t v = err_count.fetch_add(

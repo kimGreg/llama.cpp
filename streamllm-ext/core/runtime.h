@@ -223,7 +223,7 @@ private:
         // this tensor's host layout + per-plane device pointer tables.
         // Allocated by register_layout from the parsed UpstreamLayoutHost
         // (slab-allocated pointer arrays bound via set_device_state).
-        std::unique_ptr<anybcq::AnyBCQFamilyTensor> tensor;
+        std::unique_ptr<ChunkedTensor> tensor;
         UpstreamLayoutDevice dev;
         // Per-Entry mutex guarding tensor->host().chunks reads/writes.
         // Owned via unique_ptr because std::mutex isn't move-constructible
@@ -290,6 +290,7 @@ private:
     struct AsyncLoadRequest {
         std::string  wid;
         int          cid;
+        StreamHandle compute_stream = nullptr;
         // Optional per-batch counter for fine-grained (per-expert)
         // host-side waits. nullptr means the request is only counted
         // by the global ``io_in_flight_`` counter that
@@ -328,7 +329,8 @@ public:
     // wait_async_load_batch to wait on just this batch (= one
     // expert's chunks) instead of the whole hook fire.
     bool submit_async_load(const std::string & wid, int cid,
-                           std::shared_ptr<std::atomic<uint32_t>> batch_remaining);
+        std::shared_ptr<std::atomic<uint32_t>> batch_remaining,
+        StreamHandle compute_stream = nullptr);
     // Block until every submitted async-load has finished.
     void wait_async_load_idle();
     // Block until ``remaining`` reaches zero — the caller increments
