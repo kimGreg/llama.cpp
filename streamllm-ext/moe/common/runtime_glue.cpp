@@ -92,18 +92,8 @@ std::vector<void **>                  g_bound_model_slots_;
 
 namespace {
 
-// Default executor name preserved from pre-Step-1 installs.  Used when
-// the GGUF does not carry ``streamllm.executor`` (pre-gate artifact)
-// and required_runtime is false.  This is the soft-fallback name; the
-// hard refuse-to-load path lives below.
-constexpr const char * kDefaultExecutorName = "qwen3_ss_anybcq_v1";
-
-// Resolve the executor name to look up in the registry.
-//   GGUF carries streamllm.executor → use it.
-//   Missing key                     → kDefaultExecutorName (legacy).
 std::string resolve_executor_name(const GlobalMeta & g) {
-    return g.executor.empty() ? std::string(kDefaultExecutorName)
-                              : g.executor;
+    return g.executor;
 }
 
 // Conservative pool sizing used by install_for_gguf. Mirrors
@@ -187,6 +177,25 @@ bool install_for_gguf(const char * gguf_path) {
         long mb = std::atol(s);
         if (mb > 0) cap = (size_t)mb * 1024UL * 1024UL;
     }
+
+    // Mode A executor (SSOT §6.1.1, Milestone 1 Step 1 loader gate).
+    // Gate before runtime install so stale metadata fails without
+    // parsing/registering thousands of managed tensors into the pool.
+    qwen3::register_qwen3_moe_anybcq_executor();
+    const std::string exec_name = resolve_executor_name(reader.global());
+    if (exec_name.empty()) {
+        throw std::runtime_error(
+            "streamllm-ext: managed artifact is missing streamllm.executor; "
+            "re-encode or re-materialize with current StreamLLM metadata");
+    }
+    std::unique_ptr<ModelExecutor> new_executor =
+        make_executor(exec_name.c_str());
+    if (new_executor == nullptr) {
+        throw std::runtime_error(
+            "streamllm-ext: executor '" + exec_name +
+            "' is not registered; re-encode or re-materialize this artifact");
+    }
+
     // Benchmark/score-mode capture opt-in. Read here so the hook
     // short-circuit below sees the right value the first time it
     // fires (sentinel-bearing cgraphs land on the very first
@@ -212,46 +221,7 @@ bool install_for_gguf(const char * gguf_path) {
             "streamllm-ext: failed to size cast scratch");
     }
 
-    // Mode A executor (SSOT §6.1.1, Milestone 1 Step 1 loader gate).
-    // Register the Qwen3-MoE AnyBCQ executor (idempotent), then resolve
-    // the executor name against the GGUF's streamllm.executor key (with
-    // a soft-fallback default for pre-gate artifacts).  When
-    // streamllm.required_runtime=true and the named executor is not in
-    // the registry — e.g. binary mismatch, missing build config — refuse
-    // to load with a greppable error rather than silently downgrade.
-    qwen3::register_qwen3_moe_anybcq_executor();
-    const std::string exec_name = resolve_executor_name(reader.global());
-    g_executor = make_executor(exec_name.c_str());
-    if (g_executor == nullptr) {
-        // S9 (Mode A): required_runtime=true with no resolvable
-        // executor is an unconditional hard-fail — no escape hatch.
-        // Falling through here would leave the model with a managed-
-        // MoE artifact and no executor, which would mean either a
-        // null deref at bind time or — worse — silent legacy
-        // dispatch on managed MoE producing wrong output.
-        if (reader.global().required_runtime) {
-            g_runtime.reset();
-            throw std::runtime_error(
-                "streamllm-ext: required_runtime=true but executor '"
-                + exec_name + "' is not registered (build mismatch?)");
-        }
-        // Pre-gate artifacts may carry stale optional executor metadata.
-        // Preserve the soft-fallback contract by using the current default
-        // unless the required-runtime loader gate opted into hard failure.
-        if (exec_name != kDefaultExecutorName) {
-            std::fprintf(stderr,
-                "streamllm-ext: optional executor '%s' is not registered; "
-                "falling back to '%s'\n",
-                exec_name.c_str(), kDefaultExecutorName);
-            g_executor = make_executor(kDefaultExecutorName);
-        }
-        if (g_executor == nullptr) {
-            g_runtime.reset();
-            throw std::runtime_error(
-                "streamllm-ext: default executor '" +
-                std::string(kDefaultExecutorName) + "' is not registered");
-        }
-    }
+    g_executor = std::move(new_executor);
     g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
     if (g_executor->uses_stock_moe_graph()) {
         g_streamllm_allow_capture.store(false, std::memory_order_relaxed);

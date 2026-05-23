@@ -749,6 +749,9 @@ public:
     void release_from_dispatch(const std::string & wid, int cid) {
         tracker_.release(wid, cid);
     }
+    void touch_resident(const std::string & wid, int cid, int plane) {
+        tracker_.touch(wid, cid, plane);
+    }
 
     const MoeExpertTable * moe_expert_table(
         const std::string & canonical_wid) {
@@ -1612,6 +1615,15 @@ void scheduler_release_from_dispatch(
     int                 cid)
 {
     as_moe(sched).release_from_dispatch(wid, cid);
+}
+
+void scheduler_touch_resident(
+    Scheduler &         sched,
+    const std::string & wid,
+    int                 cid,
+    int                 plane)
+{
+    as_moe(sched).touch_resident(wid, cid, plane);
 }
 
 void scheduler_after_compute(

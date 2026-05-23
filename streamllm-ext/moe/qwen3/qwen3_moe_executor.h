@@ -30,8 +30,6 @@ public:
 
 class Qwen3BaselineExecutor : public ModelExecutor {
 public:
-    ~Qwen3BaselineExecutor() override;
-
     const char * name() const override { return "qwen3_direct_stock_v1"; }
     bool uses_stock_moe_graph() const override { return true; }
 
@@ -61,10 +59,11 @@ private:
 
     StreamllmRuntime * rt_ = nullptr;
     std::unordered_map<int, LayerState> layers_;
-    void * full_[3] = {nullptr, nullptr, nullptr};
-    size_t full_bytes_[3] = {0, 0, 0};
+    std::string staging_wid_[3];
+    void * staging_[3] = {nullptr, nullptr, nullptr};
+    size_t staging_bytes_[3] = {0, 0, 0};
 
-    void ensure_full_(int kind, size_t bytes);
+    void allocate_staging_(int kind, size_t bytes);
 };
 
 // Registry hookup. Idempotent.

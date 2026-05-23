@@ -2,6 +2,7 @@
 // VramChunkPool + Scheduler, exposing the two primitives.
 
 #include "runtime.h"
+#include "decoder_registry.h"
 #include "runtime_diag.h"
 #include "streamllm_nvtx.h"
 
@@ -13,12 +14,7 @@
 #include "anybcq_gemv.h"         // NaverKernelScratch (decode-path scratch
                                   // owned by the runtime; encoder-side
                                   // helpers reuse it via gemv_scratch()).
-// Concrete ChunkedTensor that Entry holds. The runtime needs the full
-// type to construct + dereference it (.host(), .d_qw_ptrs(), etc.) —
-// the runtime header forward-declares it.
-#include "decoder/anybcq/tensor.h"
-#include "decoder/direct_matrix/tensor.h"
-
+#include "decoder/anybcq/tensor.h"  // complete type for tensor_anybcq()
 namespace streamllm_ext {
 // Keep the framework's chunks-per-tensor cap aligned with the AnyBCQ
 // kernel's per-launch precision cap. The two layers must move together;
@@ -277,12 +273,7 @@ void StreamllmRuntime::register_layout(const std::string & wid,
             install_bytes, std::memory_order_relaxed);
     }
 
-    if (host.direct_matrix) {
-        e.tensor = std::unique_ptr<ChunkedTensor>(
-            new direct_matrix::DirectMatrixTensor(wid, std::move(host)));
-    } else {
-        e.tensor = wrap_host_in_tensor(wid, std::move(host));
-    }
+    e.tensor = make_chunked_tensor(wid, std::move(host));
     e.dev    = dev;
 
     // Populate the dispatch-side layout fields up-front from the host
@@ -664,18 +655,22 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             }
             {
                 DiagSpan _x(diag::MoveSite::Xform);
-                // Encoder-registered transform — see UpstreamLayoutHost
-                // ChunkDiskToKernelFn typedef. Throws if not wired
-                // (would mean the encoder install path didn't set it).
-                if (host.disk_to_kernel_fn == nullptr) {
+                // Direct/native chunks are stored in the same byte layout
+                // consumed by GGML, so SSD streaming is a raw copy. Encoded
+                // chunk families install a codec-aware disk->kernel
+                // transform below.
+                if (host.direct_matrix || host.direct_expert_block) {
+                    std::memcpy(xform_scratch.data(), dst, kernel_chunk_bytes);
+                } else if (host.disk_to_kernel_fn == nullptr) {
                     throw std::runtime_error(
                         "StreamllmRuntime::move_chunk: missing "
                         "disk_to_kernel_fn for " + wid);
+                } else {
+                    host.disk_to_kernel_fn(
+                        host, p,
+                        (const uint8_t *) dst,
+                        xform_scratch.data());
                 }
-                host.disk_to_kernel_fn(
-                    host, p,
-                    (const uint8_t *) dst,
-                    xform_scratch.data());
             }
             // Populate the DRAM cache: copy the kernel-format bytes
             // into host.chunks[p] under the per-Entry mutex so a

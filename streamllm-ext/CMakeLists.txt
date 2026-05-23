@@ -26,6 +26,7 @@ set(STREAMLLM_EXT_SOURCES
     core/stream_reader.cpp
     core/runtime.cpp
     core/executor.cpp
+    decoder/chunked_tensor_factory.cpp
     moe/common/moe_scheduler.cpp
     decoder/anybcq/upstream_layout.cpp
     decoder/anybcq/tensor.cpp

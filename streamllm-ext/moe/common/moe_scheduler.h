@@ -68,6 +68,11 @@ void scheduler_release_from_dispatch(
     Scheduler &         sched,
     const std::string & wid,
     int                 cid);
+void scheduler_touch_resident(
+    Scheduler &         sched,
+    const std::string & wid,
+    int                 cid,
+    int                 plane);
 
 // Post-compute hook: called after a managed mul_mat has launched and
 // the pool's compute event has been recorded.  Schedulers that want

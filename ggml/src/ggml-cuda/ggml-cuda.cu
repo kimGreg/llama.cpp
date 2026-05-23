@@ -3242,7 +3242,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // cgraphs). The dense hook being installed is still enough of a
     // signal that streamllm is active to gate capture off unless the
     // operator explicitly opts in.
-    const bool stream_llm_hook = (g_cuda_mul_mat_hook != nullptr);
+    const bool stream_llm_hook =
+        (g_cuda_mul_mat_hook != nullptr) || (g_cuda_pre_op_hook != nullptr);
     if (stream_llm_hook) {
         const char * enable = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
         const bool allow_legacy =
@@ -3958,7 +3959,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
-                if (!disable_fusion) {
+                if (!disable_fusion && g_cuda_pre_op_hook == nullptr) {
                     ggml_cuda_topk_moe_args args;
 
                     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||

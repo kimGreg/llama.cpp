@@ -6,15 +6,7 @@
 // streamllm_ext::install_for_gguf; the test asserts the install
 // outcome matches the expected gate semantics:
 //
-//   (A) pre-gate (no required_runtime/executor keys, no managed tensors)
-//       → install_for_gguf returns false (the artifact's
-//         from_gguf parses but install bails on empty managed_tensors
-//         before reaching the executor lookup, because
-//         g_runtime->install must still succeed end-to-end).
-//
-//       For Step 1 we exercise this path only as a *parse-level*
-//       sanity check — see StreamReader::from_gguf below — rather than
-//       a full install.
+//   (A) managed metadata without executor is rejected.
 //
 //   (B) required_runtime=true + executor="qwen3_ss_anybcq_v1"
 //       (a registered name) → install_for_gguf reaches the
@@ -22,10 +14,14 @@
 //       Then it proceeds to actual pool install; we stop short by
 //       using only the parse path.
 //
-//   (C) required_runtime=true + executor="does_not_exist_v1"
-//       → install_for_gguf MUST throw with the greppable message
-//         containing "required_runtime=true but executor '...' is
-//         not registered".
+//   (C) required_runtime=true + executor="qwen3_direct_stock_v1"
+//       (a registered direct baseline name) → accepted.
+//
+//   (D) required_runtime=true + a legacy Qwen3 AnyBCQ alias
+//       → accepted and routed to the current executor.
+//
+//   (E) required_runtime=true + an unknown/stale executor
+//       → rejected with a re-encode/re-materialize message.
 //
 // Build target: streamllm-loader-gate-test
 //
@@ -137,26 +133,28 @@ void verify_parse(
         tag, (int)g.required_runtime, g.executor.c_str());
 }
 
-// Mimic install_for_gguf's resolve-and-gate step in isolation: take
-// a parsed GlobalMeta, resolve the executor name, look it up in the
-// registry, and assert the throw fires on the unregistered name when
-// required_runtime is true.
+// Mimic install_for_gguf's resolve-and-gate step in isolation: managed
+// artifacts must carry a registered executor name.
 void verify_registry_gate(
     const char *                       tag,
     const streamllm_ext::GlobalMeta &  g,
     bool                               expect_throws)
 {
     streamllm_ext::qwen3::register_qwen3_moe_executor();
-    const std::string name =
-        g.executor.empty() ? std::string("qwen3_ss_anybcq_v1") : g.executor;
-    auto exec = streamllm_ext::make_executor(name.c_str());
+    const std::string name = g.executor;
+    auto exec = name.empty() ? nullptr
+                             : streamllm_ext::make_executor(name.c_str());
 
     bool would_throw = false;
     std::string err;
-    if (exec == nullptr && g.required_runtime) {
+    if (name.empty()) {
         would_throw = true;
-        err = std::string("streamllm-ext: required_runtime=true but executor '")
-            + name + "' is not registered (build mismatch?)";
+        err = "streamllm-ext: managed artifact is missing streamllm.executor; "
+              "re-encode or re-materialize with current StreamLLM metadata";
+    } else if (exec == nullptr) {
+        would_throw = true;
+        err = std::string("streamllm-ext: executor '")
+            + name + "' is not registered; re-encode or re-materialize this artifact";
     }
 
     if (would_throw != expect_throws) {
@@ -173,7 +171,8 @@ void verify_registry_gate(
         would_throw ? err.c_str()     : "");
     if (would_throw) {
         // Greppable substring sanity.
-        if (err.find("required_runtime=true but executor '") == std::string::npos) {
+        if (err.find("re-encode") == std::string::npos &&
+            err.find("re-materialize") == std::string::npos) {
             std::fprintf(stderr,
                 "test_loader_gate[%s]: refuse-to-load message lost its "
                 "greppable substring\n", tag);
@@ -187,19 +186,18 @@ void verify_registry_gate(
 int main() {
     std::fprintf(stderr, "test_loader_gate: starting\n");
 
-    // (A) pre-gate-ish — required_runtime absent in GGUF (we omit the
-    // key by passing required_runtime=false and executor=nullptr).
+    // (A) managed metadata without streamllm.executor is now invalid.
     {
-        std::string p = write_test_gguf("A_pre_gate",
+        std::string p = write_test_gguf("A_missing_executor",
             /*required_runtime=*/false,
             /*executor_name=*/  nullptr);
-        verify_parse("A_pre_gate", p,
+        verify_parse("A_missing_executor", p,
             /*expect_required_runtime=*/false,
             /*expect_executor=*/        std::string());
         streamllm_ext::GlobalMeta g{};
         g.required_runtime = false;
         g.executor.clear();
-        verify_registry_gate("A_pre_gate", g, /*expect_throws=*/false);
+        verify_registry_gate("A_missing_executor", g, /*expect_throws=*/true);
         fs::remove(p);
     }
 
@@ -218,18 +216,48 @@ int main() {
         fs::remove(p);
     }
 
-    // (C) required_runtime=true + a name that is NOT registered.
+    // (C) required_runtime=true + direct baseline executor.
     {
-        std::string p = write_test_gguf("C_required_bad",
+        std::string p = write_test_gguf("C_direct_ok",
             /*required_runtime=*/true,
-            /*executor_name=*/  "does_not_exist_v1");
-        verify_parse("C_required_bad", p,
+            /*executor_name=*/  "qwen3_direct_stock_v1");
+        verify_parse("C_direct_ok", p,
             /*expect_required_runtime=*/true,
-            /*expect_executor=*/        std::string("does_not_exist_v1"));
+            /*expect_executor=*/        std::string("qwen3_direct_stock_v1"));
         streamllm_ext::GlobalMeta g{};
         g.required_runtime = true;
-        g.executor         = "does_not_exist_v1";
-        verify_registry_gate("C_required_bad", g, /*expect_throws=*/true);
+        g.executor         = "qwen3_direct_stock_v1";
+        verify_registry_gate("C_direct_ok", g, /*expect_throws=*/false);
+        fs::remove(p);
+    }
+
+    // (D) required_runtime=true + legacy Qwen3 AnyBCQ alias.
+    {
+        std::string p = write_test_gguf("D_legacy_anybcq_ok",
+            /*required_runtime=*/true,
+            /*executor_name=*/  "qwen3_anybcq_v1");
+        verify_parse("D_legacy_anybcq_ok", p,
+            /*expect_required_runtime=*/true,
+            /*expect_executor=*/        std::string("qwen3_anybcq_v1"));
+        streamllm_ext::GlobalMeta g{};
+        g.required_runtime = true;
+        g.executor         = "qwen3_anybcq_v1";
+        verify_registry_gate("D_legacy_anybcq_ok", g, /*expect_throws=*/false);
+        fs::remove(p);
+    }
+
+    // (E) required_runtime=true + a stale name that is NOT registered.
+    {
+        std::string p = write_test_gguf("E_required_bad",
+            /*required_runtime=*/true,
+            /*executor_name=*/  "qwen3_unknown_v0");
+        verify_parse("E_required_bad", p,
+            /*expect_required_runtime=*/true,
+            /*expect_executor=*/        std::string("qwen3_unknown_v0"));
+        streamllm_ext::GlobalMeta g{};
+        g.required_runtime = true;
+        g.executor         = "qwen3_unknown_v0";
+        verify_registry_gate("E_required_bad", g, /*expect_throws=*/true);
         fs::remove(p);
     }
 
