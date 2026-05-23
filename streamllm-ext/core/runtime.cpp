@@ -931,11 +931,15 @@ EventHandle StreamllmRuntime::move_chunks_batch(
     StreamHandle compute_stream)
 {
     if (keys.empty()) return nullptr;
-    std::vector<PreparedChunkPayload> payloads;
-    payloads.reserve(keys.size());
-    size_t packed_bytes = 0;
-    prepare_chunk_payloads_batch_(keys, payloads, packed_bytes);
-    if (payloads.empty() || packed_bytes == 0) return nullptr;
+
+    struct BundleBatchRef {
+        ChunkKey key;
+        Entry * entry = nullptr;
+        int p = -1;
+        int64_t off = 0;
+        size_t nbytes = 0;
+        std::string bundle;
+    };
 
     size_t max_batch_bytes = 4ull * 1024ull * 1024ull;
     if (const char * env = std::getenv("STREAMLLM_BATCH_CHUNK_MAX_MB")) {
@@ -945,23 +949,202 @@ EventHandle StreamllmRuntime::move_chunks_batch(
         }
     }
 
-    auto run_payload_batch = [&](size_t first, size_t last, size_t nbytes) {
-        if (nbytes > batch_staging_bytes_) {
-            if (batch_staging_) {
-                cudaFreeHost(batch_staging_);
-                batch_staging_ = nullptr;
-                batch_staging_bytes_ = 0;
-            }
-            cudaError_t cerr = cudaHostAlloc(&batch_staging_, nbytes,
-                                             cudaHostAllocDefault);
-            if (cerr != cudaSuccess) {
-                throw std::runtime_error(
-                    std::string("StreamllmRuntime::move_chunks_batch: "
-                                "cudaHostAlloc(batch staging) failed: ") +
-                    cudaGetErrorString(cerr));
-            }
-            batch_staging_bytes_ = nbytes;
+    auto ensure_batch_staging = [&](size_t nbytes) {
+        if (nbytes <= batch_staging_bytes_) return;
+        if (batch_staging_) {
+            cudaFreeHost(batch_staging_);
+            batch_staging_ = nullptr;
+            batch_staging_bytes_ = 0;
         }
+        cudaError_t cerr = cudaHostAlloc(&batch_staging_, nbytes,
+                                         cudaHostAllocDefault);
+        if (cerr != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("StreamllmRuntime::move_chunks_batch: "
+                            "cudaHostAlloc(batch staging) failed: ") +
+                cudaGetErrorString(cerr));
+        }
+        batch_staging_bytes_ = nbytes;
+    };
+
+    auto try_move_kernel_ready_bundle_batch = [&]() -> bool {
+        std::vector<BundleBatchRef> refs;
+        refs.reserve(keys.size());
+        for (const auto & key : keys) {
+            if (pool_->is_resident(key.wid, key.cid)) {
+                pool_->note_redundant_h2d_skipped();
+                continue;
+            }
+            auto it = entries_.find(key.wid);
+            if (it == entries_.end() || !cid_is_chunk(key.cid)) {
+                return false;
+            }
+            Entry & e = it->second;
+            const int p = cid_chunk_index(key.cid);
+            const bool have_bundle =
+                p >= 0 &&
+                p < (int)e.chunk_file_offsets.size() &&
+                p < (int)e.chunk_file_sizes.size() &&
+                p < (int)e.chunk_file_kernel_ready.size() &&
+                p < (int)e.chunk_file_bundle.size() &&
+                e.chunk_file_kernel_ready[p] != 0 &&
+                !e.chunk_file_bundle[p].empty();
+            if (!have_bundle) {
+                return false;
+            }
+
+            UpstreamLayoutHost & host = e.tensor->host();
+            size_t kernel_chunk_bytes = host.bytes_per_chunk;
+            if (host.any_precision) {
+                if (p < 0 || p >= (int)host.chunk_planes.size()) {
+                    throw std::runtime_error(
+                        "StreamllmRuntime::move_chunks_batch: any-prec chunk "
+                        "index out of range for " + key.wid);
+                }
+                kernel_chunk_bytes = host.chunk_planes[p].kernel_chunk_bytes;
+            }
+            const int64_t src_size = e.chunk_file_sizes[p];
+            if (src_size < 0 || (size_t)src_size != kernel_chunk_bytes) {
+                throw std::runtime_error(
+                    "StreamllmRuntime::move_chunks_batch: bundle kernel-ready "
+                    "slice size mismatch for " + key.wid);
+            }
+            refs.push_back(BundleBatchRef{
+                key, &e, p, e.chunk_file_offsets[p],
+                kernel_chunk_bytes, e.chunk_file_bundle[p],
+            });
+        }
+        if (refs.empty()) return true;
+
+        std::stable_sort(
+            refs.begin(), refs.end(),
+            [](const BundleBatchRef & a, const BundleBatchRef & b) {
+                if (a.bundle != b.bundle) return a.bundle < b.bundle;
+                return a.off < b.off;
+            });
+
+        auto run_ref_batch = [&](size_t first, size_t last, size_t nbytes) {
+            ensure_batch_staging(nbytes);
+            uint8_t * packed = reinterpret_cast<uint8_t *>(batch_staging_);
+            std::vector<BatchLoadItem> items;
+            items.reserve(last - first);
+            std::vector<std::pair<ChunkKey, void *>> loaded;
+            loaded.reserve(last - first);
+
+            size_t cursor = 0;
+            for (size_t i = first; i < last; ++i) {
+                items.push_back(BatchLoadItem{
+                    refs[i].key,
+                    packed + cursor,
+                    refs[i].nbytes,
+                });
+                cursor += refs[i].nbytes;
+            }
+
+            cursor = 0;
+            size_t i = first;
+            while (i < last) {
+                const size_t packed_start = cursor;
+                const int64_t src_start = refs[i].off;
+                int64_t src_end = refs[i].off + (int64_t)refs[i].nbytes;
+                cursor += refs[i].nbytes;
+                size_t j = i + 1;
+                while (j < last &&
+                       refs[j].bundle == refs[i].bundle &&
+                       refs[j].off == src_end) {
+                    src_end += (int64_t)refs[j].nbytes;
+                    cursor += refs[j].nbytes;
+                    ++j;
+                }
+
+                const int64_t span_size = src_end - src_start;
+                int64_t total = 0;
+                {
+                    DiagSpan _t(diag::MoveSite::Pread);
+                    while (total < span_size) {
+                        ssize_t got = ::pread(
+                            gguf_fd_,
+                            packed + packed_start + total,
+                            (size_t)(span_size - total),
+                            (off_t)(src_start + total));
+                        if (got < 0) {
+                            int err = errno;
+                            throw std::runtime_error(
+                                "StreamllmRuntime::move_chunks_batch: pread "
+                                "failed: " + std::string(std::strerror(err)));
+                        }
+                        if (got == 0) {
+                            throw std::runtime_error(
+                                "StreamllmRuntime::move_chunks_batch: short "
+                                "pread");
+                        }
+                        total += got;
+                    }
+                    (void)::posix_fadvise(gguf_fd_, (off_t)src_start,
+                                          (off_t)span_size,
+                                          POSIX_FADV_DONTNEED);
+                }
+                diag::record_move_event(diag::MoveEvent::SsdMiss);
+                i = j;
+            }
+
+            std::vector<ChunkHandle> handles;
+            begin_deferred_pointer_clears_(pool_->copy_stream());
+            try {
+                for (;;) {
+                    handles = pool_->load_batch_sync(items, packed,
+                                                     nbytes, compute_stream);
+                    if (!handles.empty()) break;
+                    if (!scheduler_->make_room_for(*pool_, nbytes)) {
+                        flush_deferred_pointer_clears_();
+                        return false;
+                    }
+                }
+                flush_deferred_pointer_clears_();
+            } catch (...) {
+                cancel_deferred_pointer_clears_();
+                throw;
+            }
+
+            for (size_t j = 0; j < handles.size(); ++j) {
+                loaded.push_back({refs[first + j].key, handles[j].device_ptr});
+            }
+            finish_loaded_chunks_batch_(loaded);
+            if (pool_->copy_stream() != nullptr) {
+                cudaStreamSynchronize((cudaStream_t)pool_->copy_stream());
+            }
+            return true;
+        };
+
+        size_t first = 0;
+        size_t cur_bytes = 0;
+        for (size_t i = 0; i < refs.size(); ++i) {
+            const size_t n = refs[i].nbytes;
+            if (i > first && cur_bytes + n > max_batch_bytes) {
+                if (!run_ref_batch(first, i, cur_bytes)) return false;
+                first = i;
+                cur_bytes = 0;
+            }
+            cur_bytes += n;
+        }
+        if (first < refs.size()) {
+            if (!run_ref_batch(first, refs.size(), cur_bytes)) return false;
+        }
+        return true;
+    };
+
+    if (try_move_kernel_ready_bundle_batch()) {
+        return nullptr;
+    }
+
+    std::vector<PreparedChunkPayload> payloads;
+    payloads.reserve(keys.size());
+    size_t packed_bytes = 0;
+    prepare_chunk_payloads_batch_(keys, payloads, packed_bytes);
+    if (payloads.empty() || packed_bytes == 0) return nullptr;
+
+    auto run_payload_batch = [&](size_t first, size_t last, size_t nbytes) {
+        ensure_batch_staging(nbytes);
         uint8_t * packed = reinterpret_cast<uint8_t *>(batch_staging_);
         std::vector<BatchLoadItem> items;
         items.reserve(last - first);
