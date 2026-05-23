@@ -201,12 +201,10 @@ int main(int argc, char ** argv) {
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
-    // streamllm-ext live precision dial + realtime stats
-    ctx_http.get ("/streamllm/score_table",    ex_wrapper(routes.get_streamllm_score_table));
-    ctx_http.post("/streamllm/score_table",    ex_wrapper(routes.post_streamllm_score_table));
-    ctx_http.get ("/streamllm/static_layout",  ex_wrapper(routes.get_streamllm_static_layout));
-    ctx_http.post("/streamllm/static_layout",  ex_wrapper(routes.post_streamllm_static_layout));
-    ctx_http.post("/streamllm/schedule",       ex_wrapper(routes.post_streamllm_schedule));
+    // streamllm-ext KBar dial + realtime stats
+    ctx_http.get ("/streamllm/kbar",           ex_wrapper(routes.get_streamllm_kbar));
+    ctx_http.post("/streamllm/kbar",           ex_wrapper(routes.post_streamllm_kbar));
+    ctx_http.post("/streamllm/kbar_schedule",  ex_wrapper(routes.post_streamllm_kbar_schedule));
     ctx_http.get ("/streamllm/stats",          ex_wrapper(routes.get_streamllm_stats));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));

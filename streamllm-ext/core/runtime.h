@@ -341,30 +341,29 @@ public:
     // Number of async-load worker threads (0 = disabled).
     int  io_worker_count() const { return (int)io_workers_.size(); }
 
-    // Score-table snapshot taken once per cgraph_compute by the
-    // scheduler's ``on_graph_compute_begin``. Computations that
-    // depend on the live dial read this snapshot during their plan()
-    // so the dial value is consistent across all managed dispatches
-    // in the same compute pass.
-    void                       set_replay_score_table(std::vector<float> snap);
-    const std::vector<float> & current_replay_score_table() const;
+    // KBar snapshot taken once per cgraph_compute by the scheduler's
+    // ``on_graph_compute_begin``. Computations that depend on the live
+    // dial read this scalar during their plan() so the dial is
+    // consistent across all managed dispatches in the same compute pass.
+    void  set_replay_kbar(float kbar);
+    float current_replay_kbar() const;
 
-    // Score-table version key, refreshed alongside the snapshot.
+    // Dial version key, refreshed alongside the snapshot.
     // Read by ggml-cuda's CUDA-graph cache predicate to force re-
-    // capture when the dial changes (e.g. HTTP /streamllm/score_table
-    // swap or a phase-aware reasoning→generation transition). Atomic
+    // capture when the dial changes (e.g. HTTP /streamllm/kbar
+    // swap or a phase-aware reasoning->generation transition). Atomic
     // so the cache hook can read it lock-free per cgraph_compute.
-    void     set_replay_score_table_version(uint64_t v);
-    uint64_t replay_score_table_version() const;
+    void     set_replay_dial_version(uint64_t v);
+    uint64_t replay_dial_version() const;
 
 private:
     bool installed_ = false;
 
-    // Score-table snapshot, refreshed by the scheduler in
+    // KBar snapshot, refreshed by the scheduler in
     // on_graph_compute_begin.
-    std::vector<float>                       replay_score_table_;
-    mutable std::mutex                       replay_score_table_mu_;
-    std::atomic<uint64_t>                    replay_score_table_version_{0};
+    float                                    replay_kbar_ = 0.0f;
+    mutable std::mutex                       replay_dial_mu_;
+    std::atomic<uint64_t>                    replay_dial_version_{0};
 };
 
 } // namespace streamllm_ext

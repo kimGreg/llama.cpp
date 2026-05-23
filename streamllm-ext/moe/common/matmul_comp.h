@@ -118,6 +118,14 @@ public:
     int                           n_chunks_max()  const { return n_chunks_; }
     int                           group_size()    const { return group_size_; }
 
+    // Eager-mode device planner hook. The executor may compute the
+    // per-expert chunk counts once per layer dispatch and share them
+    // across gate/up/down planning. Values <= 0 mean inactive expert.
+    void use_external_chunk_plan(const int * chunks_per_expert) {
+        external_chunks_per_expert_ = chunks_per_expert;
+    }
+    void clear_external_chunk_plan() { external_chunks_per_expert_ = nullptr; }
+
 private:
     StreamllmRuntime *           rt_         = nullptr;
     Scheduler *                  sched_      = nullptr;
@@ -165,6 +173,8 @@ private:
     int  cur_n_expert_       = 0;
     bool have_real_scores_   = false;
     bool have_renorm_weights_ = false;
+
+    const int * external_chunks_per_expert_ = nullptr;
 };
 
 // Free-fn lookup the dispatch shim uses to find a comp from a canonical

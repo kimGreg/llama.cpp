@@ -96,7 +96,7 @@ namespace {
 // the GGUF does not carry ``streamllm.executor`` (pre-gate artifact)
 // and required_runtime is false.  This is the soft-fallback name; the
 // hard refuse-to-load path lives below.
-constexpr const char * kDefaultExecutorName = "qwen3_moe_anybcq_v1";
+constexpr const char * kDefaultExecutorName = "qwen3_ss_anybcq_v1";
 
 // Resolve the executor name to look up in the registry.
 //   GGUF carries streamllm.executor → use it.
@@ -229,17 +229,28 @@ bool install_for_gguf(const char * gguf_path) {
         // MoE artifact and no executor, which would mean either a
         // null deref at bind time or — worse — silent legacy
         // dispatch on managed MoE producing wrong output.
-        g_runtime.reset();
         if (reader.global().required_runtime) {
+            g_runtime.reset();
             throw std::runtime_error(
                 "streamllm-ext: required_runtime=true but executor '"
                 + exec_name + "' is not registered (build mismatch?)");
         }
-        // Pre-gate artifacts (no required_runtime key) still expect
-        // the resolved name to be in the registry. Surface a clear
-        // error so the operator knows the build is broken.
-        throw std::runtime_error(
-            "streamllm-ext: executor '" + exec_name + "' not registered");
+        // Pre-gate artifacts may carry stale optional executor metadata.
+        // Preserve the soft-fallback contract by using the current default
+        // unless the required-runtime loader gate opted into hard failure.
+        if (exec_name != kDefaultExecutorName) {
+            std::fprintf(stderr,
+                "streamllm-ext: optional executor '%s' is not registered; "
+                "falling back to '%s'\n",
+                exec_name.c_str(), kDefaultExecutorName);
+            g_executor = make_executor(kDefaultExecutorName);
+        }
+        if (g_executor == nullptr) {
+            g_runtime.reset();
+            throw std::runtime_error(
+                "streamllm-ext: default executor '" +
+                std::string(kDefaultExecutorName) + "' is not registered");
+        }
     }
     g_executor->bind_to_model(*g_runtime, reader, std::string(gguf_path));
     if (g_executor->uses_stock_moe_graph()) {
@@ -305,13 +316,8 @@ bool install_for_gguf(const char * gguf_path) {
         (void *) &streamllm_on_graph_audit_and_score_snapshot_end);
     ggml_cuda_set_user_node_claims_hook(
         (void *) &streamllm_user_node_claims);
-    // Score-table version key for the CUDA-graph cache. Fires once
-    // per cgraph_compute; bumps invalidate the cached graph so a
-    // dial swap (HTTP /streamllm/score_table or phase-aware
-    // reasoning→generation transition) re-captures with the new
-    // grid dims instead of replaying the stale graph.
     ggml_cuda_set_streamllm_score_version_hook(
-        (void *) &streamllm_replay_score_table_version);
+        (void *) &streamllm_replay_dial_version);
     return true;
 }
 
@@ -396,7 +402,7 @@ extern "C" bool streamllm_user_node_claims(const struct ggml_tensor * node) {
     return g_runtime->scheduler().claims_node(node);
 }
 
-extern "C" uint64_t streamllm_replay_score_table_version(void) {
+extern "C" uint64_t streamllm_replay_dial_version(void) {
     // Hot path: called by ggml-cuda's graph-update predicate once
     // per cgraph_compute. The runtime's atomic version field is
     // refreshed in MoEScheduler::on_graph_compute_begin alongside
@@ -404,7 +410,7 @@ extern "C" uint64_t streamllm_replay_score_table_version(void) {
     // grid dims for the current capture window.
     std::lock_guard<std::mutex> lk(g_runtime_mu);
     if (!g_runtime) return 0;
-    return g_runtime->replay_score_table_version();
+    return g_runtime->replay_dial_version();
 }
 
 // ── Runtime-mutable gradual-schedule state ────────────────────────────
@@ -418,37 +424,34 @@ namespace {
 std::mutex                            g_schedule_mu;
 bool                                  g_schedule_active_v = false;
 std::vector<int>                      g_schedule_thresholds_v;
-std::vector<std::vector<float>>       g_schedule_dials_v;
+std::vector<float>                    g_schedule_kbars_v;
+int                                   g_schedule_allocator_v = 0;
 }  // anon
 
-extern "C" bool streamllm_schedule_set(
+extern "C" bool streamllm_kbar_schedule_set(
     const int *   thresholds, int n_thresh,
-    const float * dials_flat, const int * dial_lens, int n_dials)
+    const float * kbars, int n_kbars,
+    int allocator_mode)
 {
-    if (thresholds == nullptr || dials_flat == nullptr || dial_lens == nullptr) {
+    if (thresholds == nullptr || kbars == nullptr) {
         return false;
     }
-    if (n_thresh < 0 || n_dials <= 0 || n_dials != n_thresh + 1) {
+    if (n_thresh < 0 || n_kbars <= 0 || n_kbars != n_thresh + 1) {
         return false;
     }
     // Validate strictly-ascending thresholds.
     for (int i = 1; i < n_thresh; ++i) {
         if (thresholds[i] <= thresholds[i - 1]) return false;
     }
-    // Copy out under lock.
-    std::vector<int> new_thr(thresholds, thresholds + n_thresh);
-    std::vector<std::vector<float>> new_dials;
-    new_dials.reserve((size_t) n_dials);
-    int off = 0;
-    for (int d = 0; d < n_dials; ++d) {
-        const int len = dial_lens[d];
-        if (len <= 0) return false;
-        new_dials.emplace_back(dials_flat + off, dials_flat + off + len);
-        off += len;
+    for (int i = 0; i < n_kbars; ++i) {
+        if (!(kbars[i] >= 0.0f)) return false;
     }
+    std::vector<int> new_thr(thresholds, thresholds + n_thresh);
+    std::vector<float> new_kbars(kbars, kbars + n_kbars);
     std::lock_guard<std::mutex> lk(g_schedule_mu);
     g_schedule_thresholds_v = std::move(new_thr);
-    g_schedule_dials_v      = std::move(new_dials);
+    g_schedule_kbars_v      = std::move(new_kbars);
+    g_schedule_allocator_v  = allocator_mode;
     g_schedule_active_v     = true;
     return true;
 }
@@ -457,7 +460,8 @@ extern "C" void streamllm_schedule_clear(void) {
     std::lock_guard<std::mutex> lk(g_schedule_mu);
     g_schedule_active_v = false;
     g_schedule_thresholds_v.clear();
-    g_schedule_dials_v.clear();
+    g_schedule_kbars_v.clear();
+    g_schedule_allocator_v = 0;
 }
 
 extern "C" bool streamllm_schedule_active(void) {
@@ -467,12 +471,14 @@ extern "C" bool streamllm_schedule_active(void) {
 
 bool streamllm_schedule_get(
     std::vector<int> *                out_thresholds,
-    std::vector<std::vector<float>> * out_dials)
+    std::vector<float> *              out_kbars,
+    int *                             out_allocator_mode)
 {
     std::lock_guard<std::mutex> lk(g_schedule_mu);
     if (!g_schedule_active_v) return false;
     if (out_thresholds) *out_thresholds = g_schedule_thresholds_v;
-    if (out_dials)      *out_dials      = g_schedule_dials_v;
+    if (out_kbars)      *out_kbars      = g_schedule_kbars_v;
+    if (out_allocator_mode) *out_allocator_mode = g_schedule_allocator_v;
     return true;
 }
 
@@ -540,73 +546,36 @@ __attribute__((weak)) unsigned long long streamllm_stat_tier_ssd_misses(void) { 
 __attribute__((weak)) int                streamllm_stat_diag_enabled(void)    { return 0; }
 } // extern "C"
 
-extern "C" bool streamllm_set_score_table(
-    const float * thresholds, int n_thresh)
+extern "C" bool streamllm_set_kbar(float kbar, int allocator_mode)
 {
-    if (thresholds == nullptr || n_thresh <= 0) return false;
-    std::vector<float> th(thresholds, thresholds + n_thresh);
     StreamllmRuntime * rt = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_runtime_mu);
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    return qwen3::scheduler_set_score_table(rt->scheduler(), th);
+    const auto mode = allocator_mode == 1
+        ? qwen3::KBarAllocatorMode::Uniform
+        : qwen3::KBarAllocatorMode::Profile;
+    return qwen3::scheduler_set_kbar(rt->scheduler(), kbar, mode);
 }
 
-bool streamllm_get_score_table(
-    std::vector<float> & out_thresholds)
+extern "C" bool streamllm_get_kbar(float * out_kbar, int * out_allocator_mode)
 {
-    out_thresholds.clear();
     StreamllmRuntime * rt = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_runtime_mu);
         rt = g_runtime.get();
     }
     if (rt == nullptr) return false;
-    out_thresholds = qwen3::scheduler_score_thresholds_snapshot(rt->scheduler());
+    if (out_kbar) *out_kbar = qwen3::scheduler_kbar(rt->scheduler());
+    if (out_allocator_mode) {
+        *out_allocator_mode =
+            qwen3::scheduler_kbar_allocator_mode(rt->scheduler()) ==
+                    qwen3::KBarAllocatorMode::Uniform ? 1 : 0;
+    }
     return true;
 }
-
-// ── Static per-(layer, expert) chunk-count override (extern-C) ─────
-// See moe_scheduler.h. flat_table is a length-(n_layers * n_experts)
-// uint8 array, row-major (layer-major). Entries: 0 = no override (fall
-// back to threshold path); > 0 = use this many chunks for the expert.
-extern "C" bool streamllm_set_static_layout(
-    const unsigned char * flat_table, int n_layers, int n_experts)
-{
-    if (flat_table == nullptr || n_layers <= 0 || n_experts <= 0) return false;
-    const size_t n = (size_t) n_layers * (size_t) n_experts;
-    std::vector<uint8_t> table(flat_table, flat_table + n);
-    StreamllmRuntime * rt = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_runtime_mu);
-        rt = g_runtime.get();
-    }
-    if (rt == nullptr) return false;
-    return qwen3::scheduler_set_static_layout(
-        rt->scheduler(), table, n_layers, n_experts);
-}
-
-extern "C" void streamllm_clear_static_layout(void) {
-    StreamllmRuntime * rt = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_runtime_mu);
-        rt = g_runtime.get();
-    }
-    if (rt != nullptr) qwen3::scheduler_clear_static_layout(rt->scheduler());
-}
-
-extern "C" int streamllm_has_static_layout(void) {
-    StreamllmRuntime * rt = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_runtime_mu);
-        rt = g_runtime.get();
-    }
-    if (rt == nullptr) return 0;
-    return qwen3::scheduler_has_static_layout(rt->scheduler()) ? 1 : 0;
-}
-
 
 void clear() {
     std::lock_guard<std::mutex> lk(g_runtime_mu);

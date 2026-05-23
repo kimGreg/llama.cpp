@@ -251,5 +251,44 @@ void launch_plan_per_expert_kbar(
     int *           planes_per_eid_d,
     StreamHandle    stream);
 
+void launch_plan_per_expert_uniform(
+    const int32_t * ids_d,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             uniform_k,
+    int             n_chunks_max,
+    int             base_p,
+    bool            any_precision,
+    int *           planes_per_eid_d,
+    StreamHandle    stream);
+
+// Eager-mode dynamic KBar planner. Unlike the capture planner above,
+// this emits CHUNK counts, keeps inactive experts at 0, and accepts
+// byte strides from ggml tensors so the executor can plan directly
+// from the live ids/weights/probs tensors without staging full D2H
+// routing buffers.
+void launch_plan_chunks_kbar_exact_strided(
+    const int32_t * ids_d,
+    size_t          ids_row_stride,
+    const float *   weights_d,
+    size_t          weights_row_stride,
+    const float *   probs_d,
+    size_t          probs_row_stride,
+    const float *   R_d,
+    int             K_min,
+    int             K_max,
+    int             layer_index,
+    float           kbar,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             n_chunks_max,
+    int *           chunks_per_eid_d,
+    float *         dp_prev_d,
+    float *         dp_cur_d,
+    uint8_t *       trace_d,
+    StreamHandle    stream);
+
 }  // namespace qwen3
 }  // namespace streamllm_ext

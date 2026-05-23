@@ -177,34 +177,12 @@ void register_chunk_io_from_layout(StreamllmRuntime & rt,
 //
 //   At dispatch time (mul_mat_id hook calls plan_for_expert per
 //   selected expert):
-//     - desired = clamp(precision_from_gate(score), MIN, MAX)
-//     - on-demand planes ride the VramChunkPool LRU so cap pressure
-//       auto-evicts least-recently-used on-demand chunks (pinned
-//       MIN planes are never evictable).
-//
-// Precision policy: per-expert max gate-score → threshold-ladder
-// lookup → chunks_loaded.  Per-expert aggregation takes max(g) over
-// (t, u) hitting the expert; every (t, u) routed to expert e shares
-// the same precision derived from e's highest-scoring token in the
-// minibatch.  Single-token decode and batched prefill go through the
-// same code (the minibatch is just one token at decode).
-//
-// Env var (only one):
-//   STREAMLLM_MOE_SCORE_THRESHOLDS  ascending CSV of length N (=
-//                                   max n_chunks across managed
-//                                   tensors).  thresholds[k] = lower-
-//                                   edge gate score for the band that
-//                                   loads (k+1) chunks.  Default = all
-//                                   zeros (full precision for every
-//                                   gate).  Live-dial via
-//                                   streamllm_set_score_table.
+// Precision policy: one global KBar dial. Profile mode uses the
+// residual table from STREAMLLM_KBAR_PROFILE_FILE; uniform mode rounds
+// KBar to the same chunk count for every active expert.
 class MoEScheduler : public Scheduler {
 public:
     ~MoEScheduler() override {
-        if (score_thresholds_d_ != nullptr) {
-            cudaFree(score_thresholds_d_);
-            score_thresholds_d_ = nullptr;
-        }
         if (dynamic_R_d_ != nullptr) {
             cudaFree(dynamic_R_d_);
             dynamic_R_d_ = nullptr;
@@ -232,52 +210,6 @@ public:
         for (const auto & name : reader.managed_tensor_names()) {
             managed_names_.insert(name);
         }
-        // No install-time plane pinning: every chunk loads on demand.
-        //
-        // Score-table semantics:
-        //   score_thresholds_ is a length-N ascending vector where N
-        //   = max n_chunks across managed tensors (= the model's
-        //   "full chunk size" — every encoded chunk loaded).
-        //   score_thresholds_[k] is the lower-edge gate score for the
-        //   band that loads (k+1) chunks (planes_served = base_p + k).
-        //   At dispatch the per-expert max gate score selects the
-        //   largest index k where score_thresholds_[k] <= g, yielding
-        //   chunks_loaded = k+1.
-        //
-        //   No explicit chunks array — chunks_loaded for index k is
-        //   defined by position. This matches the demo's HTML
-        //   synthesize() output (cumulative band lower edges).
-        //
-        // Default = all zeros → full precision (gate=0 still selects
-        // the highest k → chunks_loaded = N → full precision).
-
-        auto parse_csv = [](const char * csv,
-                             std::vector<float> & out) {
-            const char * p = csv;
-            while (*p) {
-                char * end = nullptr;
-                float v = std::strtof(p, &end);
-                if (end == p) break;
-                out.push_back(v);
-                p = end;
-                while (*p == ',' || *p == ' ') ++p;
-            }
-        };
-
-        if (const char * csv = getenv("STREAMLLM_MOE_SCORE_THRESHOLDS")) {
-            parse_csv(csv, score_thresholds_);
-            // Validate ascending; reject otherwise.
-            for (size_t k = 1; k < score_thresholds_.size(); ++k) {
-                if (score_thresholds_[k] < score_thresholds_[k - 1]) {
-                    std::fprintf(stderr,
-                        "streamllm-scheduler[moe]: STREAMLLM_MOE_SCORE_THRESHOLDS "
-                        "must be ascending; clearing the table\n");
-                    score_thresholds_.clear();
-                    break;
-                }
-            }
-        }
-
         size_t n_total = 0;
         // DRAM cache cap (host tier). 0 = disabled; the runtime still
         // populates host.chunks[p] on SSD-stream as a side-effect cache,
@@ -414,81 +346,14 @@ public:
             }
         }
 
-        // Now we know max_n_chunks_ across all managed tensors.
-        // Resize the threshold table to that length:
-        //   - if env-supplied table is shorter, pad with the last value
-        //     (or 0 if empty);
-        //   - if longer, truncate.
-        // Default (no env) → all zeros = full precision for every gate.
-        n_score_tiers_ = max_n_chunks_;
-        {
-            std::lock_guard<std::mutex> lk(score_table_mu_);
-            const float pad = score_thresholds_.empty()
-                              ? 0.0f : score_thresholds_.back();
-            score_thresholds_.resize((size_t)max_n_chunks_, pad);
-        }
-
         std::fprintf(stderr,
-            "streamllm-scheduler[moe]: %zu experts | n_tiers=%d",
+            "streamllm-scheduler[moe]: %zu experts | max_chunks=%d",
             n_total, max_n_chunks_);
-        {
-            std::lock_guard<std::mutex> lk(score_table_mu_);
-            std::fprintf(stderr, " | thresholds=[");
-            for (size_t i = 0; i < score_thresholds_.size(); ++i) {
-                std::fprintf(stderr, "%s%.3f",
-                    i == 0 ? "" : ",", score_thresholds_[i]);
-            }
-            std::fprintf(stderr, "]");
-        }
         std::fprintf(stderr,
             " | %zu pinned chunks resident, %zu on-demand chunks available\n",
             total_pinned, total_on_demand);
 
-        // ── Optional: load a static per-(layer, expert) chunk-count
-        // override from a binary file at startup. Format:
-        //   uint32_t n_layers  (LE)
-        //   uint32_t n_experts (LE)
-        //   uint8_t  table[n_layers * n_experts]   row-major (layer-major)
-        // Used by the offline budget-knapsack solver
-        // (experiments/4_layout_solver/) so llama-perplexity (which has
-        // no HTTP) can consume layouts.  No file → no override.
-        if (const char * path = std::getenv("STREAMLLM_STATIC_LAYOUT_FILE")) {
-            std::FILE * f = std::fopen(path, "rb");
-            if (f == nullptr) {
-                std::fprintf(stderr,
-                    "streamllm-scheduler[moe]: STREAMLLM_STATIC_LAYOUT_FILE=%s "
-                    "fopen failed: %s\n", path, std::strerror(errno));
-            } else {
-                uint32_t hdr[2] = {0, 0};
-                if (std::fread(hdr, sizeof(uint32_t), 2, f) != 2) {
-                    std::fprintf(stderr,
-                        "streamllm-scheduler[moe]: layout file too short\n");
-                    std::fclose(f);
-                } else {
-                    const int n_lay = (int) hdr[0];
-                    const int n_exp = (int) hdr[1];
-                    if (n_lay > 0 && n_exp > 0 && n_lay <= 256 && n_exp <= 4096) {
-                        const size_t n = (size_t) n_lay * (size_t) n_exp;
-                        std::vector<uint8_t> tbl(n);
-                        if (std::fread(tbl.data(), 1, n, f) == n) {
-                            this->set_static_layout(tbl, n_lay, n_exp);
-                        } else {
-                            std::fprintf(stderr,
-                                "streamllm-scheduler[moe]: short read on layout "
-                                "(want %zu bytes)\n", n);
-                        }
-                    } else {
-                        std::fprintf(stderr,
-                            "streamllm-scheduler[moe]: bad layout header "
-                            "n_layers=%d n_experts=%d (sanity bound: <= 256, "
-                            "<= 4096)\n", n_lay, n_exp);
-                    }
-                    std::fclose(f);
-                }
-            }
-        }
-
-        // Optional dynamic-dispatch residuals — STREAMLLM_DYNAMIC_RESIDUALS_FILE
+        // Optional profile-backed dispatch residuals.
         // overrides everything when present (mostly for dev / when the
         // GGUF didn't carry residuals).  Binary format:
         //   uint32_t n_layers
@@ -496,11 +361,11 @@ public:
         //   uint32_t K_min
         //   uint32_t K_max
         //   float32  R[n_layers * n_experts * (K_max - K_min + 1)]
-        if (const char * path = std::getenv("STREAMLLM_DYNAMIC_RESIDUALS_FILE")) {
+        if (const char * path = std::getenv("STREAMLLM_KBAR_PROFILE_FILE")) {
             std::FILE * f = std::fopen(path, "rb");
             if (f == nullptr) {
                 std::fprintf(stderr,
-                    "streamllm-scheduler[moe]: STREAMLLM_DYNAMIC_RESIDUALS_FILE=%s "
+                    "streamllm-scheduler[moe]: STREAMLLM_KBAR_PROFILE_FILE=%s "
                     "fopen failed: %s\n", path, std::strerror(errno));
             } else {
                 uint32_t hdr[4] = {0, 0, 0, 0};
@@ -534,27 +399,19 @@ public:
                 }
             }
         }
-        // STREAMLLM_DYNAMIC_TAU initial value (mutable later via the
-        // HTTP /streamllm/dynamic_tau endpoint).
-        if (const char * s = std::getenv("STREAMLLM_DYNAMIC_TAU")) {
-            dynamic_tau_.store((float)std::atof(s),
-                                  std::memory_order_relaxed);
+        if (const char * mode = std::getenv("STREAMLLM_KBAR_ALLOCATOR")) {
+            if (std::strcmp(mode, "uniform") == 0) {
+                kbar_allocator_mode_ = qwen3::KBarAllocatorMode::Uniform;
+            } else {
+                kbar_allocator_mode_ = qwen3::KBarAllocatorMode::Profile;
+            }
         }
-        // STREAMLLM_DYNAMIC_KBAR (ablation): per-dispatch chunk-budget
-        // knob — pins exactly B_local = round(n_active × kbar) chunks
-        // per dispatch via the DP knapsack.  K̄ becomes the dial.
-        if (const char * s = std::getenv("STREAMLLM_DYNAMIC_KBAR")) {
+        // STREAMLLM_KBAR is the single global dial. In profile mode it
+        // is the per-dispatch average chunk budget; in uniform mode it
+        // rounds to a fixed chunk count for every active expert.
+        if (const char * s = std::getenv("STREAMLLM_KBAR")) {
             dynamic_kbar_.store((float)std::atof(s),
                                    std::memory_order_relaxed);
-        }
-        // STREAMLLM_DYNAMIC_EPS (production): per-dispatch error-budget
-        // knob — allocator picks the smallest Σ K[e] such that the
-        // predicted Σ g²·R[K[e]] ≤ ε.  Effective K̄ is observed per
-        // dispatch.  Wins precedence over KBAR when both are set
-        // (PROBLEM.md §8).
-        if (const char * s = std::getenv("STREAMLLM_DYNAMIC_EPS")) {
-            dynamic_eps_.store((float)std::atof(s),
-                                  std::memory_order_relaxed);
         }
 
         // Eagerly build all per-canonical MoeExpertTable instances now,
@@ -650,30 +507,6 @@ public:
                 "pool %.2f GB >= managed %.2f GB (version-keyed graph cache)\n",
                 (double)cap / 1e9, (double)total_managed_bytes / 1e9);
 
-            // Device-side mirror of the score-threshold table — read
-            // by the on-device plan kernel to compute per-expert
-            // chunk counts without a host round-trip.
-            const size_t th_bytes = (size_t)n_score_tiers_ * sizeof(float);
-            cudaError_t err = cudaMalloc(&score_thresholds_d_, th_bytes);
-            if (err != cudaSuccess) {
-                std::fprintf(stderr,
-                    "streamllm-scheduler[moe]: cudaMalloc(score_thresholds_d, "
-                    "%zu B) failed: %s\n",
-                    th_bytes, cudaGetErrorString(err));
-                GGML_ABORT("streamllm-scheduler: capture-mode cudaMalloc failed");
-            }
-            // Seed with the current thresholds + matching version so the
-            // hook+kernel see consistent state on the first cgraph.
-            std::vector<float> snap;
-            uint64_t version;
-            {
-                std::lock_guard<std::mutex> lk(score_table_mu_);
-                snap    = score_thresholds_;
-                version = score_table_version_.load(std::memory_order_relaxed);
-            }
-            cudaMemcpy(score_thresholds_d_, snap.data(),
-                       th_bytes, cudaMemcpyHostToDevice);
-            score_thresholds_d_version_ = version;
             // Device-side mirror of the dynamic-residuals table — used
             // by the K̄-knapsack plan kernel (capture-mode rung 2).
             // Allocated lazily here; the H2D in set_dynamic_residuals
@@ -1090,37 +923,15 @@ public:
                                  const struct ggml_cgraph * cgraph) override {
         if (rt_ == nullptr || cgraph == nullptr) return;
 
-        // Snapshot the score table + its version atomically (under
-        // score_table_mu_) once per cgraph_compute. The thresholds
-        // copy drives kernel grid dims; the version is read by ggml-
-        // cuda's graph-cache predicate (via the
-        // ggml_cuda_set_streamllm_score_version_hook installed in
-        // qwen3_runtime_glue) so a dial swap forces re-capture.
+        // Snapshot KBar + version once per cgraph_compute. The version
+        // is read by ggml-cuda's graph-cache predicate so a dial swap
+        // forces re-capture.
         {
-            std::vector<float> snap;
-            uint64_t           version;
-            {
-                std::lock_guard<std::mutex> lk(score_table_mu_);
-                snap    = score_thresholds_;
-                version = score_table_version_.load(std::memory_order_relaxed);
-            }
-            // Refresh the device-side mirror only when the dial has
-            // actually changed — the H2D is async (stream-ordered, so
-            // capture-safe), but a no-op call per cgraph is still
-            // worth skipping.  Done BEFORE the host-side snap is
-            // stored so a cgraph that sees the new version will also
-            // see the matching device buffer.
-            if (score_thresholds_d_ != nullptr &&
-                version != score_thresholds_d_version_)
-            {
-                cudaMemcpyAsync(score_thresholds_d_, snap.data(),
-                                snap.size() * sizeof(float),
-                                cudaMemcpyHostToDevice,
-                                (cudaStream_t)compute_stream);
-                score_thresholds_d_version_ = version;
-            }
-            rt_->set_replay_score_table(std::move(snap));
-            rt_->set_replay_score_table_version(version);
+            const float snap = dynamic_kbar_.load(std::memory_order_relaxed);
+            const uint64_t version =
+                dial_version_.load(std::memory_order_relaxed);
+            rt_->set_replay_kbar(snap);
+            rt_->set_replay_dial_version(version);
         }
 
         // S8 (Mode A): cgraph audit. STREAMLLM_CGRAPH_AUDIT=1 walks
@@ -1242,97 +1053,13 @@ public:
             kind_name, ev.layer_index);
     }
 
-    // Score-table snapshot.  The dispatch reads this length-N
-    // ascending vector and uses chunks_loaded(g) = (largest k where
-    // threshold[k] <= g) + 1, with chunks_loaded clamped to the
-    // per-tensor n_chunks at the kernel.
-    std::vector<float> score_thresholds_snapshot() const {
-        std::lock_guard<std::mutex> lk(score_table_mu_);
-        return score_thresholds_;
-    }
-    int score_n_tiers() const { return n_score_tiers_; }
-
-    // Replace the live score-threshold table.  The vector must be
-    // ascending and of length ``n_score_tiers_`` (the model-determined
-    // max-n_chunks across managed tensors). Returns false on shape /
-    // ordering / range violations; the in-flight dispatch keeps using
-    // its snapshot so a swap mid-generation never tears.
-    bool set_score_table(const std::vector<float> & th) {
-        if ((int)th.size() != n_score_tiers_) return false;
-        for (size_t k = 1; k < th.size(); ++k) {
-            if (th[k] < th[k - 1]) return false;  // must be ascending
-        }
-        for (float v : th) {
-            if (!(v >= 0.0f && v <= 1.0f)) return false;
-        }
-        std::lock_guard<std::mutex> lk(score_table_mu_);
-        score_thresholds_ = th;
-        // Bump under the same lock so on_graph_compute_begin sees a
-        // consistent (snapshot, version) pair.  The atomic store
-        // gives the version a lock-free read on the cgraph dispatch
-        // path (ggml-cuda's score-version hook).
-        score_table_version_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+    uint64_t dial_version() const {
+        return dial_version_.load(std::memory_order_relaxed);
     }
 
-    uint64_t score_table_version() const {
-        return score_table_version_.load(std::memory_order_relaxed);
-    }
-
-    // Capture-mode accessors. The on-device plan kernel reads the
-    // thresholds buffer; the executor consults allow_capture() to
-    // gate its capture-mode dispatch fast path.
-    const float * score_thresholds_device() const { return score_thresholds_d_; }
     bool          allow_capture()           const { return allow_capture_; }
 
-    // ── Static per-(layer, expert) chunk-count override ─────────────
-    // See moe_scheduler.h for wire format. 0 / unset = no override.
-    bool set_static_layout(const std::vector<uint8_t> & flat_table,
-                            int n_layers, int n_experts) {
-        if (n_layers <= 0 || n_experts <= 0) return false;
-        if ((int)flat_table.size() != n_layers * n_experts) return false;
-        {
-            std::lock_guard<std::mutex> lk(score_table_mu_);
-            static_layout_ = flat_table;
-            static_layout_n_layers_ = n_layers;
-            static_layout_n_experts_ = n_experts;
-            // Bump under the same lock so cgraph cache invalidates.
-            score_table_version_.fetch_add(1, std::memory_order_relaxed);
-        }
-        std::fprintf(stderr,
-            "streamllm-scheduler[moe]: static_layout SET — n_layers=%d n_experts=%d, "
-            "non-zero entries=%zu / %d\n",
-            n_layers, n_experts,
-            (size_t)std::count_if(flat_table.begin(), flat_table.end(),
-                                   [](uint8_t v){ return v != 0; }),
-            n_layers * n_experts);
-        return true;
-    }
-    void clear_static_layout() {
-        std::lock_guard<std::mutex> lk(score_table_mu_);
-        static_layout_.clear();
-        static_layout_n_layers_ = 0;
-        static_layout_n_experts_ = 0;
-        score_table_version_.fetch_add(1, std::memory_order_relaxed);
-    }
-    uint8_t static_layout_for(int layer, int expert) const {
-        // Lock-free read of the flat table. Atomicity hazard: a swap
-        // between set_static_layout's resize and the index read is
-        // possible. We accept it — the consumer just re-runs on the
-        // next cgraph build after cgraph cache invalidation.
-        if (static_layout_n_layers_ == 0) return 0;
-        if (layer < 0 || layer >= static_layout_n_layers_) return 0;
-        if (expert < 0 || expert >= static_layout_n_experts_) return 0;
-        const size_t idx = (size_t) layer * (size_t) static_layout_n_experts_
-                            + (size_t) expert;
-        if (idx >= static_layout_.size()) return 0;
-        return static_layout_[idx];
-    }
-    bool has_static_layout() const {
-        return static_layout_n_layers_ > 0 && !static_layout_.empty();
-    }
-
-    // ── Dynamic per-dispatch K decision (rung 2) ────────────────────
+    // ── Profile-backed per-dispatch K decision ─────────────────────
     // Residual-aware per-dispatch K via the local-FFN-output-L2² gain
     // criterion.  See moe_scheduler.h for the rule + header comment.
     bool set_dynamic_residuals(const std::vector<float> & R_flat,
@@ -1343,7 +1070,7 @@ public:
         if (n_K <= 0) return false;
         if ((int)R_flat.size() != n_layers * n_experts * n_K) return false;
         {
-            std::lock_guard<std::mutex> lk(score_table_mu_);
+            std::lock_guard<std::mutex> lk(dial_mu_);
             dynamic_R_ = R_flat;
             dynamic_n_layers_  = n_layers;
             dynamic_n_experts_ = n_experts;
@@ -1352,19 +1079,17 @@ public:
             // Bump the same version atomic so any captured cgraph
             // invalidates (the dispatch decision encodes into the
             // grid/launch shape).
-            score_table_version_.fetch_add(1, std::memory_order_relaxed);
-            if (allow_capture_) {
-                upload_dynamic_R_to_device_unlocked();
-            }
+            dial_version_.fetch_add(1, std::memory_order_relaxed);
+            upload_dynamic_R_to_device_unlocked();
         }
         std::fprintf(stderr,
             "streamllm-scheduler[moe]: dynamic_residuals SET — n_layers=%d "
-            "n_experts=%d K∈[%d, %d]  (τ=%.6g)\n",
-            n_layers, n_experts, K_min, K_max, dynamic_tau_.load());
+            "n_experts=%d K=[%d, %d]\n",
+            n_layers, n_experts, K_min, K_max);
         return true;
     }
     // Upload the host dynamic_R_ table to the device mirror.  Caller
-    // must hold score_table_mu_.  Re-allocates dynamic_R_d_ when the
+    // must hold dial_mu_.  Re-allocates dynamic_R_d_ when the
     // shape changes (rare — set once at install).
     void upload_dynamic_R_to_device_unlocked() {
         const size_t want = dynamic_R_.size();
@@ -1394,63 +1119,34 @@ public:
     int dynamic_K_min() const { return dynamic_K_min_; }
     int dynamic_K_max() const { return dynamic_K_max_; }
     void clear_dynamic_residuals() {
-        std::lock_guard<std::mutex> lk(score_table_mu_);
+        std::lock_guard<std::mutex> lk(dial_mu_);
         dynamic_R_.clear();
         dynamic_n_layers_  = 0;
         dynamic_n_experts_ = 0;
         dynamic_K_min_     = 0;
         dynamic_K_max_     = 0;
-        score_table_version_.fetch_add(1, std::memory_order_relaxed);
+        dial_version_.fetch_add(1, std::memory_order_relaxed);
     }
     bool has_dynamic_residuals() const {
         return dynamic_n_layers_ > 0 && !dynamic_R_.empty();
     }
-    int dynamic_K_for(int layer, int expert, float gate_score) const {
-        if (dynamic_n_layers_ == 0) return 0;
-        if (layer < 0 || layer >= dynamic_n_layers_) return 0;
-        if (expert < 0 || expert >= dynamic_n_experts_) return 0;
-        const int n_K = dynamic_K_max_ - dynamic_K_min_ + 1;
-        const size_t base = ((size_t) layer * dynamic_n_experts_
-                              + (size_t) expert) * (size_t) n_K;
-        if (base + (size_t) n_K > dynamic_R_.size()) return 0;
-        const float tau = dynamic_tau_.load(std::memory_order_relaxed);
-        const float g2  = gate_score * gate_score;
-        // R is monotone non-increasing in K, so the marginal gain
-        // (R[K-1] − R[K]) is positive; choose the largest K such
-        // that g²·(R[K-1]−R[K]) > τ, else K_min.
-        int K_chosen = dynamic_K_min_;
-        for (int ki = 1; ki < n_K; ++ki) {
-            const float R_prev = dynamic_R_[base + (size_t)(ki - 1)];
-            const float R_here = dynamic_R_[base + (size_t)ki];
-            const float gain   = g2 * (R_prev - R_here);
-            if (gain > tau) {
-                K_chosen = dynamic_K_min_ + ki;
-            }
-        }
-        return K_chosen;
-    }
-    float dynamic_tau() const {
-        return dynamic_tau_.load(std::memory_order_relaxed);
-    }
-    void set_dynamic_tau(float tau) {
-        dynamic_tau_.store(tau, std::memory_order_relaxed);
-        score_table_version_.fetch_add(1, std::memory_order_relaxed);
-    }
     float dynamic_kbar() const {
         return dynamic_kbar_.load(std::memory_order_relaxed);
     }
+    qwen3::KBarAllocatorMode kbar_allocator_mode() const {
+        return kbar_allocator_mode_;
+    }
     void set_dynamic_kbar(float kbar) {
         dynamic_kbar_.store(kbar, std::memory_order_relaxed);
-        score_table_version_.fetch_add(1, std::memory_order_relaxed);
+        dial_version_.fetch_add(1, std::memory_order_relaxed);
     }
-    float dynamic_eps() const {
-        return dynamic_eps_.load(std::memory_order_relaxed);
+    bool set_kbar(float kbar, qwen3::KBarAllocatorMode mode) {
+        if (!(kbar >= 0.0f)) return false;
+        kbar_allocator_mode_ = mode;
+        dynamic_kbar_.store(kbar, std::memory_order_relaxed);
+        dial_version_.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
-    void set_dynamic_eps(float eps) {
-        dynamic_eps_.store(eps, std::memory_order_relaxed);
-        score_table_version_.fetch_add(1, std::memory_order_relaxed);
-    }
-
     // Per-dispatch K̄-budget allocator (PROBLEM.md §5).
     //
     //   n        = experts.size() = number of unique active experts
@@ -1481,16 +1177,8 @@ public:
                                     const std::vector<float> & gates,
                                     std::vector<int>         & K_out) const {
         if (dynamic_n_layers_ == 0) return false;
-        // Mode dispatch (PROBLEM.md §3, §8):
-        //   eps  > 0  → ε-budget (production): pick smallest B s.t.
-        //               dp[n][B] ≤ ε.
-        //   kbar > 0  → K̄-budget (ablation):  pin B = round(n × K̄).
-        //   neither   → allocator inactive; caller falls back.
-        const float eps  = dynamic_eps_ .load(std::memory_order_relaxed);
         const float kbar = dynamic_kbar_.load(std::memory_order_relaxed);
-        const bool use_eps  = eps  > 0.0f;
-        const bool use_kbar = !use_eps && kbar > 0.0f;
-        if (!use_eps && !use_kbar) return false;
+        if (!(kbar > 0.0f)) return false;
         const int n = (int) experts.size();
         if (n == 0) return false;
         if ((int) gates.size() != n) return false;
@@ -1512,20 +1200,13 @@ public:
         const int n_K   = K_max - K_min + 1;
         if (n_K <= 1) return true;
 
-        // In ε-mode we need the full DP table up to n·K_max so we can
-        // find the smallest reachable B; in K̄-mode we only need up to
-        // the target.  Unified upper bound: n·K_max.
         const int Bhi = n * K_max;
         const int B1  = Bhi + 1;
 
-        // K̄-mode target (clamped).
-        int target = 0;
-        if (use_kbar) {
-            long t = (long) std::lrint((double) n * (double) kbar);
-            if (t < (long) n * K_min) t = (long) n * K_min;
-            if (t > (long) n * K_max) t = (long) n * K_max;
-            target = (int) t;
-        }
+        long t = (long) std::lrint((double) n * (double) kbar);
+        if (t < (long) n * K_min) t = (long) n * K_min;
+        if (t > (long) n * K_max) t = (long) n * K_max;
+        const int target = (int) t;
 
         // Pre-compute the cost table  C[i, K] = gᵢ² · R[L, eᵢ, K]
         // for K ∈ [K_min, K_max].  Hot-loop access is contiguous over K.
@@ -1584,18 +1265,7 @@ public:
             dp_prev.swap(dp_cur);
         }
 
-        // Dial dispatch — pick the target B cell.
-        int target_b = -1;
-        if (use_kbar) {
-            target_b = target;
-        } else {  // use_eps
-            // Walk b from n·K_min up; take first b with dp[n][b] ≤ ε.
-            const int b_lo = n * K_min;
-            for (int b = b_lo; b <= Bhi; ++b) {
-                if (dp_prev[b] <= eps) { target_b = b; break; }
-            }
-            if (target_b < 0) target_b = Bhi;   // ε unreachable — full pin
-        }
+        const int target_b = target;
 
         // Backtrack from dp_prev[target_b].
         if (dp_prev[target_b] < INF) {
@@ -1634,11 +1304,9 @@ public:
         if (check_sum != (long) target_b) {
             std::fprintf(stderr,
                 "streamllm-allocator: invariant 1 violated — "
-                "Σ K[e]=%ld, expected target_b=%d "
-                "(mode=%s, K̄=%g ε=%g n=%d)\n",
-                check_sum, target_b,
-                use_eps ? "eps" : "kbar",
-                (double) kbar, (double) eps, n);
+                "sum K[e]=%ld, expected target_b=%d "
+                "(mode=kbar, KBar=%g n=%d)\n",
+                check_sum, target_b, (double) kbar, n);
             GGML_ABORT("streamllm-allocator: budget not enforced");
         }
 
@@ -1681,11 +1349,9 @@ public:
                     err_uniform += gg * (double) dynamic_R_[base + (size_t) idx_u];
             }
             std::fprintf(stderr,
-                "streamllm-alloc L=%d n=%d mode=%s  K̄_eff=%.3f  B=%d  "
+                "streamllm-alloc L=%d n=%d mode=kbar  KBar_eff=%.3f  B=%d  "
                 "err_dp=%.6g  err_uniform(K=%d)=%.6g  ratio=%.3f\n",
-                layer, n,
-                use_eps ? "eps" : "kbar",
-                Kbar_eff, target_b,
+                layer, n, Kbar_eff, target_b,
                 err_dp, K_unif_c, err_uniform,
                 err_uniform > 0 ? err_dp / err_uniform : 0.0);
             std::fprintf(stderr, "  experts↓gate ");
@@ -1721,60 +1387,17 @@ private:
 
     // Score-threshold table.  Length n_score_tiers_ = max n_chunks
     // across managed tensors; score_thresholds_[k] is the lower-edge
-    // gate score for the band where chunks_loaded = k+1.  Lookup:
-    // largest k where threshold[k] <= g → chunks_loaded = k+1
-    // (planes_served = base_p + k).
-    //
-    // Mutable across requests: set_score_table() swaps under
-    // score_table_mu_.  Hot-path readers take a snapshot via
-    // score_thresholds_snapshot() and iterate locally so a swap
-    // mid-generation never tears.
-    mutable std::mutex    score_table_mu_;
-    std::vector<float>    score_thresholds_;
-    int                   n_score_tiers_ = 0;
-    // Monotonic counter bumped under score_table_mu_ on every
-    // successful set_score_table() call. Reading is lock-free via
-    // atomic — the ggml-cuda graph-cache predicate (registered
-    // through ggml_cuda_set_streamllm_score_version_hook) consults
-    // this once per cgraph_compute to force re-capture across dial
-    // swaps (HTTP score_table swap, phase-aware reasoning→generation
-    // transition).
-    std::atomic<uint64_t> score_table_version_{0};
+    mutable std::mutex    dial_mu_;
+    std::atomic<uint64_t> dial_version_{0};
 
-    // Static per-(layer, expert) chunk-count override. Loaded via
-    // /streamllm/static_layout. Length = n_layers * n_experts, row-major
-    // (layer-major). 0 = no override; > 0 = use this many chunks for the
-    // expert. Protected by score_table_mu_ on writes; reads use a
-    // best-effort lock-free path (see static_layout_for()) since a stale
-    // read just produces an obsolete kernel-input that the cgraph cache
-    // will invalidate on the next compute step.
-    std::vector<uint8_t> static_layout_;
-    int                  static_layout_n_layers_ = 0;
-    int                  static_layout_n_experts_ = 0;
-
-    // ── Dynamic per-dispatch residuals (rung 2) ─────────────────────
-    // ``streamllm.expert_residuals.R``-style flat array stored in
-    // layer-major order, length n_layers · n_experts · n_K where
-    // n_K = K_max − K_min + 1.  Read at install time from the GGUF
-    // (or via STREAMLLM_DYNAMIC_RESIDUALS_FILE during dev).  τ is
-    // mutable at runtime via HTTP / env var.
+    // Profile residuals loaded from STREAMLLM_KBAR_PROFILE_FILE.
     std::vector<float>   dynamic_R_;
     int                  dynamic_n_layers_  = 0;
     int                  dynamic_n_experts_ = 0;
     int                  dynamic_K_min_     = 0;
     int                  dynamic_K_max_     = 0;
-    std::atomic<float>   dynamic_tau_{0.0f};
-    // K̄ knob (STREAMLLM_DYNAMIC_KBAR, ablation): when set the
-    // per-dispatch allocator pins exactly
-    //   B_local = round(n_active_experts × kbar)
-    // chunks, distributed by DP on Σ g²·R[K[e]].
     std::atomic<float>   dynamic_kbar_{0.0f};
-    // ε knob (STREAMLLM_DYNAMIC_EPS, production): when set the
-    // allocator picks the smallest B such that
-    //   min_K  Σ g[e]² · R[L, e, K[e]]  ≤  ε
-    // Effective K̄ is observed (= B / n_active).  Wins precedence
-    // over KBAR when both are non-zero.
-    std::atomic<float>   dynamic_eps_{0.0f};
+    qwen3::KBarAllocatorMode    kbar_allocator_mode_{qwen3::KBarAllocatorMode::Profile};
 
     // STREAMLLM_ALLOW_CAPTURE=1: opt-in to CUDA-graph capture for the
     // managed cgraph. Only legal when the operator has set
@@ -1782,18 +1405,7 @@ private:
     // The fully-pinned check at the end of on_install aborts loudly
     // when the assumption is broken.
     bool allow_capture_ = false;
-    // Device-side mirror of score_thresholds_. Used by the on-device
-    // plan kernel (capture mode) to compute per-expert chunk counts
-    // without a host round-trip. Allocated at on_install when
-    // allow_capture_ is set; refreshed in on_graph_compute_begin via
-    // async H2D when score_table_version_ differs from the value last
-    // pushed.  nullptr in non-capture mode.
-    float *               score_thresholds_d_ = nullptr;
-    uint64_t              score_thresholds_d_version_ = 0;
-    // Device mirror of dynamic_R_ for the capture-mode K̄-knapsack plan.
-    // Allocated when allow_capture_ is set AND residuals are loaded;
-    // refreshed on every set_dynamic_residuals() call.  nullptr when
-    // either capture is off or residuals haven't been installed.
+    // Device mirror of dynamic_R_ for KBar planners.
     float *               dynamic_R_d_ = nullptr;
     size_t                dynamic_R_d_count_ = 0;
 
@@ -2019,49 +1631,24 @@ void scheduler_after_compute(
 // qwen3_graph_instrumenter prewalk; sentinel naming carries the
 // per-layer index directly.
 
-std::vector<float> scheduler_score_thresholds_snapshot(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).score_thresholds_snapshot();
+float scheduler_kbar(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dynamic_kbar();
 }
 
-int scheduler_score_n_tiers(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).score_n_tiers();
+KBarAllocatorMode scheduler_kbar_allocator_mode(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).kbar_allocator_mode();
 }
 
-bool scheduler_set_score_table(
-    Scheduler &                sched,
-    const std::vector<float> & thresholds)
-{
-    return as_moe(sched).set_score_table(thresholds);
+bool scheduler_set_kbar(Scheduler & sched, float kbar, KBarAllocatorMode mode) {
+    return as_moe(sched).set_kbar(kbar, mode);
 }
 
-uint64_t scheduler_score_table_version(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).score_table_version();
-}
-
-const float * scheduler_score_thresholds_device(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).score_thresholds_device();
+uint64_t scheduler_dial_version(const Scheduler & sched) {
+    return static_cast<const MoEScheduler &>(sched).dial_version();
 }
 
 bool scheduler_allow_capture(const Scheduler & sched) {
     return static_cast<const MoEScheduler &>(sched).allow_capture();
-}
-
-bool scheduler_set_static_layout(
-    Scheduler &                  sched,
-    const std::vector<uint8_t> & flat_table,
-    int                          n_layers,
-    int                          n_experts)
-{
-    return as_moe(sched).set_static_layout(flat_table, n_layers, n_experts);
-}
-void scheduler_clear_static_layout(Scheduler & sched) {
-    as_moe(sched).clear_static_layout();
-}
-uint8_t scheduler_static_layout_for(const Scheduler & sched, int layer, int expert) {
-    return static_cast<const MoEScheduler &>(sched).static_layout_for(layer, expert);
-}
-bool scheduler_has_static_layout(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).has_static_layout();
 }
 
 // ─── Dynamic per-dispatch residuals (rung 2) ───────────────────────
@@ -2081,38 +1668,6 @@ void scheduler_clear_dynamic_residuals(Scheduler & sched) {
 }
 bool scheduler_has_dynamic_residuals(const Scheduler & sched) {
     return static_cast<const MoEScheduler &>(sched).has_dynamic_residuals();
-}
-int scheduler_dynamic_K_for(const Scheduler & sched,
-                              int layer, int expert,
-                              float gate_score, float tau) {
-    // ``tau`` is a per-call override of the scheduler's stored tau —
-    // useful for the http endpoint to swap in a value without
-    // invalidating the captured cgraph.  Most call sites pass NaN
-    // (or 0) and want the stored value; that's the dynamic_K_for
-    // overload below.  Today we always honour ``tau`` and ignore the
-    // stored value, since the matmul_comp callsite reads tau from
-    // the scheduler at plan time anyway.
-    (void) tau;
-    return static_cast<const MoEScheduler &>(sched)
-        .dynamic_K_for(layer, expert, gate_score);
-}
-float scheduler_dynamic_tau(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).dynamic_tau();
-}
-void scheduler_set_dynamic_tau(Scheduler & sched, float tau) {
-    as_moe(sched).set_dynamic_tau(tau);
-}
-float scheduler_dynamic_kbar(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).dynamic_kbar();
-}
-void scheduler_set_dynamic_kbar(Scheduler & sched, float kbar) {
-    as_moe(sched).set_dynamic_kbar(kbar);
-}
-float scheduler_dynamic_eps(const Scheduler & sched) {
-    return static_cast<const MoEScheduler &>(sched).dynamic_eps();
-}
-void scheduler_set_dynamic_eps(Scheduler & sched, float eps) {
-    as_moe(sched).set_dynamic_eps(eps);
 }
 bool scheduler_allocate_dispatch_budget(const Scheduler &        sched,
                                           int                      layer,

@@ -288,7 +288,9 @@ UpstreamLayoutHost build_upstream_layout_host(
     }
 
     if ((flags & kFlagAnyPrec) != 0) {
-        return build_upstream_layout_anyprec(layout, tensor_data, group_size, flags);
+        throw std::runtime_error(
+            "build_upstream_layout_host: old any-precision AnyBCQ streams "
+            "are no longer supported; re-encode as ss_anybcq");
     }
     return ss_anybcq::build_upstream_layout_ss_anybcq(
         layout, tensor_data, group_size, flags);

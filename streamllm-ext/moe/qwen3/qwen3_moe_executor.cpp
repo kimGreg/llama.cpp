@@ -55,15 +55,12 @@ void register_qwen3_moe_executor() {
     auto factory = []() -> std::unique_ptr<ModelExecutor> {
         return std::unique_ptr<ModelExecutor>(new Qwen3MoEExecutor());
     };
-    register_executor("qwen3_anybcq_v1",     factory);
-    register_executor("qwen3_moe_anybcq_v1", factory);   // legacy alias
-    register_executor("qwen35_anybcq_v1",    factory);
-    register_executor("qwen36_anybcq_v1",    factory);
+    register_executor("qwen3_ss_anybcq_v1", factory);
 
     auto baseline_factory = []() -> std::unique_ptr<ModelExecutor> {
         return std::unique_ptr<ModelExecutor>(new Qwen3BaselineExecutor());
     };
-    register_executor("qwen3_baseline_v1", baseline_factory);
+    register_executor("qwen3_direct_stock_v1", baseline_factory);
 }
 
 Qwen3BaselineExecutor::~Qwen3BaselineExecutor() {
@@ -91,7 +88,7 @@ bool Qwen3BaselineExecutor::forward_moe_layer(
     ggml_tensor *,
     int) {
     std::fprintf(stderr,
-        "qwen3_baseline_v1: sentinel forward_moe_layer is not used; "
+        "qwen3_direct_stock_v1: sentinel forward_moe_layer is not used; "
         "the baseline executor requires the stock MoE graph\n");
     return false;
 }

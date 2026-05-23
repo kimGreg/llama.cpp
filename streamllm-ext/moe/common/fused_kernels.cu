@@ -912,4 +912,224 @@ void launch_plan_per_expert_kbar(
         planes_per_eid_d);
 }
 
+namespace {
+__global__ void k_plan_per_expert_uniform(
+    const int32_t * __restrict__ ids,
+    int n_tokens,
+    int n_used,
+    int n_expert,
+    int uniform_k,
+    int n_chunks_max,
+    int base_p,
+    int any_precision,
+    int * __restrict__ planes_per_eid)
+{
+    const int e = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (e >= n_expert) return;
+    int active = 0;
+    const int total = n_tokens * n_used;
+    for (int i = 0; i < total; ++i) {
+        if (ids[i] == e) { active = 1; break; }
+    }
+    int chunks = active ? uniform_k : n_chunks_max;
+    if (chunks < 1) chunks = 1;
+    if (chunks > n_chunks_max) chunks = n_chunks_max;
+    int planes = any_precision ? (base_p + chunks - 1) : chunks;
+    if (planes < 1) planes = 1;
+    planes_per_eid[e] = planes;
+}
+} // anon
+
+void launch_plan_per_expert_uniform(
+    const int32_t * ids_d,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             uniform_k,
+    int             n_chunks_max,
+    int             base_p,
+    bool            any_precision,
+    int *           planes_per_eid_d,
+    StreamHandle    stream)
+{
+    if (ids_d == nullptr || planes_per_eid_d == nullptr) return;
+    if (n_tokens <= 0 || n_used <= 0 || n_expert <= 0) return;
+    const int block = 128;
+    const int grid = (n_expert + block - 1) / block;
+    k_plan_per_expert_uniform<<<grid, block, 0, (cudaStream_t) stream>>>(
+        ids_d, n_tokens, n_used, n_expert, uniform_k, n_chunks_max,
+        base_p, any_precision ? 1 : 0, planes_per_eid_d);
+}
+
+__device__ __forceinline__ int32_t load_i32_strided(
+    const int32_t * base, size_t row_stride, int t, int u)
+{
+    const char * row = (const char *) base + (size_t) t * row_stride;
+    return ((const int32_t *) row)[u];
+}
+
+__device__ __forceinline__ float load_f32_strided(
+    const float * base, size_t row_stride, int t, int u)
+{
+    const char * row = (const char *) base + (size_t) t * row_stride;
+    return ((const float *) row)[u];
+}
+
+__global__ void k_plan_chunks_kbar_exact_strided(
+    const int32_t * __restrict__ ids,
+    size_t ids_row_stride,
+    const float * __restrict__ weights,
+    size_t weights_row_stride,
+    const float * __restrict__ probs,
+    size_t probs_row_stride,
+    const float * __restrict__ R,       // [n_expert × n_K] slice for this layer
+    int n_tokens,
+    int n_used,
+    int n_expert,
+    int n_K,
+    int K_min,
+    int K_max,
+    float kbar,
+    int n_chunks_max,
+    int * __restrict__ chunks_per_eid,
+    float * __restrict__ dp_prev,
+    float * __restrict__ dp_cur,
+    uint8_t * __restrict__ trace)
+{
+    __shared__ float s_max_g[K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_active[K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_eids[K_KBAR_N_EXPERT_MAX];
+
+    const int tid = (int) threadIdx.x;
+    for (int e = tid; e < n_expert; e += (int) blockDim.x) {
+        s_max_g[e] = 0.0f;
+        s_active[e] = 0;
+        chunks_per_eid[e] = 0;
+    }
+    __syncthreads();
+
+    const int total = n_tokens * n_used;
+    for (int idx = tid; idx < total; idx += (int) blockDim.x) {
+        const int t = idx / n_used;
+        const int u = idx - t * n_used;
+        const int e = (int) load_i32_strided(ids, ids_row_stride, t, u);
+        if (e < 0 || e >= n_expert) continue;
+        s_active[e] = 1;
+
+        float g;
+        if (weights != nullptr) {
+            g = load_f32_strided(weights, weights_row_stride, t, u);
+        } else if (probs != nullptr) {
+            g = load_f32_strided(probs, probs_row_stride, t, e);
+        } else {
+            g = 0.45f - 0.05f * (float) u;
+            if (g < 0.05f) g = 0.05f;
+        }
+        if (g < 0.0f) g = 0.0f;
+        atomicMax((unsigned int *) &s_max_g[e], __float_as_uint(g));
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int n_active = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            if (s_active[e]) s_eids[n_active++] = e;
+        }
+        if (n_active > 0) {
+            int target = (int) lrintf((float) n_active * kbar);
+            const int B_lo = n_active * K_min;
+            const int B_hi = n_active * K_max;
+            if (target < B_lo) target = B_lo;
+            if (target > B_hi) target = B_hi;
+
+            const float INF = 1.0e30f;
+            for (int b = 0; b <= target; ++b) {
+                dp_prev[b] = INF;
+                dp_cur[b] = INF;
+            }
+            dp_prev[0] = 0.0f;
+
+            float * prev = dp_prev;
+            float * cur  = dp_cur;
+            const int B1 = n_expert * K_max + 1;
+            for (int i = 0; i < n_active; ++i) {
+                for (int b = 0; b <= target; ++b) cur[b] = INF;
+                const int e = s_eids[i];
+                const float g2 = s_max_g[e] * s_max_g[e];
+                for (int prev_b = 0; prev_b <= target; ++prev_b) {
+                    const float base = prev[prev_b];
+                    if (base >= INF * 0.5f) continue;
+                    for (int K = K_min; K <= K_max; ++K) {
+                        const int nb = prev_b + K;
+                        if (nb > target) break;
+                        const float cost =
+                            base + g2 * R[e * n_K + (K - K_min)];
+                        if (cost < cur[nb]) {
+                            cur[nb] = cost;
+                            trace[(size_t) i * (size_t) B1 + (size_t) nb] =
+                                (uint8_t) K;
+                        }
+                    }
+                }
+                float * tmp = prev;
+                prev = cur;
+                cur = tmp;
+            }
+
+            int b = target;
+            for (int i = n_active - 1; i >= 0; --i) {
+                const int e = s_eids[i];
+                const int B1 = n_expert * K_max + 1;
+                int K = (int) trace[(size_t) i * (size_t) B1 + (size_t) b];
+                if (K < K_min || K > K_max) K = K_min;
+                if (K > n_chunks_max) K = n_chunks_max;
+                chunks_per_eid[e] = K;
+                b -= K;
+                if (b < 0) b = 0;
+            }
+        }
+    }
+}
+
+void launch_plan_chunks_kbar_exact_strided(
+    const int32_t * ids_d,
+    size_t          ids_row_stride,
+    const float *   weights_d,
+    size_t          weights_row_stride,
+    const float *   probs_d,
+    size_t          probs_row_stride,
+    const float *   R_d,
+    int             K_min,
+    int             K_max,
+    int             layer_index,
+    float           kbar,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             n_chunks_max,
+    int *           chunks_per_eid_d,
+    float *         dp_prev_d,
+    float *         dp_cur_d,
+    uint8_t *       trace_d,
+    StreamHandle    stream)
+{
+    if (ids_d == nullptr || R_d == nullptr || chunks_per_eid_d == nullptr) return;
+    if (dp_prev_d == nullptr || dp_cur_d == nullptr || trace_d == nullptr) return;
+    if (n_tokens <= 0 || n_used <= 0 || n_expert <= 0) return;
+    if (n_expert > K_KBAR_N_EXPERT_MAX) return;
+    if (K_min < 0 || K_max < K_min) return;
+    if (!(kbar > 0.0f)) return;
+    const int n_K = K_max - K_min + 1;
+    if (n_K <= 0 || n_K > K_KBAR_N_K_MAX) return;
+    const float * R_layer = R_d + (size_t) layer_index * n_expert * n_K;
+    k_plan_chunks_kbar_exact_strided<<<1, 256, 0, (cudaStream_t) stream>>>(
+        ids_d, ids_row_stride,
+        weights_d, weights_row_stride,
+        probs_d, probs_row_stride,
+        R_layer,
+        n_tokens, n_used, n_expert, n_K,
+        K_min, K_max, kbar, n_chunks_max,
+        chunks_per_eid_d, dp_prev_d, dp_cur_d, trace_d);
+}
+
 }}  // namespace streamllm_ext::qwen3

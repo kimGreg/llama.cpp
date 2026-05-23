@@ -31,7 +31,7 @@ public:
     virtual ~ModelExecutor() = default;
 
     // Registry name.  Must match the GGUF's ``streamllm.executor``
-    // key.  Versioned (e.g. ``"qwen3_moe_anybcq_v1"``) so the executor
+    // key.  Versioned (e.g. ``"qwen3_ss_anybcq_v1"``) so the executor
     // and encoder can evolve in lockstep.
     virtual const char * name() const = 0;
 

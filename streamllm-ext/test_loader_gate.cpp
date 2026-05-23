@@ -16,7 +16,7 @@
 //       sanity check — see StreamReader::from_gguf below — rather than
 //       a full install.
 //
-//   (B) required_runtime=true + executor="qwen3_moe_anybcq_v1"
+//   (B) required_runtime=true + executor="qwen3_ss_anybcq_v1"
 //       (a registered name) → install_for_gguf reaches the
 //       executor-registry lookup and DOES NOT throw on the gate.
 //       Then it proceeds to actual pool install; we stop short by
@@ -36,7 +36,7 @@
 
 #include "core/stream_reader.h"
 #include "core/executor.h"
-#include "qwen3/executor.h"
+#include "moe/qwen3/qwen3_moe_executor.h"
 
 #include <ggml.h>
 #include <gguf.h>
@@ -146,9 +146,9 @@ void verify_registry_gate(
     const streamllm_ext::GlobalMeta &  g,
     bool                               expect_throws)
 {
-    streamllm_ext::qwen3::register_qwen3_moe_anybcq_executor();
+    streamllm_ext::qwen3::register_qwen3_moe_executor();
     const std::string name =
-        g.executor.empty() ? std::string("qwen3_moe_anybcq_v1") : g.executor;
+        g.executor.empty() ? std::string("qwen3_ss_anybcq_v1") : g.executor;
     auto exec = streamllm_ext::make_executor(name.c_str());
 
     bool would_throw = false;
@@ -207,13 +207,13 @@ int main() {
     {
         std::string p = write_test_gguf("B_required_ok",
             /*required_runtime=*/true,
-            /*executor_name=*/  "qwen3_moe_anybcq_v1");
+            /*executor_name=*/  "qwen3_ss_anybcq_v1");
         verify_parse("B_required_ok", p,
             /*expect_required_runtime=*/true,
-            /*expect_executor=*/        std::string("qwen3_moe_anybcq_v1"));
+            /*expect_executor=*/        std::string("qwen3_ss_anybcq_v1"));
         streamllm_ext::GlobalMeta g{};
         g.required_runtime = true;
-        g.executor         = "qwen3_moe_anybcq_v1";
+        g.executor         = "qwen3_ss_anybcq_v1";
         verify_registry_gate("B_required_ok", g, /*expect_throws=*/false);
         fs::remove(p);
     }

@@ -961,29 +961,26 @@ void StreamllmRuntime::io_worker_loop_() {
 }
 
 // ---------------------------------------------------------------------------
-// Replay-scoped state — score-table snapshot + chunk reservations cleared
+// Replay-scoped state — KBar snapshot + chunk reservations cleared
 // at the end of each graph_compute pass.
 // ---------------------------------------------------------------------------
 
-void StreamllmRuntime::set_replay_score_table(std::vector<float> snap) {
-    std::lock_guard<std::mutex> lk(replay_score_table_mu_);
-    replay_score_table_ = std::move(snap);
+void StreamllmRuntime::set_replay_kbar(float kbar) {
+    std::lock_guard<std::mutex> lk(replay_dial_mu_);
+    replay_kbar_ = kbar;
 }
 
-const std::vector<float> & StreamllmRuntime::current_replay_score_table() const {
-    // Returning a reference under a mutex is unusual; the contract is
-    // "read once per dispatch", and all writes happen from
-    // graph_compute_begin which is sequenced before any dispatch in
-    // this compute pass. The mutex is belt-and-braces.
-    return replay_score_table_;
+float StreamllmRuntime::current_replay_kbar() const {
+    std::lock_guard<std::mutex> lk(replay_dial_mu_);
+    return replay_kbar_;
 }
 
-void StreamllmRuntime::set_replay_score_table_version(uint64_t v) {
-    replay_score_table_version_.store(v, std::memory_order_release);
+void StreamllmRuntime::set_replay_dial_version(uint64_t v) {
+    replay_dial_version_.store(v, std::memory_order_release);
 }
 
-uint64_t StreamllmRuntime::replay_score_table_version() const {
-    return replay_score_table_version_.load(std::memory_order_acquire);
+uint64_t StreamllmRuntime::replay_dial_version() const {
+    return replay_dial_version_.load(std::memory_order_acquire);
 }
 
 } // namespace streamllm_ext

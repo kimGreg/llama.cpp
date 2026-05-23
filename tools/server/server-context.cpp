@@ -23,35 +23,19 @@
 #include <utility>
 #include <vector>
 
-// streamllm-ext live precision dial — forward decls so server-context
+// streamllm-ext live KBar dial — forward decls so server-context
 // doesn't take a hard include dependency on the streamllm-ext tree.
 // The symbols are linked in via the static lib when STREAMLLM_EXT is
 // enabled at build time.
-extern "C" bool streamllm_set_score_table(
-    const float * thresholds, int n_thresh);
-namespace streamllm_ext {
-bool streamllm_get_score_table(
-    std::vector<float> & out_thresholds);
-} // namespace streamllm_ext
-using streamllm_ext::streamllm_get_score_table;
+extern "C" bool streamllm_set_kbar(float kbar, int allocator_mode);
+extern "C" bool streamllm_get_kbar(float * out_kbar, int * out_allocator_mode);
 
-// streamllm-ext gradual-schedule API. The /streamllm/schedule POST
-// route writes via streamllm_schedule_set; sampling.cpp reads on each
-// common_sampler_init.
-extern "C" bool streamllm_schedule_set(
+extern "C" bool streamllm_kbar_schedule_set(
     const int * thresholds, int n_thresh,
-    const float * dials_flat, const int * dial_lens, int n_dials);
+    const float * kbars, int n_kbars,
+    int allocator_mode);
 extern "C" void streamllm_schedule_clear(void);
 extern "C" bool streamllm_schedule_active(void);
-
-// streamllm-ext static-layout API. /streamllm/static_layout POST
-// accepts a flat (n_layers * n_experts) uint8 array; entries override
-// the per-(layer, expert) chunk count, falling back to the threshold
-// path on 0/unset entries.  See experiments/4_layout_solver/.
-extern "C" bool streamllm_set_static_layout(
-    const unsigned char * flat_table, int n_layers, int n_experts);
-extern "C" void streamllm_clear_static_layout(void);
-extern "C" int  streamllm_has_static_layout(void);
 
 // /streamllm/stats accessors. Each is a single atomic read from the
 // streamllm-ext runtime; safe to call at high frequency.
@@ -4180,180 +4164,55 @@ void server_routes::init_routes() {
         return res;
     };
 
-    // streamllm-ext: live precision dial. POST a JSON body
-    //   {"thresholds": [0.4, 0.3, 0.1, 0.05]}
-    // to swap the active score table. Safe to call mid-generation —
-    // the in-flight forward pass keeps using the snapshot it took
-    // at graph-compute-begin; the next decode picks up the new
-    // table.
-    //
-    // Policy-only contract (Mode A M1): this route may only update
-    // the score/dial table. It must NOT trigger loads, evictions,
-    // residency changes, execution-path selection, or any legacy
-    // fallback. When no StreamLLM runtime is active the route
-    // returns 404 (rather than failing silently or accepting a
-    // policy that nothing reads).
-    this->post_streamllm_score_table = [this](const server_http_req & req) {
+    this->post_streamllm_kbar = [this](const server_http_req & req) {
         auto res = create_response(true);  // bypass-sleep: no model needed
         bool ctx_server; GGML_UNUSED(ctx_server);
-        // Q4 gate: no runtime → 404 with a clear disabled message.
-        // ERROR_TYPE_NOT_FOUND maps to HTTP 404 in format_error_response.
-        {
-            std::vector<float> probe;
-            if (!streamllm_get_score_table(probe)) {
-                res->error(format_error_response(
-                    "streamllm runtime not active — no model with "
-                    "required_runtime=true is loaded. The score-dial "
-                    "route is policy-only and requires an active "
-                    "StreamLLM runtime.",
-                    ERROR_TYPE_NOT_FOUND));
-                return res;
-            }
-        }
         const json body = json::parse(req.body);
         if (!body.is_object() ||
-            !body.contains("thresholds") || !body["thresholds"].is_array()) {
+            !body.contains("kbar") || !body["kbar"].is_number()) {
             res->error(format_error_response(
-                "body must be an object with array field 'thresholds' "
-                "(ascending floats; length = model's full chunk count)",
+                "body must be {\"kbar\": number, \"allocator\": \"profile|uniform\"}",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        std::vector<float> th;
-        for (const auto & v : body["thresholds"]) th.push_back(v.get<float>());
-        if (!streamllm_set_score_table(th.data(), (int)th.size())) {
+        const std::string allocator =
+            body.value("allocator", std::string("profile"));
+        const int allocator_mode = allocator == "uniform" ? 1 : 0;
+        const float kbar = body["kbar"].get<float>();
+        if (!streamllm_set_kbar(kbar, allocator_mode)) {
             res->error(format_error_response(
-                "streamllm: set_score_table rejected the table "
-                "(check length matches the model's n_chunks, thresholds "
-                "ascending, values in [0, 1])",
+                "streamllm runtime not active or KBar was rejected",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         res->ok({
-            {"thresholds", th},
-            {"status",     "applied"},
+            {"kbar", kbar},
+            {"allocator", allocator_mode == 1 ? "uniform" : "profile"},
+            {"status", "applied"},
         });
         return res;
     };
 
-    this->get_streamllm_score_table = [this](const server_http_req &) {
+    this->get_streamllm_kbar = [this](const server_http_req &) {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
-        std::vector<float> th;
-        // Q4 gate: no runtime → 404 with a clear disabled message.
-        if (!streamllm_get_score_table(th)) {
+        float kbar = 0.0f;
+        int allocator_mode = 0;
+        if (!streamllm_get_kbar(&kbar, &allocator_mode)) {
             res->error(format_error_response(
                 "streamllm runtime not active — no model with "
                 "required_runtime=true is loaded.",
                 ERROR_TYPE_NOT_FOUND));
             return res;
         }
-        res->ok({{"thresholds", th}});
-        return res;
-    };
-
-    // streamllm-ext: static per-(layer, expert) chunk-count layout
-    // override. Used by the offline budget-knapsack solver
-    // (experiments/4_layout_solver/). POST body forms:
-    //   {"clear": true}                                  → clear override
-    //   {"n_layers":48, "n_experts":128, "table":[ints]} → set override
-    // The table is a flat length-(n_layers * n_experts) uint8 array,
-    // row-major (layer-major).  Entries 0 = no override (fall back to
-    // threshold path); > 0 = use that many chunks for that expert.
-    this->post_streamllm_static_layout = [this](const server_http_req & req) {
-        auto res = create_response(true);
-        // Probe runtime: no streamllm runtime → 404 with the same
-        // contract as /streamllm/score_table.
-        {
-            std::vector<float> probe;
-            if (!streamllm_get_score_table(probe)) {
-                res->error(format_error_response(
-                    "streamllm runtime not active — no model with "
-                    "required_runtime=true is loaded.",
-                    ERROR_TYPE_NOT_FOUND));
-                return res;
-            }
-        }
-        const json body = json::parse(req.body);
-        if (body.is_object() && body.value("clear", false)) {
-            streamllm_clear_static_layout();
-            res->ok({{"status", "cleared"}});
-            return res;
-        }
-        if (!body.is_object()
-            || !body.contains("n_layers") || !body["n_layers"].is_number_integer()
-            || !body.contains("n_experts") || !body["n_experts"].is_number_integer()
-            || !body.contains("table") || !body["table"].is_array())
-        {
-            res->error(format_error_response(
-                "body must be either {\"clear\":true} or "
-                "{\"n_layers\": int, \"n_experts\": int, "
-                "\"table\": [n_layers*n_experts uint8 entries, row-major]}",
-                ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
-        const int n_layers  = body["n_layers"].get<int>();
-        const int n_experts = body["n_experts"].get<int>();
-        const auto & arr = body["table"];
-        if ((int) arr.size() != n_layers * n_experts) {
-            res->error(format_error_response(
-                "table length must equal n_layers * n_experts",
-                ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
-        std::vector<unsigned char> flat;
-        flat.reserve((size_t) n_layers * (size_t) n_experts);
-        for (const auto & v : arr) {
-            const int x = v.get<int>();
-            if (x < 0 || x > 255) {
-                res->error(format_error_response(
-                    "table entries must be uint8 in [0, 255]",
-                    ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            flat.push_back((unsigned char) x);
-        }
-        if (!streamllm_set_static_layout(flat.data(), n_layers, n_experts)) {
-            res->error(format_error_response(
-                "streamllm: set_static_layout rejected the table "
-                "(check n_layers > 0, n_experts > 0, length matches)",
-                ERROR_TYPE_INVALID_REQUEST));
-            return res;
-        }
         res->ok({
-            {"n_layers", n_layers},
-            {"n_experts", n_experts},
-            {"status",   "applied"},
+            {"kbar", kbar},
+            {"allocator", allocator_mode == 1 ? "uniform" : "profile"},
         });
         return res;
     };
 
-    this->get_streamllm_static_layout = [this](const server_http_req &) {
-        auto res = create_response(true);
-        {
-            std::vector<float> probe;
-            if (!streamllm_get_score_table(probe)) {
-                res->error(format_error_response(
-                    "streamllm runtime not active.",
-                    ERROR_TYPE_NOT_FOUND));
-                return res;
-            }
-        }
-        const bool loaded = streamllm_has_static_layout() != 0;
-        res->ok({{"loaded", loaded}});
-        return res;
-    };
-
-    // streamllm-ext gradual-schedule API (Pareto-orchestrator path).
-    // Two POST shapes:
-    //   {"clear": true}                  → streamllm_schedule_clear
-    //   {"thresholds":[...], "dials":[[...]]} → streamllm_schedule_set
-    // |dials| must equal |thresholds|+1; thresholds must be strictly
-    // ascending non-negative ints; each dial is a list of floats in
-    // [0, 1]. Returns 400 on shape/order violations.  Sampler init
-    // reads the runtime state on each new request, so a swap here is
-    // visible to the next /v1/chat/completions call.
-    this->post_streamllm_schedule = [this](const server_http_req & req) {
+    this->post_streamllm_kbar_schedule = [this](const server_http_req & req) {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
         const json body = json::parse(req.body);
@@ -4364,42 +4223,36 @@ void server_routes::init_routes() {
         }
         if (!body.is_object() ||
             !body.contains("thresholds") || !body["thresholds"].is_array() ||
-            !body.contains("dials")      || !body["dials"].is_array())
+            !body.contains("kbars")      || !body["kbars"].is_array())
         {
             res->error(format_error_response(
-                "body must be {\"thresholds\":[ints],\"dials\":[[floats],...]} "
-                "with |dials|=|thresholds|+1 (or {\"clear\":true})",
+                "body must be {\"thresholds\":[ints],\"kbars\":[floats],"
+                "\"allocator\":\"profile|uniform\"} with |kbars|=|thresholds|+1 "
+                "(or {\"clear\":true})",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         std::vector<int>   thr;
-        std::vector<float> flat;
-        std::vector<int>   lens;
+        std::vector<float> kbars;
         for (const auto & v : body["thresholds"]) thr.push_back(v.get<int>());
-        for (const auto & dial : body["dials"]) {
-            if (!dial.is_array()) {
-                res->error(format_error_response(
-                    "each entry of 'dials' must be an array of floats",
-                    ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            int n = 0;
-            for (const auto & v : dial) { flat.push_back(v.get<float>()); ++n; }
-            lens.push_back(n);
-        }
-        if (!streamllm_schedule_set(
-                thr.data(), (int) thr.size(),
-                flat.data(), lens.data(), (int) lens.size()))
+        for (const auto & v : body["kbars"]) kbars.push_back(v.get<float>());
+        const std::string allocator =
+            body.value("allocator", std::string("profile"));
+        const int allocator_mode = allocator == "uniform" ? 1 : 0;
+        if (!streamllm_kbar_schedule_set(
+                thr.data(), (int) thr.size(), kbars.data(), (int) kbars.size(),
+                allocator_mode))
         {
             res->error(format_error_response(
-                "streamllm: schedule_set rejected (thresholds must be "
-                "ascending, |dials|=|thresholds|+1, all dial lengths > 0)",
+                "streamllm: kbar_schedule rejected (thresholds must be "
+                "ascending and |kbars|=|thresholds|+1)",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         res->ok({
             {"thresholds", thr},
-            {"n_dials",    (int) lens.size()},
+            {"kbars",      kbars},
+            {"allocator",  allocator_mode == 1 ? "uniform" : "profile"},
             {"status",     "applied"},
         });
         return res;

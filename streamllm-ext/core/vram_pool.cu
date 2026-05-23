@@ -41,8 +41,17 @@ VramChunkPool::VramChunkPool(size_t capacity_bytes, int device, bool copy_stream
     if (capacity_bytes_ == 0) {
         throw std::runtime_error("vram_pool: capacity_bytes must be > 0");
     }
-    int prev = 0;
-    check_cuda(cudaGetDevice(&prev), "cudaGetDevice");
+    int prev = device_;
+    const cudaError_t get_prev = cudaGetDevice(&prev);
+    const bool have_prev = get_prev == cudaSuccess;
+    if (!have_prev) {
+        // In some llama.cpp load orders the CUDA driver is visible to
+        // ggml but no current cudart device has been established for
+        // this extension yet. Clear the stale runtime error and set the
+        // requested device explicitly below.
+        (void) cudaGetLastError();
+        prev = device_;
+    }
     check_cuda(cudaSetDevice(device_), "cudaSetDevice");
     check_cuda(cudaMalloc(&arena_, capacity_bytes_), "cudaMalloc(arena)");
     if (copy_stream) {
@@ -55,7 +64,9 @@ VramChunkPool::VramChunkPool(size_t capacity_bytes, int device, bool copy_stream
     if (const char * sync = std::getenv("STREAMLLM_SYNC_H2D")) {
         force_sync_h2d_ = std::atoi(sync) != 0;
     }
-    check_cuda(cudaSetDevice(prev), "cudaSetDevice(restore)");
+    if (have_prev) {
+        check_cuda(cudaSetDevice(prev), "cudaSetDevice(restore)");
+    }
 
     free_list_.push_back({0, capacity_bytes_});
 }

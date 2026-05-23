@@ -25,14 +25,14 @@ public:
         // Qwen3-MoE / Qwen3.5 / Qwen3.6 — all SwiGLU + SiLU.
         set_activation(Activation::SiLU);
     }
-    const char * name() const override { return "qwen3_anybcq_v1"; }
+    const char * name() const override { return "qwen3_ss_anybcq_v1"; }
 };
 
 class Qwen3BaselineExecutor : public ModelExecutor {
 public:
     ~Qwen3BaselineExecutor() override;
 
-    const char * name() const override { return "qwen3_baseline_v1"; }
+    const char * name() const override { return "qwen3_direct_stock_v1"; }
     bool uses_stock_moe_graph() const override { return true; }
 
     void bind_to_model(StreamllmRuntime & rt,
@@ -67,11 +67,7 @@ private:
     void ensure_full_(int kind, size_t bytes);
 };
 
-// Registry hookup. Idempotent.  Registers:
-//   qwen3_anybcq_v1       (current Qwen3-MoE name)
-//   qwen3_moe_anybcq_v1   (legacy alias — old Qwen3 GGUFs)
-//   qwen35_anybcq_v1      (Qwen3.5 family, same arch)
-//   qwen36_anybcq_v1      (Qwen3.6 family, same arch)
+// Registry hookup. Idempotent.
 void register_qwen3_moe_executor();
 
 }}  // namespace streamllm_ext::qwen3

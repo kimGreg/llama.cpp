@@ -121,25 +121,8 @@ extern "C" bool streamllm_pre_op(
     cudaStream_t stream,
     struct ggml_tensor * dst);
 
-// Live-tunable precision dial. ``thresholds`` (length n_thresh,
-// descending) and ``chunks`` (length n_chunks, same length) replace the
-// active scheduler's score-threshold table.  ``thresholds`` is a
-// length-N ascending vector where N = max n_chunks across managed
-// tensors (the model's "full chunk size").  thresholds[k] is the
-// lower-edge gate score for the band that loads (k+1) chunks; the
-// chunks count is implicit by index.  Returns true on success,
-// false if no runtime is installed or the input is malformed
-// (length mismatch, non-ascending, out-of-range value).  Safe to
-// call from any thread; the next mul_mat_id dispatch sees the new
-// table; in-flight dispatches keep using the snapshot they took
-// at entry.
-extern "C" bool streamllm_set_score_table(
-    const float * thresholds, int n_thresh);
-
-// Snapshot of the active score-threshold table.  Returns false if
-// no runtime is installed.  Safe from any thread.
-bool streamllm_get_score_table(
-    std::vector<float> & out_thresholds);
+extern "C" bool streamllm_set_kbar(float kbar, int allocator_mode);
+extern "C" bool streamllm_get_kbar(float * out_kbar, int * out_allocator_mode);
 
 // S8 (Mode A): ``streamllm_topk_moe_observed`` was retired with the
 // fused-topk_moe hook install. Sentinel ``src[2..3]`` carries probs
@@ -167,31 +150,14 @@ extern "C" void streamllm_on_graph_audit_and_score_snapshot_end(
 extern "C" bool streamllm_user_node_claims(
     const struct ggml_tensor * node);
 
-// Score-table version key. Registered with ggml-cuda's
-// ``ggml_cuda_set_streamllm_score_version_hook``; the cgraph cache
-// reads it once per compute and forces re-capture on any change.
-extern "C" uint64_t streamllm_replay_score_table_version(void);
+extern "C" uint64_t streamllm_replay_dial_version(void);
 
 // ── Runtime-mutable gradual-schedule state ────────────────────────────
 //
-// The common-sampler observer in common/sampling.cpp reads this on
-// each common_sampler_init when the runtime API has been populated;
-// otherwise it falls back to the STREAMLLM_SCHEDULE_* env vars. The
-// HTTP route POST /streamllm/schedule writes via streamllm_schedule_set.
-//
-// Wire format (C-friendly):
-//   thresholds : ascending int array of length n_thresh (generated-
-//                token breakpoints).
-//   dials_flat : packed float array, length = sum(dial_lens[i]).
-//   dial_lens  : per-dial threshold-count array of length n_dials.
-//   n_dials    = n_thresh + 1.
-//
-// Return false on shape/order violations.  Empty state (after
-// streamllm_schedule_clear or before any set) is signalled by
-// streamllm_schedule_active() == false.
-extern "C" bool streamllm_schedule_set(
-    const int *   thresholds, int n_thresh,
-    const float * dials_flat, const int * dial_lens, int n_dials);
+extern "C" bool streamllm_kbar_schedule_set(
+    const int * thresholds, int n_thresh,
+    const float * kbars, int n_kbars,
+    int allocator_mode);
 extern "C" void streamllm_schedule_clear(void);
 extern "C" bool streamllm_schedule_active(void);
 
@@ -200,6 +166,7 @@ extern "C" bool streamllm_schedule_active(void);
 // Caller passes in/out vectors; returns false if no schedule is set.
 bool streamllm_schedule_get(
     std::vector<int> *                       out_thresholds,
-    std::vector<std::vector<float>> *        out_dials);
+    std::vector<float> *                     out_kbars,
+    int *                                    out_allocator_mode);
 
 } // namespace streamllm_ext

@@ -25,7 +25,7 @@
 // Model-specific entry points (per-op dispatch, MoE expert tables,
 // score-policy snapshot/replace) are exposed as free-function
 // accessors in the model layer's header (qwen3/scheduler.h's
-// scheduler_handle_mul_mat / scheduler_set_score_table / etc.). Each
+// scheduler_handle_mul_mat / scheduler_set_kbar / etc.). Each
 // downcasts internally; core stays free of model vtable contracts.
 //
 // Pick at install via STREAMLLM_SCHEDULER.  Currently only "moe" is

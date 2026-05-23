@@ -1,8 +1,8 @@
 // streamllm-ext / qwen3 — Qwen3 MoE AnyBCQ executor.
 //
 // Concrete ModelExecutor implementation for Qwen3-MoE streamed
-// through the AnyBCQ chunk encoder.  Selected at llama_model_load
-// by ``streamllm.executor = "qwen3_moe_anybcq_v1"`` in the GGUF.
+// through the ss_anybcq chunk encoder. Selected at llama_model_load
+// by ``streamllm.executor = "qwen3_ss_anybcq_v1"`` in the GGUF.
 //
 // ``forward_moe_layer`` is invoked once per managed MoE layer by the
 // per-layer sentinel rail (qwen3_runtime_glue's ``streamllm_pre_op``
@@ -49,12 +49,22 @@ struct SlotScratch {
     size_t  slot_b_bytes = 0;
 };
 
+struct DynamicGpuPlanScratch {
+    int      n_experts = 0;
+    int      B1        = 0;
+    int *    chunks_d  = nullptr;
+    int *    chunks_h  = nullptr;
+    float *  dp_prev_d = nullptr;
+    float *  dp_cur_d  = nullptr;
+    uint8_t * trace_d  = nullptr;
+};
+
 class MoEAnyBcqExecutor : public ModelExecutor {
 public:
     MoEAnyBcqExecutor() = default;
     ~MoEAnyBcqExecutor() override;
 
-    const char * name() const override { return "qwen3_moe_anybcq_v1"; }
+    const char * name() const override { return "qwen3_ss_anybcq_v1"; }
 
     void bind_to_model(StreamllmRuntime &  rt,
                         const StreamReader & reader,
@@ -133,11 +143,15 @@ private:
     std::unordered_map<unsigned long long, SlotScratch> slot_scratch_;
     std::mutex                                          slot_scratch_mu_;
 
+    DynamicGpuPlanScratch dynamic_plan_;
+
     SlotScratch * acquire_slot_scratch_(unsigned long long stream_key,
                                          int                n_tokens,
                                          int                n_used,
                                          int                M_gate_up,
                                          int                M_down);
+    bool ensure_dynamic_plan_(int n_experts, int B1);
+    void free_dynamic_plan_();
 
     // Batched per-layer dispatch.  Plans, loads, waits, and validates
     // gate/up/down in a single coalesced phase, then runs the three
@@ -171,18 +185,11 @@ private:
         int                        layer_idx);
 };
 
-// Back-compat alias.  The class was renamed in the 2026-05-20
-// multi-arch refactor; callers that still spell the old name keep
-// working transparently.
+// Back-compat type alias for source-level users; old runtime executor
+// names are intentionally not registered.
 using Qwen3MoEAnyBcqExecutor = MoEAnyBcqExecutor;
 
-// Legacy registration entry retained for runtime_glue.cpp call sites
-// that haven't moved to the per-arch register_*_executor() functions
-// in ``moe/{qwen3,deepseek_moe,gemma_4}/<arch>_executor.cpp``.  This
-// function registers ALL per-arch aliases (qwen3_anybcq_v1,
-// qwen3_moe_anybcq_v1 legacy, deepseek_anybcq_v1, gemma4_anybcq_v1,
-// qwen35_anybcq_v1, qwen36_anybcq_v1) so a single call covers every
-// supported model.  Idempotent.
+// Registration entry retained for runtime_glue.cpp call sites. Idempotent.
 void register_qwen3_moe_anybcq_executor();
 
 }  // namespace qwen3

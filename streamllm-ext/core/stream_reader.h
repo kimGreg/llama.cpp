@@ -75,7 +75,7 @@ struct GlobalMeta {
     // such keys) default to ``false`` / ``""`` and keep the legacy
     // behaviour (hardcoded executor name with a soft fallback).
     bool        required_runtime = false;
-    std::string executor;            // versioned, e.g. "qwen3_moe_anybcq_v1"
+    std::string executor;            // versioned, e.g. "qwen3_ss_anybcq_v1"
 };
 
 // Parse streamllm.* metadata from an already-loaded gguf_context. The

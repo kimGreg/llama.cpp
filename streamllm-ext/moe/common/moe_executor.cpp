@@ -48,6 +48,7 @@ std::atomic<std::uint64_t> MoEAnyBcqExecutor::required_set_misses_{0};
 
 MoEAnyBcqExecutor::~MoEAnyBcqExecutor()
 {
+    free_dynamic_plan_();
     std::lock_guard<std::mutex> lk(slot_scratch_mu_);
     for (auto & [_, ss] : slot_scratch_) {
         if (ss.slot_a) cudaFree(ss.slot_a);
@@ -62,6 +63,49 @@ void MoEAnyBcqExecutor::bind_to_model(
     const std::string &  /*gguf_path*/)
 {
     rt_ = &rt;
+}
+
+void MoEAnyBcqExecutor::free_dynamic_plan_()
+{
+    if (dynamic_plan_.chunks_d)  cudaFree(dynamic_plan_.chunks_d);
+    if (dynamic_plan_.chunks_h)  cudaFreeHost(dynamic_plan_.chunks_h);
+    if (dynamic_plan_.dp_prev_d) cudaFree(dynamic_plan_.dp_prev_d);
+    if (dynamic_plan_.dp_cur_d)  cudaFree(dynamic_plan_.dp_cur_d);
+    if (dynamic_plan_.trace_d)   cudaFree(dynamic_plan_.trace_d);
+    dynamic_plan_ = DynamicGpuPlanScratch{};
+}
+
+bool MoEAnyBcqExecutor::ensure_dynamic_plan_(int n_experts, int B1)
+{
+    if (n_experts <= 0 || B1 <= 0) return false;
+    if (dynamic_plan_.chunks_d != nullptr &&
+        dynamic_plan_.n_experts >= n_experts &&
+        dynamic_plan_.B1 >= B1) {
+        return true;
+    }
+    free_dynamic_plan_();
+
+    dynamic_plan_.n_experts = n_experts;
+    dynamic_plan_.B1 = B1;
+    const size_t chunks_bytes = (size_t) n_experts * sizeof(int);
+    const size_t dp_bytes = (size_t) B1 * sizeof(float);
+    const size_t trace_bytes = (size_t) n_experts * (size_t) B1 * sizeof(uint8_t);
+
+    if (cudaMalloc((void **) &dynamic_plan_.chunks_d, chunks_bytes) != cudaSuccess) {
+        free_dynamic_plan_();
+        return false;
+    }
+    if (cudaMallocHost((void **) &dynamic_plan_.chunks_h, chunks_bytes) != cudaSuccess) {
+        free_dynamic_plan_();
+        return false;
+    }
+    if (cudaMalloc((void **) &dynamic_plan_.dp_prev_d, dp_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &dynamic_plan_.dp_cur_d,  dp_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &dynamic_plan_.trace_d,   trace_bytes) != cudaSuccess) {
+        free_dynamic_plan_();
+        return false;
+    }
+    return true;
 }
 
 SlotScratch * MoEAnyBcqExecutor::acquire_slot_scratch_(
@@ -369,6 +413,94 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
             (void) c.comp->pre_inputs(*c.in);
         }
     } else {
+        bool plans_ready = false;
+
+        const char * gpu_plan_env = std::getenv("STREAMLLM_DYNAMIC_GPU_PLANNER");
+        const bool gpu_plan_disabled =
+            gpu_plan_env != nullptr && gpu_plan_env[0] == '0';
+        const float dyn_kbar = qwen3::scheduler_kbar(rt_->scheduler());
+        const int K_min_dyn  = qwen3::scheduler_dynamic_K_min(rt_->scheduler());
+        const int K_max_dyn  = qwen3::scheduler_dynamic_K_max(rt_->scheduler());
+        const float * R_d    = qwen3::scheduler_dynamic_R_device(rt_->scheduler());
+        const bool can_gpu_plan =
+            !gpu_plan_disabled &&
+            R_d != nullptr &&
+            dyn_kbar > 0.0f &&
+            qwen3::scheduler_kbar_allocator_mode(rt_->scheduler()) ==
+                qwen3::KBarAllocatorMode::Profile &&
+            ids != nullptr && ids->data != nullptr &&
+            n_expert_in_probs > 0 &&
+            K_min_dyn >= 0 && K_max_dyn >= K_min_dyn &&
+            layer_idx >= 0;
+
+        if (can_gpu_plan) {
+            for (auto & c : canon) {
+                (void) c.comp->pre_inputs(*c.in);
+            }
+
+            const int B1 = n_expert_in_probs * K_max_dyn + 1;
+            if (ensure_dynamic_plan_(n_expert_in_probs, B1)) {
+                const size_t ids_row_stride = (size_t) ids->nb[1];
+                size_t weights_row_stride = 0;
+                if (weights != nullptr) {
+                    weights_row_stride =
+                        (weights->ne[0] == 1 && weights->ne[1] == n_used)
+                        ? (size_t) weights->nb[2]
+                        : (size_t) weights->nb[1];
+                }
+                const size_t probs_row_stride =
+                    probs != nullptr ? (size_t) probs->nb[1] : 0;
+
+                qwen3::launch_plan_chunks_kbar_exact_strided(
+                    (const int32_t *) ids->data,
+                    ids_row_stride,
+                    weights != nullptr ? (const float *) weights->data : nullptr,
+                    weights_row_stride,
+                    probs != nullptr ? (const float *) probs->data : nullptr,
+                    probs_row_stride,
+                    R_d,
+                    K_min_dyn,
+                    K_max_dyn,
+                    layer_idx,
+                    dyn_kbar,
+                    n_tokens,
+                    n_used,
+                    n_expert_in_probs,
+                    gate_comp.n_chunks_max(),
+                    dynamic_plan_.chunks_d,
+                    dynamic_plan_.dp_prev_d,
+                    dynamic_plan_.dp_cur_d,
+                    dynamic_plan_.trace_d,
+                    stream_h);
+                launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
+                cudaMemcpyAsync(dynamic_plan_.chunks_h,
+                                dynamic_plan_.chunks_d,
+                                (size_t) n_expert_in_probs * sizeof(int),
+                                cudaMemcpyDeviceToHost,
+                                stream);
+                launch_diag::note_stream_sync();
+                const cudaError_t sync_err = cudaStreamSynchronize(stream);
+                if (sync_err == cudaSuccess) {
+                    gate_comp.use_external_chunk_plan(dynamic_plan_.chunks_h);
+                    up_comp.use_external_chunk_plan(dynamic_plan_.chunks_h);
+                    down_comp.use_external_chunk_plan(dynamic_plan_.chunks_h);
+                    plan_gate = gate_comp.plan(in_gate);
+                    plan_up   = up_comp.plan(in_up);
+                    plan_down = down_comp.plan(in_down);
+                    gate_comp.clear_external_chunk_plan();
+                    up_comp.clear_external_chunk_plan();
+                    down_comp.clear_external_chunk_plan();
+                    plans_ready = true;
+                } else {
+                    std::fprintf(stderr,
+                        "streamllm-ext: dynamic GPU planner failed at L=%d: %s; "
+                        "falling back to host planning\n",
+                        layer_idx, cudaGetErrorString(sync_err));
+                }
+            }
+        }
+
+        if (!plans_ready) {
         // ── Phase 0a: enqueue pre_inputs D2Hs for all three canonicals.
         //    Each canonical's pre_inputs writes to its own pinned arrays;
         //    we're issuing 3× D2H_ids + 3× D2H_probs + 3× D2H_weights but
@@ -399,6 +531,7 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
         plan_gate = gate_comp.plan(in_gate);
         plan_up   = up_comp.plan(in_up);
         plan_down = down_comp.plan(in_down);
+        }
 
         auto count_residency = [&](const ChunkPlan & pl) {
             if (pl.required_set.empty()) return;
