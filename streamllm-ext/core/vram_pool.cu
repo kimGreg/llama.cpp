@@ -310,17 +310,133 @@ ChunkHandle VramChunkPool::load(
     };
 }
 
+std::vector<ChunkHandle> VramChunkPool::load_batch_sync(
+    const std::vector<BatchLoadItem> & items,
+    const void * packed_host,
+    size_t packed_nbytes,
+    StreamHandle compute_stream)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<ChunkHandle> out;
+    if (items.empty()) return out;
+    if (packed_host == nullptr || packed_nbytes == 0) return out;
+    if (packed_nbytes > capacity_bytes_) {
+        throw std::runtime_error(
+            "vram_pool: batch size " + std::to_string(packed_nbytes) +
+            " exceeds capacity " + std::to_string(capacity_bytes_));
+    }
+
+    for (const auto & item : items) {
+        if (item.host_ptr == nullptr || item.nbytes == 0) {
+            return {};
+        }
+        if (residents_.find(item.key) != residents_.end()) {
+            unexpected_h2d_for_resident_.fetch_add(
+                1, std::memory_order_relaxed);
+            return {};
+        }
+    }
+
+    std::optional<size_t> off_opt = allocate_(packed_nbytes);
+    if (!off_opt.has_value()) {
+        return {};
+    }
+
+    const size_t base_off = *off_opt;
+    char * dst = (char *)arena_ + base_off;
+    cudaStream_t stream = copy_stream_ == nullptr || force_sync_h2d_
+        ? (cudaStream_t)0
+        : (cudaStream_t)copy_stream_;
+
+    try {
+        if (copy_stream_ != nullptr && !force_sync_h2d_) {
+            bool in_capture = false;
+            if (compute_stream != nullptr) {
+                auto cs = (cudaStream_t) compute_stream;
+                cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(cs, &status) == cudaSuccess &&
+                    status == cudaStreamCaptureStatusActive) {
+                    in_capture = true;
+                    if (!capture_fork_event_) {
+                        cudaEvent_t ev;
+                        check_cuda(
+                            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+                            "cudaEventCreate(fork)");
+                        capture_fork_event_ = (EventHandle) ev;
+                    }
+                    check_cuda(
+                        cudaEventRecord((cudaEvent_t)capture_fork_event_, cs),
+                        "cudaEventRecord(fork)");
+                    check_cuda(
+                        cudaStreamWaitEvent(stream, (cudaEvent_t)capture_fork_event_, 0),
+                        "cudaStreamWaitEvent(fork)");
+                }
+            }
+            if (!in_capture && latest_compute_event_) {
+                check_cuda(
+                    cudaStreamWaitEvent(stream, (cudaEvent_t)latest_compute_event_, 0),
+                    "cudaStreamWaitEvent(compute)");
+            }
+            check_cuda(
+                cudaMemcpyAsync(dst, packed_host, packed_nbytes,
+                                cudaMemcpyHostToDevice, stream),
+                "cudaMemcpyAsync(H2D batch)");
+            check_cuda(cudaStreamSynchronize(stream),
+                       "cudaStreamSynchronize(H2D batch)");
+        } else {
+            check_cuda(
+                cudaMemcpy(dst, packed_host, packed_nbytes, cudaMemcpyHostToDevice),
+                "cudaMemcpy(H2D batch sync)");
+        }
+    } catch (...) {
+        free_(base_off, packed_nbytes);
+        throw;
+    }
+
+    out.reserve(items.size());
+    size_t cursor = 0;
+    for (const auto & item : items) {
+        Slot slot{base_off + cursor, item.nbytes};
+        residents_.emplace(item.key,
+                           Resident{slot, nullptr, ChunkState::H2D_ISSUED});
+        out.push_back(ChunkHandle{
+            (char *)arena_ + slot.offset,
+            slot.nbytes,
+            nullptr,
+        });
+        cursor += item.nbytes;
+    }
+    total_h2d_bytes_ += packed_nbytes;
+    ++total_h2d_calls_;
+    batch_h2d_bytes_ += packed_nbytes;
+    ++batch_h2d_calls_;
+    if (used_bytes_ > peak_used_bytes_) peak_used_bytes_ = used_bytes_;
+    return out;
+}
+
 
 void VramChunkPool::reset_stats() {
     std::lock_guard<std::mutex> lk(mu_);
     peak_used_bytes_ = used_bytes_;
     total_h2d_bytes_ = 0;
     total_h2d_calls_ = 0;
+    batch_h2d_bytes_ = 0;
+    batch_h2d_calls_ = 0;
+    batch_fallbacks_ = 0;
     required_chunks_.store(0, std::memory_order_relaxed);
     resident_hits_.store(0, std::memory_order_relaxed);
     load_misses_.store(0, std::memory_order_relaxed);
+    prefill_required_chunks_.store(0, std::memory_order_relaxed);
+    prefill_resident_hits_.store(0, std::memory_order_relaxed);
+    decode_required_chunks_.store(0, std::memory_order_relaxed);
+    decode_resident_hits_.store(0, std::memory_order_relaxed);
     redundant_h2d_skipped_.store(0, std::memory_order_relaxed);
     unexpected_h2d_for_resident_.store(0, std::memory_order_relaxed);
+}
+
+void VramChunkPool::note_batch_fallback() {
+    std::lock_guard<std::mutex> lk(mu_);
+    ++batch_fallbacks_;
 }
 
 size_t VramChunkPool::required_chunks() const {
@@ -332,6 +448,18 @@ size_t VramChunkPool::resident_hits() const {
 size_t VramChunkPool::load_misses() const {
     return load_misses_.load(std::memory_order_relaxed);
 }
+size_t VramChunkPool::prefill_required_chunks() const {
+    return prefill_required_chunks_.load(std::memory_order_relaxed);
+}
+size_t VramChunkPool::prefill_resident_hits() const {
+    return prefill_resident_hits_.load(std::memory_order_relaxed);
+}
+size_t VramChunkPool::decode_required_chunks() const {
+    return decode_required_chunks_.load(std::memory_order_relaxed);
+}
+size_t VramChunkPool::decode_resident_hits() const {
+    return decode_resident_hits_.load(std::memory_order_relaxed);
+}
 size_t VramChunkPool::redundant_h2d_skipped() const {
     return redundant_h2d_skipped_.load(std::memory_order_relaxed);
 }
@@ -340,11 +468,24 @@ size_t VramChunkPool::unexpected_h2d_for_resident() const {
 }
 
 void VramChunkPool::note_required_set(size_t n_required, size_t n_resident) {
+    note_required_set_phase(n_required, n_resident, false);
+}
+
+void VramChunkPool::note_required_set_phase(size_t n_required,
+                                            size_t n_resident,
+                                            bool decode_phase) {
     if (n_resident > n_required) n_resident = n_required;  // defensive
     required_chunks_.fetch_add(n_required, std::memory_order_relaxed);
     resident_hits_.fetch_add(n_resident, std::memory_order_relaxed);
     load_misses_.fetch_add(n_required - n_resident,
                             std::memory_order_relaxed);
+    if (decode_phase) {
+        decode_required_chunks_.fetch_add(n_required, std::memory_order_relaxed);
+        decode_resident_hits_.fetch_add(n_resident, std::memory_order_relaxed);
+    } else {
+        prefill_required_chunks_.fetch_add(n_required, std::memory_order_relaxed);
+        prefill_resident_hits_.fetch_add(n_resident, std::memory_order_relaxed);
+    }
 }
 
 void VramChunkPool::note_redundant_h2d_skipped() {

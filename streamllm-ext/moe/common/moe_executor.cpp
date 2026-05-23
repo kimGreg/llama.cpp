@@ -539,7 +539,8 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
             for (const auto & k : pl.required_set) {
                 if (rt_->pool().is_resident(k.wid, k.cid)) ++hits;
             }
-            rt_->pool().note_required_set(pl.required_set.size(), hits);
+            rt_->pool().note_required_set_phase(pl.required_set.size(), hits,
+                                                n_tokens == 1);
         };
         count_residency(plan_gate);
         count_residency(plan_up);
@@ -571,8 +572,78 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
 
         if (union_size > 0) {
             launch_diag::note_load_set(union_size);
-            const bool async_on = rt_->io_worker_count() > 0;
-            if (async_on) {
+            const char * batch_env = std::getenv("STREAMLLM_BATCH_CHUNK_LOAD");
+            const bool batch_on =
+                batch_env != nullptr && batch_env[0] && batch_env[0] != '0';
+            if (batch_on) {
+                std::vector<ChunkKey> missing;
+                missing.reserve(union_size);
+                std::unordered_set<ChunkKey, ChunkKeyHash> seen;
+                auto collect_plan = [&](const ChunkPlan & pl) {
+                    for (const auto & k : pl.load_set) {
+                        if (rt_->pool().is_resident(k.wid, k.cid)) continue;
+                        if (seen.insert(k).second) missing.push_back(k);
+                    }
+                };
+                collect_plan(plan_gate);
+                collect_plan(plan_up);
+                collect_plan(plan_down);
+                const char * bundle_env = std::getenv("STREAMLLM_EXPERT_BUNDLE");
+                const bool expert_bundle_on =
+                    bundle_env != nullptr && bundle_env[0] && bundle_env[0] != '0';
+                if (expert_bundle_on && missing.size() > 1) {
+                    struct BundleOrder {
+                        int layer  = 1 << 29;
+                        int expert = 1 << 29;
+                        int cid    = 1 << 29;
+                        int kind   = 1 << 29;
+                    };
+                    auto order_for = [](const ChunkKey & k) {
+                        BundleOrder o;
+                        if (k.cid >= kCidChunkBase) {
+                            o.cid = k.cid - kCidChunkBase;
+                        }
+                        const char * s = k.wid.c_str();
+                        if (std::strncmp(s, "blk.", 4) == 0) {
+                            char * end = nullptr;
+                            const long layer = std::strtol(s + 4, &end, 10);
+                            if (end != s + 4) o.layer = (int)layer;
+                        }
+                        if (k.wid.find(".ffn_gate_exps.weight") != std::string::npos) {
+                            o.kind = 0;
+                        } else if (k.wid.find(".ffn_up_exps.weight") != std::string::npos) {
+                            o.kind = 1;
+                        } else if (k.wid.find(".ffn_down_exps.weight") != std::string::npos) {
+                            o.kind = 2;
+                        }
+                        const size_t epos = k.wid.rfind(":e");
+                        if (epos != std::string::npos && epos + 2 < k.wid.size()) {
+                            char * end = nullptr;
+                            const long expert =
+                                std::strtol(k.wid.c_str() + epos + 2, &end, 10);
+                            if (end != k.wid.c_str() + epos + 2) {
+                                o.expert = (int)expert;
+                            }
+                        }
+                        return o;
+                    };
+                    std::stable_sort(
+                        missing.begin(), missing.end(),
+                        [&](const ChunkKey & a, const ChunkKey & b) {
+                            const BundleOrder oa = order_for(a);
+                            const BundleOrder ob = order_for(b);
+                            if (oa.layer  != ob.layer)  return oa.layer  < ob.layer;
+                            if (oa.expert != ob.expert) return oa.expert < ob.expert;
+                            if (oa.cid    != ob.cid)    return oa.cid    < ob.cid;
+                            if (oa.kind   != ob.kind)   return oa.kind   < ob.kind;
+                            if (a.cid != b.cid) return a.cid < b.cid;
+                            return a.wid < b.wid;
+                        });
+                }
+                if (!missing.empty()) {
+                    rt_->move_chunks_batch(missing, stream_h);
+                }
+            } else if (rt_->io_worker_count() > 0) {
                 auto batch = std::make_shared<std::atomic<uint32_t>>(0);
                 auto submit_plan = [&](const ChunkPlan & pl) {
                     for (const auto & k : pl.load_set) {
@@ -597,14 +668,16 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                 move_plan(plan_up);
                 move_plan(plan_down);
             }
-            auto wait_plan = [&](const ChunkPlan & pl) {
-                for (const auto & k : pl.load_set) {
-                    rt_->pool().wait_on_stream(k.wid, k.cid, stream_h);
-                }
-            };
-            wait_plan(plan_gate);
-            wait_plan(plan_up);
-            wait_plan(plan_down);
+            if (!batch_on) {
+                auto wait_plan = [&](const ChunkPlan & pl) {
+                    for (const auto & k : pl.load_set) {
+                        rt_->pool().wait_on_stream(k.wid, k.cid, stream_h);
+                    }
+                };
+                wait_plan(plan_gate);
+                wait_plan(plan_up);
+                wait_plan(plan_down);
+            }
         }
 
         // ── Phase 0f: validate all three.
@@ -949,7 +1022,9 @@ void MoEAnyBcqExecutor::attach_router_gates(
 namespace streamllm_ext {
 namespace qwen3        { void register_qwen3_moe_executor();     }
 namespace deepseek_moe { void register_deepseek_moe_executor();  }
+#if defined(STREAMLLM_HAVE_GEMMA4_EXECUTOR)
 namespace gemma_4      { void register_gemma4_moe_executor();    }
+#endif
 
 namespace qwen3 {
 
@@ -961,7 +1036,9 @@ void register_qwen3_moe_anybcq_executor() {
     // double-registration risk.
     qwen3::register_qwen3_moe_executor();
     deepseek_moe::register_deepseek_moe_executor();
+#if defined(STREAMLLM_HAVE_GEMMA4_EXECUTOR)
     gemma_4::register_gemma4_moe_executor();
+#endif
 }
 
 }}  // namespace streamllm_ext::qwen3

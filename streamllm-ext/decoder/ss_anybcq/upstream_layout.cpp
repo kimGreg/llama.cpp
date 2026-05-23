@@ -111,7 +111,12 @@ UpstreamLayoutHost build_upstream_layout_ss_anybcq(
     out.disk_bytes_per_chunk =
         (size_t)plane_sign_bytes + (size_t)d1 * (size_t)a_size;
 
-    out.chunks.assign(P, std::vector<uint8_t>(out.bytes_per_chunk));
+    const bool has_inline_chunks = !layout.fixed_only_payload();
+    if (has_inline_chunks) {
+        out.chunks.assign(P, std::vector<uint8_t>(out.bytes_per_chunk));
+    } else {
+        out.chunks.assign(P, std::vector<uint8_t>());
+    }
     out.q_bias.resize(out.q_bias_n_elem);
 
     // β → q_bias[kg, row] fp16, row innermost.
@@ -133,12 +138,14 @@ UpstreamLayoutHost build_upstream_layout_ss_anybcq(
         }
     }
 
-    size_t plane_off = layout.fixed_bytes;
-    for (int32_t p = 0; p < P; ++p) {
-        plane_disk_to_kernel(
-            tensor_data + plane_off, out.chunks[p].data(),
-            n, padded_m, ng, a_size);
-        plane_off += layout.chunk_bytes[p];
+    if (has_inline_chunks) {
+        size_t plane_off = layout.fixed_bytes;
+        for (int32_t p = 0; p < P; ++p) {
+            plane_disk_to_kernel(
+                tensor_data + plane_off, out.chunks[p].data(),
+                n, padded_m, ng, a_size);
+            plane_off += layout.chunk_bytes[p];
+        }
     }
 
     // Encoder-side callbacks core's move_chunk invokes (no decoder

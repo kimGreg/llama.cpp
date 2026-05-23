@@ -56,7 +56,12 @@ struct TensorLayout {
     bool byte_accounting_ok() const {
         uint64_t total = fixed_bytes;
         for (auto b : chunk_bytes) total += b;
-        return static_cast<int64_t>(total) == tensor_nbytes;
+        return static_cast<int64_t>(total) == tensor_nbytes ||
+               static_cast<int64_t>(fixed_bytes) == tensor_nbytes;
+    }
+
+    bool fixed_only_payload() const {
+        return static_cast<int64_t>(fixed_bytes) == tensor_nbytes;
     }
 };
 
@@ -76,6 +81,15 @@ struct GlobalMeta {
     // behaviour (hardcoded executor name with a soft fallback).
     bool        required_runtime = false;
     std::string executor;            // versioned, e.g. "qwen3_ss_anybcq_v1"
+};
+
+struct BundleChunkSlice {
+    std::string wid;
+    uint32_t cid = 0;
+    int64_t offset = 0;
+    int64_t size = 0;
+    std::string bundle;
+    bool kernel_ready = false;
 };
 
 // Parse streamllm.* metadata from an already-loaded gguf_context. The
@@ -119,6 +133,14 @@ public:
         return it == layouts_.end() ? nullptr : &it->second;
     }
 
+    const BundleChunkSlice * bundle_slice(const std::string & wid,
+                                          uint32_t cid) const {
+        auto it = bundle_slices_.find(wid + "#" + std::to_string(cid));
+        return it == bundle_slices_.end() ? nullptr : &it->second;
+    }
+
+    size_t bundle_slice_count() const { return bundle_slices_.size(); }
+
     // True for managed tensors that exist only as placeholders in the
     // GGUF (loader-skip + seed pointer). These have no chunk metadata
     // because their bytes are accessed via per-expert sub-wids — the
@@ -139,6 +161,7 @@ private:
     GlobalMeta global_{};
     std::vector<std::string> managed_;
     std::unordered_map<std::string, TensorLayout> layouts_;
+    std::unordered_map<std::string, BundleChunkSlice> bundle_slices_;
     std::unordered_set<std::string> placeholder_only_;
     std::string gguf_path_;
 };

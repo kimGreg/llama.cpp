@@ -584,14 +584,18 @@ void clear() {
         const auto & p = g_runtime->pool();
         std::fprintf(stderr,
             "streamllm-ext stats: scheduler=%s peak_pool=%.1f MB "
-            "h2d=%.1f MB in %zu moves (avg %.1f KB/move)\n",
+            "h2d=%.1f MB in %zu moves (avg %.1f KB/move) "
+            "batch_h2d=%.1f MB in %zu moves fallback=%zu\n",
             g_runtime->scheduler().name(),
             (double)p.peak_used_bytes() / 1024.0 / 1024.0,
             (double)p.total_h2d_bytes() / 1024.0 / 1024.0,
             p.total_h2d_calls(),
             p.total_h2d_calls()
                 ? (double)p.total_h2d_bytes() / 1024.0 / p.total_h2d_calls()
-                : 0.0);
+                : 0.0,
+            (double)p.batch_h2d_bytes() / 1024.0 / 1024.0,
+            p.batch_h2d_calls(),
+            p.batch_fallbacks());
         // Residency-invariant counters.  At full cap with no eviction,
         // after warmup: resident_hits should dominate, load_misses
         // should approach zero, h2d_submitted should stop growing, and
@@ -610,6 +614,17 @@ void clear() {
             p.h2d_submitted_chunks(),
             p.redundant_h2d_skipped(),
             p.unexpected_h2d_for_resident());
+        const size_t pre_req = p.prefill_required_chunks();
+        const size_t pre_hit = p.prefill_resident_hits();
+        const size_t dec_req = p.decode_required_chunks();
+        const size_t dec_hit = p.decode_resident_hits();
+        std::fprintf(stderr,
+            "streamllm-ext residency phases: prefill=%zu/%zu (%.1f%%)  "
+            "decode=%zu/%zu (%.1f%%)\n",
+            pre_hit, pre_req,
+            pre_req ? 100.0 * (double)pre_hit / (double)pre_req : 0.0,
+            dec_hit, dec_req,
+            dec_req ? 100.0 * (double)dec_hit / (double)dec_req : 0.0);
         // Launch / sync breakdown for the sentinel eager MoE path.
         launch_diag::dump_to_stderr();
     }

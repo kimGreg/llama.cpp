@@ -49,8 +49,13 @@ if (GGML_CUDA)
         moe/common/moe_executor.cpp
         moe/qwen3/qwen3_moe_executor.cpp
         moe/deepseek_moe/deepseek_moe_executor.cpp
-        moe/gemma_4/gemma4_moe_executor.cpp
     )
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/moe/gemma_4/gemma4_moe_executor.cpp")
+        list(APPEND STREAMLLM_EXT_SOURCES
+            moe/gemma_4/gemma4_moe_executor.cpp
+        )
+        add_compile_definitions(STREAMLLM_HAVE_GEMMA4_EXECUTOR=1)
+    endif()
 endif()
 
 # CUDA sources. naver_kernel_copy.cu is a verbatim copy of NAVER's
@@ -60,6 +65,7 @@ if (GGML_CUDA)
     enable_language(CUDA)
     list(APPEND STREAMLLM_EXT_SOURCES
         core/vram_pool.cu
+        core/pointer_patch.cu
         decoder/anybcq/kernels/chunked_matmul_gemv.cu
         decoder/anybcq/kernels/chunked_matmul_gemm.cu
         decoder/anybcq/chunked_matmul.cu

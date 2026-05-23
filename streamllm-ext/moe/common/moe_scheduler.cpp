@@ -152,15 +152,31 @@ void register_chunk_io_from_layout(StreamllmRuntime & rt,
     if (layout == nullptr) return;
     std::vector<int64_t> offs;
     std::vector<int64_t> sizes;
+    std::vector<uint8_t> kernel_ready;
+    std::vector<std::string> bundles;
     offs.reserve(layout->chunk_bytes.size());
     sizes.reserve(layout->chunk_bytes.size());
+    kernel_ready.reserve(layout->chunk_bytes.size());
+    bundles.reserve(layout->chunk_bytes.size());
     int64_t cursor = layout->tensor_offset + (int64_t)layout->fixed_bytes;
-    for (uint32_t bytes : layout->chunk_bytes) {
-        offs.push_back(cursor);
-        sizes.push_back((int64_t)bytes);
+    for (size_t p = 0; p < layout->chunk_bytes.size(); ++p) {
+        const uint32_t bytes = layout->chunk_bytes[p];
+        const auto * slice = reader.bundle_slice(name, (uint32_t)cid_chunk((int)p));
+        if (slice != nullptr && slice->kernel_ready) {
+            offs.push_back(slice->offset);
+            sizes.push_back(slice->size);
+            kernel_ready.push_back(1);
+            bundles.push_back(slice->bundle);
+        } else {
+            offs.push_back(cursor);
+            sizes.push_back((int64_t)bytes);
+            kernel_ready.push_back(0);
+            bundles.emplace_back();
+        }
         cursor += (int64_t)bytes;
     }
-    rt.register_chunk_io(name, std::move(offs), std::move(sizes));
+    rt.register_chunk_io(name, std::move(offs), std::move(sizes),
+                         std::move(kernel_ready), std::move(bundles));
 }
 
 
@@ -211,15 +227,21 @@ public:
             managed_names_.insert(name);
         }
         size_t n_total = 0;
-        // DRAM cache cap (host tier). 0 = disabled; the runtime still
-        // populates host.chunks[p] on SSD-stream as a side-effect cache,
-        // but the scheduler doesn't evict — so total host bytes grow
-        // without bound (limited only by total managed bytes ≈ 22-35 GB
-        // for Qwen3-30B-A3B). When > 0, the scheduler maintains a
-        // process-wide LRU of (wid, cid) host-resident chunks and
-        // calls rt.release_chunk_host once total bytes exceed the cap.
+        // DRAM cache cap (host tier). STREAMLLM_HOST_CACHE=0 disables
+        // the transformed-chunk DRAM cache entirely for embedded-style
+        // pure VRAM↔SSD streaming. Otherwise, 0 = uncapped cache and
+        // >0 makes the scheduler maintain a process-wide host LRU.
+        host_cache_enabled_ = true;
+        if (const char * s = std::getenv("STREAMLLM_HOST_CACHE")) {
+            host_cache_enabled_ = !(s[0] == '0');
+        }
+        if (const char * s = std::getenv("STREAMLLM_DISABLE_HOST_CACHE")) {
+            if (s[0] && s[0] != '0') host_cache_enabled_ = false;
+        }
         host_max_bytes_ = 0;
-        if (const char * s = std::getenv("STREAMLLM_HOST_CAP_MB")) {
+        if (host_cache_enabled_ &&
+            (std::getenv("STREAMLLM_HOST_CAP_MB") != nullptr)) {
+            const char * s = std::getenv("STREAMLLM_HOST_CAP_MB");
             long mb = std::atol(s);
             if (mb > 0) host_max_bytes_ = (size_t)mb * 1024ULL * 1024ULL;
         }
@@ -584,7 +606,7 @@ public:
         // install (per_chunk_bytes_anyprec_) so cap accounting reflects
         // the actual variable chunk size, not the dense path's
         // single-bytes-per-chunk assumption.
-        if (host_max_bytes_ > 0) {
+        if (host_cache_enabled_ && host_max_bytes_ > 0) {
             std::vector<HostKey> to_evict;
             {
                 std::lock_guard<std::mutex> lk(host_lru_mu_);
@@ -667,7 +689,7 @@ public:
         // (synthetic, cid) admitted to the LRU contributes
         // bytes_per_chunk to host_used_bytes_; eviction happens in
         // the same lock once the cap is breached.
-        if (host_max_bytes_ > 0) {
+        if (host_cache_enabled_ && host_max_bytes_ > 0) {
             auto bp_it = bytes_per_chunk_of_.find(synthetic);
             const size_t per_chunk =
                 bp_it == bytes_per_chunk_of_.end() ? 0 : bp_it->second;
@@ -1464,6 +1486,7 @@ private:
     std::mutex                  host_lru_mu_;
     size_t                      host_used_bytes_ = 0;
     size_t                      host_max_bytes_  = 0;
+    bool                        host_cache_enabled_ = true;
     std::list<HostKey>          host_lru_;
     std::unordered_map<HostKey, std::list<HostKey>::iterator,
                        HostKeyHash> host_pos_;

@@ -3,6 +3,7 @@
 
 #include "runtime.h"
 #include "decoder_registry.h"
+#include "pointer_patch.h"
 #include "runtime_diag.h"
 #include "streamllm_nvtx.h"
 
@@ -29,6 +30,7 @@ static_assert(kMaxChunksPerTensor == kNaverMaxPrecision,
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -77,6 +79,16 @@ struct DiagSpan {
     explicit DiagSpan(diag::MoveSite) {}
 #endif
 };
+
+bool host_chunk_cache_enabled() {
+    if (const char * s = std::getenv("STREAMLLM_HOST_CACHE")) {
+        return !(s[0] == '0');
+    }
+    if (const char * s = std::getenv("STREAMLLM_DISABLE_HOST_CACHE")) {
+        return !(s[0] && s[0] != '0');
+    }
+    return true;
+}
 } // anon
 
 const char * tier_name(Tier t) {
@@ -132,6 +144,11 @@ StreamllmRuntime::~StreamllmRuntime() {
     if (host_ring_) {
         cudaFreeHost(host_ring_);
         host_ring_ = nullptr;
+    }
+    if (batch_staging_) {
+        cudaFreeHost(batch_staging_);
+        batch_staging_ = nullptr;
+        batch_staging_bytes_ = 0;
     }
     if (gguf_fd_ >= 0) {
         ::close(gguf_fd_);
@@ -383,13 +400,36 @@ void StreamllmRuntime::register_chunk_io(
         const std::string & wid,
         std::vector<int64_t> chunk_file_offsets,
         std::vector<int64_t> chunk_file_sizes) {
+    std::vector<uint8_t> kernel_ready(chunk_file_offsets.size(), 0);
+    std::vector<std::string> bundle(chunk_file_offsets.size());
+    register_chunk_io(wid, std::move(chunk_file_offsets),
+                      std::move(chunk_file_sizes),
+                      std::move(kernel_ready), std::move(bundle));
+}
+
+void StreamllmRuntime::register_chunk_io(
+        const std::string & wid,
+        std::vector<int64_t> chunk_file_offsets,
+        std::vector<int64_t> chunk_file_sizes,
+        std::vector<uint8_t> chunk_file_kernel_ready,
+        std::vector<std::string> chunk_file_bundle) {
     auto it = entries_.find(wid);
     if (it == entries_.end()) {
         throw std::runtime_error(
             "StreamllmRuntime::register_chunk_io: unknown wid " + wid);
     }
+    if (chunk_file_offsets.size() != chunk_file_sizes.size() ||
+        chunk_file_offsets.size() != chunk_file_kernel_ready.size() ||
+        chunk_file_offsets.size() != chunk_file_bundle.size()) {
+        throw std::runtime_error(
+            "StreamllmRuntime::register_chunk_io: source vector size mismatch for " +
+            wid);
+    }
     it->second.chunk_file_offsets = std::move(chunk_file_offsets);
     it->second.chunk_file_sizes   = std::move(chunk_file_sizes);
+    it->second.chunk_file_kernel_ready =
+        std::move(chunk_file_kernel_ready);
+    it->second.chunk_file_bundle = std::move(chunk_file_bundle);
 }
 
 const UpstreamLayoutDevice * StreamllmRuntime::layout(const std::string & wid) const {
@@ -417,6 +457,16 @@ void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid,
     auto it = entries_.find(wid);
     if (it == entries_.end()) return;
     int p = cid_chunk_index(cid);
+
+    if (defer_pointer_clears_) {
+        if (deferred_clear_stream_ == nullptr) deferred_clear_stream_ = stream;
+        if (stream == deferred_clear_stream_) {
+            if (it->second.tensor->append_after_evict_patch(
+                    p, deferred_clear_patches_)) {
+                return;
+            }
+        }
+    }
 
     // CROSS-STREAM EVICTION SAFETY.
     //
@@ -451,6 +501,33 @@ void StreamllmRuntime::clear_chunk_device_ptr(const std::string & wid, int cid,
     it->second.tensor->after_evict(p, stream);
 }
 
+void StreamllmRuntime::begin_deferred_pointer_clears_(StreamHandle stream) {
+    defer_pointer_clears_ = true;
+    deferred_clear_stream_ = stream;
+    deferred_clear_patches_.clear();
+}
+
+void StreamllmRuntime::flush_deferred_pointer_clears_() {
+    if (!defer_pointer_clears_) return;
+    StreamHandle stream = deferred_clear_stream_;
+    defer_pointer_clears_ = false;
+    deferred_clear_stream_ = nullptr;
+
+    if (!deferred_clear_patches_.empty()) {
+        if (pool_) {
+            pool_->wait_compute_on(stream);
+        }
+        apply_pointer_patches_async(deferred_clear_patches_, stream);
+        deferred_clear_patches_.clear();
+    }
+}
+
+void StreamllmRuntime::cancel_deferred_pointer_clears_() {
+    defer_pointer_clears_ = false;
+    deferred_clear_stream_ = nullptr;
+    deferred_clear_patches_.clear();
+}
+
 void * StreamllmRuntime::small_alloc(size_t bytes) {
     if (bytes == 0) return nullptr;
     // 8-byte align the bump pointer.
@@ -463,6 +540,498 @@ void * StreamllmRuntime::small_alloc(size_t bytes) {
     void * out = (char *)small_slab_ + small_slab_used_;
     small_slab_used_ += bytes;
     return out;
+}
+
+bool StreamllmRuntime::prepare_chunk_payload_(
+    const std::string & wid, int cid, PreparedChunkPayload & out)
+{
+    auto it = entries_.find(wid);
+    if (it == entries_.end()) {
+        throw std::runtime_error(
+            "StreamllmRuntime::prepare_chunk_payload_: unknown wid " + wid);
+    }
+    Entry & e = it->second;
+    UpstreamLayoutHost & host = e.tensor->host();
+
+    out.key = ChunkKey{wid, cid};
+    out.bytes.clear();
+
+    if (cid == kCidQBias) {
+        const auto * p = reinterpret_cast<const uint8_t *>(host.q_bias.data());
+        const size_t n = host.q_bias.size() * sizeof(uint16_t);
+        out.bytes.assign(p, p + n);
+        return n > 0;
+    }
+    if (!cid_is_chunk(cid)) {
+        throw std::runtime_error(
+            "StreamllmRuntime::prepare_chunk_payload_: unknown cid " +
+            std::to_string(cid));
+    }
+
+    const int p = cid_chunk_index(cid);
+    const bool have_io =
+        p >= 0 &&
+        p < (int)e.chunk_file_offsets.size() &&
+        p < (int)e.chunk_file_sizes.size();
+
+    if (host_chunk_cache_enabled()) {
+        std::lock_guard<std::mutex> lk(*e.host_mu);
+        if (p >= 0 && p < (int)host.chunks.size() &&
+            !host.chunks[p].empty()) {
+            out.bytes = host.chunks[p];
+            diag::record_move_event(diag::MoveEvent::DramHit);
+            diag::record_move_event(diag::MoveEvent::CacheSnapshot);
+            return true;
+        }
+    }
+
+    if (!have_io || host_ring_slot_bytes_ == 0) {
+        return false;
+    }
+
+    const int64_t off = e.chunk_file_offsets[p];
+    const int64_t size = e.chunk_file_sizes[p];
+    const bool kernel_ready_source =
+        p < (int)e.chunk_file_kernel_ready.size() &&
+        e.chunk_file_kernel_ready[p] != 0;
+    std::vector<uint8_t> disk_bytes((size_t)size);
+    int64_t total = 0;
+    while (total < size) {
+        ssize_t got = ::pread(gguf_fd_, disk_bytes.data() + total,
+                              (size_t)(size - total),
+                              (off_t)(off + total));
+        if (got < 0) {
+            int err = errno;
+            throw std::runtime_error(
+                "StreamllmRuntime::prepare_chunk_payload_: pread failed: " +
+                std::string(std::strerror(err)));
+        }
+        if (got == 0) {
+            throw std::runtime_error(
+                "StreamllmRuntime::prepare_chunk_payload_: short pread for " + wid);
+        }
+        total += got;
+    }
+    (void)::posix_fadvise(gguf_fd_, (off_t)off, (off_t)size,
+                          POSIX_FADV_DONTNEED);
+    diag::record_move_event(diag::MoveEvent::SsdMiss);
+
+    size_t expected_disk_bytes = 0;
+    size_t kernel_chunk_bytes = 0;
+    if (host.any_precision) {
+        if (p < 0 || p >= (int)host.chunk_planes.size()) {
+            throw std::runtime_error(
+                "StreamllmRuntime::prepare_chunk_payload_: any-prec chunk index "
+                + std::to_string(p) + " out of range for " + wid);
+        }
+        expected_disk_bytes = host.chunk_planes[p].disk_chunk_bytes;
+        kernel_chunk_bytes  = host.chunk_planes[p].kernel_chunk_bytes;
+    } else {
+        expected_disk_bytes = host.disk_bytes_per_chunk;
+        kernel_chunk_bytes  = host.bytes_per_chunk;
+    }
+    const size_t expected_source_bytes =
+        kernel_ready_source ? kernel_chunk_bytes : expected_disk_bytes;
+    if ((size_t)size != expected_source_bytes) {
+        throw std::runtime_error(
+            "StreamllmRuntime::prepare_chunk_payload_: SSD-stream plane size "
+            "doesn't match expected disk layout for " + wid);
+    }
+
+    out.bytes.assign(kernel_chunk_bytes, 0);
+    if (kernel_ready_source) {
+        std::memcpy(out.bytes.data(), disk_bytes.data(), kernel_chunk_bytes);
+    } else if (host.direct_matrix || host.direct_expert_block) {
+        std::memcpy(out.bytes.data(), disk_bytes.data(), kernel_chunk_bytes);
+    } else if (host.disk_to_kernel_fn == nullptr) {
+        throw std::runtime_error(
+            "StreamllmRuntime::prepare_chunk_payload_: missing disk_to_kernel_fn for " +
+            wid);
+    } else {
+        host.disk_to_kernel_fn(host, p, disk_bytes.data(), out.bytes.data());
+    }
+
+    if (host_chunk_cache_enabled()) {
+        std::lock_guard<std::mutex> lk(*e.host_mu);
+        if (p >= (int)host.chunks.size()) {
+            host.chunks.resize(p + 1);
+        }
+        const size_t prev_bytes = host.chunks[p].size();
+        host.chunks[p] = out.bytes;
+        const size_t new_bytes = host.chunks[p].size();
+        if (new_bytes > prev_bytes) {
+            g_host_dram_bytes.fetch_add(new_bytes - prev_bytes,
+                                         std::memory_order_relaxed);
+        } else if (prev_bytes > new_bytes) {
+            g_host_dram_bytes.fetch_sub(prev_bytes - new_bytes,
+                                         std::memory_order_relaxed);
+        }
+        diag::record_move_event(diag::MoveEvent::CacheInsert);
+    }
+    return true;
+}
+
+void StreamllmRuntime::prepare_chunk_payloads_batch_(
+    const std::vector<ChunkKey> & keys,
+    std::vector<PreparedChunkPayload> & payloads,
+    size_t & packed_bytes)
+{
+    struct PendingBundle {
+        ChunkKey key;
+        Entry * entry = nullptr;
+        int p = -1;
+        int64_t off = 0;
+        int64_t size = 0;
+        std::string bundle;
+    };
+
+    std::vector<PendingBundle> pending;
+    pending.reserve(keys.size());
+
+    for (const auto & key : keys) {
+        if (pool_->is_resident(key.wid, key.cid)) {
+            pool_->note_redundant_h2d_skipped();
+            continue;
+        }
+        auto it = entries_.find(key.wid);
+        if (it == entries_.end() || !cid_is_chunk(key.cid)) {
+            PreparedChunkPayload payload;
+            if (prepare_chunk_payload_(key.wid, key.cid, payload)) {
+                packed_bytes += payload.bytes.size();
+                payloads.push_back(std::move(payload));
+            }
+            continue;
+        }
+        Entry & e = it->second;
+        const int p = cid_chunk_index(key.cid);
+
+        if (host_chunk_cache_enabled()) {
+            std::lock_guard<std::mutex> lk(*e.host_mu);
+            auto & chunks = e.tensor->host().chunks;
+            if (p >= 0 && p < (int)chunks.size() && !chunks[p].empty()) {
+                PreparedChunkPayload payload;
+                payload.key = key;
+                payload.bytes = chunks[p];
+                packed_bytes += payload.bytes.size();
+                payloads.push_back(std::move(payload));
+                diag::record_move_event(diag::MoveEvent::DramHit);
+                diag::record_move_event(diag::MoveEvent::CacheSnapshot);
+                continue;
+            }
+        }
+
+        const bool have_bundle =
+            p >= 0 &&
+            p < (int)e.chunk_file_offsets.size() &&
+            p < (int)e.chunk_file_sizes.size() &&
+            p < (int)e.chunk_file_kernel_ready.size() &&
+            p < (int)e.chunk_file_bundle.size() &&
+            e.chunk_file_kernel_ready[p] != 0 &&
+            !e.chunk_file_bundle[p].empty();
+        if (!have_bundle) {
+            PreparedChunkPayload payload;
+            if (prepare_chunk_payload_(key.wid, key.cid, payload)) {
+                packed_bytes += payload.bytes.size();
+                payloads.push_back(std::move(payload));
+            }
+            continue;
+        }
+        pending.push_back(PendingBundle{
+            key, &e, p, e.chunk_file_offsets[p], e.chunk_file_sizes[p],
+            e.chunk_file_bundle[p],
+        });
+    }
+
+    std::stable_sort(
+        pending.begin(), pending.end(),
+        [](const PendingBundle & a, const PendingBundle & b) {
+            if (a.bundle != b.bundle) return a.bundle < b.bundle;
+            return a.off < b.off;
+        });
+
+    size_t i = 0;
+    while (i < pending.size()) {
+        size_t last = i + 1;
+        int64_t span_off = pending[i].off;
+        int64_t span_end = pending[i].off + pending[i].size;
+        while (last < pending.size() &&
+               pending[last].bundle == pending[i].bundle &&
+               pending[last].off == span_end) {
+            span_end += pending[last].size;
+            ++last;
+        }
+        const int64_t span_size = span_end - span_off;
+        std::vector<uint8_t> span((size_t)span_size);
+        {
+            DiagSpan _t(diag::MoveSite::Pread);
+            int64_t total = 0;
+            while (total < span_size) {
+                ssize_t got = ::pread(gguf_fd_, span.data() + total,
+                                      (size_t)(span_size - total),
+                                      (off_t)(span_off + total));
+                if (got < 0) {
+                    int err = errno;
+                    throw std::runtime_error(
+                        "StreamllmRuntime::prepare_chunk_payloads_batch_: pread failed: " +
+                        std::string(std::strerror(err)));
+                }
+                if (got == 0) {
+                    throw std::runtime_error(
+                        "StreamllmRuntime::prepare_chunk_payloads_batch_: short pread");
+                }
+                total += got;
+            }
+            (void)::posix_fadvise(gguf_fd_, (off_t)span_off,
+                                  (off_t)span_size, POSIX_FADV_DONTNEED);
+        }
+        diag::record_move_event(diag::MoveEvent::SsdMiss);
+
+        for (size_t j = i; j < last; ++j) {
+            const PendingBundle & pb = pending[j];
+            UpstreamLayoutHost & host = pb.entry->tensor->host();
+            size_t kernel_chunk_bytes = host.bytes_per_chunk;
+            if (host.any_precision) {
+                if (pb.p < 0 || pb.p >= (int)host.chunk_planes.size()) {
+                    throw std::runtime_error(
+                        "StreamllmRuntime::prepare_chunk_payloads_batch_: "
+                        "any-prec chunk index out of range for " + pb.key.wid);
+                }
+                kernel_chunk_bytes = host.chunk_planes[pb.p].kernel_chunk_bytes;
+            }
+            if ((size_t)pb.size != kernel_chunk_bytes) {
+                throw std::runtime_error(
+                    "StreamllmRuntime::prepare_chunk_payloads_batch_: "
+                    "bundle kernel-ready slice size mismatch for " + pb.key.wid);
+            }
+            const size_t rel = (size_t)(pb.off - span_off);
+            PreparedChunkPayload payload;
+            payload.key = pb.key;
+            payload.bytes.assign(span.data() + rel,
+                                 span.data() + rel + kernel_chunk_bytes);
+
+            if (host_chunk_cache_enabled()) {
+                std::lock_guard<std::mutex> lk(*pb.entry->host_mu);
+                if (pb.p >= (int)host.chunks.size()) host.chunks.resize(pb.p + 1);
+                const size_t prev_bytes = host.chunks[pb.p].size();
+                host.chunks[pb.p] = payload.bytes;
+                const size_t new_bytes = host.chunks[pb.p].size();
+                if (new_bytes > prev_bytes) {
+                    g_host_dram_bytes.fetch_add(new_bytes - prev_bytes,
+                                                std::memory_order_relaxed);
+                } else if (prev_bytes > new_bytes) {
+                    g_host_dram_bytes.fetch_sub(prev_bytes - new_bytes,
+                                                std::memory_order_relaxed);
+                }
+                diag::record_move_event(diag::MoveEvent::CacheInsert);
+            }
+
+            packed_bytes += payload.bytes.size();
+            payloads.push_back(std::move(payload));
+        }
+        i = last;
+    }
+}
+
+void StreamllmRuntime::finish_loaded_chunk_(
+    const std::string & wid, int cid, void * device_ptr)
+{
+    auto it = entries_.find(wid);
+    if (it == entries_.end()) return;
+    Entry & e = it->second;
+    UpstreamLayoutHost & host = e.tensor->host();
+    UpstreamLayoutDevice & dev = e.dev;
+
+    if (cid == kCidQBias) {
+        dev.q_bias_fp16 = device_ptr;
+    } else if (cid_is_chunk(cid)) {
+        const int p = cid_chunk_index(cid);
+        if (p < kMaxChunksPerTensor) {
+            dev.chunk_ptrs[p] = device_ptr;
+            if (device_ptr != nullptr) {
+                e.tensor->after_load(p, device_ptr, pool_->copy_stream());
+                if (host.any_precision &&
+                    p < (int)host.chunk_planes.size()) {
+                    const auto & cp = host.chunk_planes[p];
+                    dev.q_bias_fp16 =
+                        (const uint8_t *) device_ptr + cp.ker_off_qbias;
+                }
+            }
+        }
+    }
+
+    dev.M                  = host.n;
+    dev.K                  = host.padded_m;
+    dev.n_chunks           = host.n_chunks;
+    dev.K_groups           = host.K_groups;
+    dev.group_size         = host.group_size;
+    dev.qw_bytes_per_chunk = host.qw_bytes_per_chunk;
+    dev.any_precision      = host.any_precision;
+    dev.base_precision     = host.base_precision;
+    pool_->mark_pointer_table_ready(wid, cid);
+}
+
+void StreamllmRuntime::finish_loaded_chunks_batch_(
+    const std::vector<std::pair<ChunkKey, void *>> & loaded)
+{
+    std::vector<PointerPatch> patches;
+    patches.reserve(loaded.size());
+    std::vector<ChunkKey> ready_keys;
+    ready_keys.reserve(loaded.size());
+
+    for (const auto & item : loaded) {
+        const ChunkKey & key = item.first;
+        void * device_ptr = item.second;
+        auto it = entries_.find(key.wid);
+        if (it == entries_.end()) continue;
+        Entry & e = it->second;
+        UpstreamLayoutHost & host = e.tensor->host();
+        UpstreamLayoutDevice & dev = e.dev;
+
+        if (key.cid == kCidQBias) {
+            dev.q_bias_fp16 = device_ptr;
+        } else if (cid_is_chunk(key.cid)) {
+            const int p = cid_chunk_index(key.cid);
+            if (p < kMaxChunksPerTensor) {
+                dev.chunk_ptrs[p] = device_ptr;
+                if (device_ptr != nullptr) {
+                    if (!e.tensor->append_after_load_patch(
+                            p, device_ptr, patches)) {
+                        e.tensor->after_load(p, device_ptr,
+                                             pool_->copy_stream());
+                    }
+                    if (host.any_precision &&
+                        p < (int)host.chunk_planes.size()) {
+                        const auto & cp = host.chunk_planes[p];
+                        dev.q_bias_fp16 =
+                            (const uint8_t *) device_ptr + cp.ker_off_qbias;
+                    }
+                }
+            }
+        }
+
+        dev.M                  = host.n;
+        dev.K                  = host.padded_m;
+        dev.n_chunks           = host.n_chunks;
+        dev.K_groups           = host.K_groups;
+        dev.group_size         = host.group_size;
+        dev.qw_bytes_per_chunk = host.qw_bytes_per_chunk;
+        dev.any_precision      = host.any_precision;
+        dev.base_precision     = host.base_precision;
+        ready_keys.push_back(key);
+    }
+
+    apply_pointer_patches_async(patches, pool_->copy_stream());
+    for (const auto & key : ready_keys) {
+        pool_->mark_pointer_table_ready(key.wid, key.cid);
+    }
+}
+
+EventHandle StreamllmRuntime::move_chunks_batch(
+    const std::vector<ChunkKey> & keys,
+    StreamHandle compute_stream)
+{
+    if (keys.empty()) return nullptr;
+    std::vector<PreparedChunkPayload> payloads;
+    payloads.reserve(keys.size());
+    size_t packed_bytes = 0;
+    prepare_chunk_payloads_batch_(keys, payloads, packed_bytes);
+    if (payloads.empty() || packed_bytes == 0) return nullptr;
+
+    size_t max_batch_bytes = 4ull * 1024ull * 1024ull;
+    if (const char * env = std::getenv("STREAMLLM_BATCH_CHUNK_MAX_MB")) {
+        const long mb = std::strtol(env, nullptr, 10);
+        if (mb > 0) {
+            max_batch_bytes = (size_t)mb * 1024ull * 1024ull;
+        }
+    }
+
+    auto run_payload_batch = [&](size_t first, size_t last, size_t nbytes) {
+        if (nbytes > batch_staging_bytes_) {
+            if (batch_staging_) {
+                cudaFreeHost(batch_staging_);
+                batch_staging_ = nullptr;
+                batch_staging_bytes_ = 0;
+            }
+            cudaError_t cerr = cudaHostAlloc(&batch_staging_, nbytes,
+                                             cudaHostAllocDefault);
+            if (cerr != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("StreamllmRuntime::move_chunks_batch: "
+                                "cudaHostAlloc(batch staging) failed: ") +
+                    cudaGetErrorString(cerr));
+            }
+            batch_staging_bytes_ = nbytes;
+        }
+        uint8_t * packed = reinterpret_cast<uint8_t *>(batch_staging_);
+        std::vector<BatchLoadItem> items;
+        items.reserve(last - first);
+        size_t cursor = 0;
+        for (size_t i = first; i < last; ++i) {
+            const auto & payload = payloads[i];
+            std::memcpy(packed + cursor,
+                        payload.bytes.data(),
+                        payload.bytes.size());
+            items.push_back(BatchLoadItem{
+                payload.key,
+                packed + cursor,
+                payload.bytes.size(),
+            });
+            cursor += payload.bytes.size();
+        }
+
+        std::vector<ChunkHandle> handles;
+        begin_deferred_pointer_clears_(pool_->copy_stream());
+        try {
+            for (;;) {
+                handles = pool_->load_batch_sync(items, packed,
+                                                 nbytes, compute_stream);
+                if (!handles.empty()) break;
+                if (!scheduler_->make_room_for(*pool_, nbytes)) {
+                    flush_deferred_pointer_clears_();
+                    pool_->note_batch_fallback();
+                    for (size_t i = first; i < last; ++i) {
+                        const auto & payload = payloads[i];
+                        (void)move_chunk(payload.key.wid, payload.key.cid,
+                                         Tier::RAM, Tier::VRAM, compute_stream);
+                        pool_->wait_on_stream(payload.key.wid, payload.key.cid,
+                                              compute_stream);
+                    }
+                    return;
+                }
+            }
+            flush_deferred_pointer_clears_();
+        } catch (...) {
+            cancel_deferred_pointer_clears_();
+            throw;
+        }
+
+        std::vector<std::pair<ChunkKey, void *>> loaded;
+        loaded.reserve(handles.size());
+        for (size_t j = 0; j < handles.size(); ++j) {
+            const size_t i = first + j;
+            loaded.push_back({payloads[i].key, handles[j].device_ptr});
+        }
+        finish_loaded_chunks_batch_(loaded);
+        if (pool_->copy_stream() != nullptr) {
+            cudaStreamSynchronize((cudaStream_t)pool_->copy_stream());
+        }
+    };
+
+    size_t first = 0;
+    size_t cur_bytes = 0;
+    for (size_t i = 0; i < payloads.size(); ++i) {
+        const size_t n = payloads[i].bytes.size();
+        if (i > first && cur_bytes + n > max_batch_bytes) {
+            run_payload_batch(first, i, cur_bytes);
+            first = i;
+            cur_bytes = 0;
+        }
+        cur_bytes += n;
+    }
+    if (first < payloads.size()) {
+        run_payload_batch(first, payloads.size(), cur_bytes);
+    }
+    return nullptr;
 }
 
 
@@ -537,7 +1106,7 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
         // under it. Costs one ~240 KB memcpy/hit but eliminates the
         // cross-thread contention we'd hit holding the lock through
         // pool_->load.
-        {
+        if (host_chunk_cache_enabled()) {
             std::lock_guard<std::mutex> lk(*e.host_mu);
             if (p >= 0 && p < (int)host.chunks.size() &&
                 !host.chunks[p].empty()) {
@@ -555,6 +1124,9 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             // SSD-stream: pread chunk bytes into a pinned ring slot.
             const int64_t off  = e.chunk_file_offsets[p];
             const int64_t size = e.chunk_file_sizes[p];
+            const bool kernel_ready_source =
+                p < (int)e.chunk_file_kernel_ready.size() &&
+                e.chunk_file_kernel_ready[p] != 0;
             if ((size_t)size > host_ring_slot_bytes_) {
                 throw std::runtime_error(
                     "StreamllmRuntime::move_chunk: chunk size (" +
@@ -641,7 +1213,9 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
                 expected_disk_bytes = host.disk_bytes_per_chunk;
                 kernel_chunk_bytes  = host.bytes_per_chunk;
             }
-            if ((size_t)size != expected_disk_bytes) {
+            const size_t expected_source_bytes =
+                kernel_ready_source ? kernel_chunk_bytes : expected_disk_bytes;
+            if ((size_t)size != expected_source_bytes) {
                 throw std::runtime_error(
                     "StreamllmRuntime::move_chunk: SSD-stream plane size "
                     "doesn't match expected disk layout for " + wid +
@@ -659,7 +1233,8 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
                 // consumed by GGML, so SSD streaming is a raw copy. Encoded
                 // chunk families install a codec-aware disk->kernel
                 // transform below.
-                if (host.direct_matrix || host.direct_expert_block) {
+                if (kernel_ready_source ||
+                    host.direct_matrix || host.direct_expert_block) {
                     std::memcpy(xform_scratch.data(), dst, kernel_chunk_bytes);
                 } else if (host.disk_to_kernel_fn == nullptr) {
                     throw std::runtime_error(
@@ -678,7 +1253,7 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             // cache instead of re-preading. Eviction is the
             // scheduler's job (release_chunk_host under cap pressure);
             // here we just keep the bytes alive as a side effect.
-            {
+            if (host_chunk_cache_enabled()) {
                 DiagSpan _i(diag::MoveSite::HostCacheInsert);
                 std::lock_guard<std::mutex> lk(*e.host_mu);
                 if (p >= (int)host.chunks.size()) {

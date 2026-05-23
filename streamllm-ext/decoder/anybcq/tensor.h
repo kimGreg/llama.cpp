@@ -44,6 +44,11 @@ public:
                          StreamHandle stream) override;
     void after_evict   (int chunk_idx,
                          StreamHandle stream) override;
+    bool append_after_load_patch(int chunk_idx,
+                                 const void * device_ptr,
+                                 std::vector<PointerPatch> & out) override;
+    bool append_after_evict_patch(int chunk_idx,
+                                  std::vector<PointerPatch> & out) override;
 
     // ─── Encoder-private accessors ─────────────────────────────
     UpstreamLayoutHost &       host() override       { return host_; }

@@ -92,6 +92,12 @@ struct ChunkKeyHash {
     }
 };
 
+struct BatchLoadItem {
+    ChunkKey      key;
+    const void *  host_ptr = nullptr;
+    size_t        nbytes   = 0;
+};
+
 
 class VramChunkPool {
 public:
@@ -121,6 +127,18 @@ public:
     ChunkHandle load(const std::string & wid, int cid,
                      const void * host_ptr, size_t nbytes,
                      StreamHandle compute_stream = nullptr);
+
+    // Upload a packed list of non-resident chunks with one H2D copy.
+    // Conservative v1 semantics: the copy stream is synchronized before
+    // returning, so returned handles have ready_event == nullptr and callers
+    // can immediately enqueue pointer-table updates. Returns an empty vector
+    // if a contiguous span for the whole batch cannot be allocated.
+    std::vector<ChunkHandle> load_batch_sync(
+        const std::vector<BatchLoadItem> & items,
+        const void * packed_host,
+        size_t packed_nbytes,
+        StreamHandle compute_stream = nullptr);
+
 
     // Evict a chunk. No-op if not resident. Always evicts when resident
     // — pool does not track pin state.
@@ -189,6 +207,10 @@ public:
     // the chunk not already resident).
     size_t total_h2d_bytes() const { return total_h2d_bytes_; }
     size_t total_h2d_calls() const { return total_h2d_calls_; }
+    size_t batch_h2d_calls() const { return batch_h2d_calls_; }
+    size_t batch_h2d_bytes() const { return batch_h2d_bytes_; }
+    size_t batch_fallbacks() const { return batch_fallbacks_; }
+    void note_batch_fallback();
     // Reset the cumulative counters — useful between benchmark phases
     // (e.g. exclude install warmup from per-step streaming totals).
     void reset_stats();
@@ -227,6 +249,10 @@ public:
     size_t required_chunks() const;
     size_t resident_hits() const;
     size_t load_misses() const;
+    size_t prefill_required_chunks() const;
+    size_t prefill_resident_hits() const;
+    size_t decode_required_chunks() const;
+    size_t decode_resident_hits() const;
     size_t h2d_submitted_chunks() const { return total_h2d_calls(); }
     size_t redundant_h2d_skipped() const;
     size_t unexpected_h2d_for_resident() const;
@@ -236,6 +262,8 @@ public:
     // is how many were already in the pool.  Both bump in lock-step so
     // ``resident_hits + load_misses == required_chunks`` always holds.
     void note_required_set(size_t n_required, size_t n_resident);
+    void note_required_set_phase(size_t n_required, size_t n_resident,
+                                 bool decode_phase);
     // Bumped by ``move_chunk`` when the resident-skip fires.
     void note_redundant_h2d_skipped();
 
@@ -283,11 +311,18 @@ private:
     size_t peak_used_bytes_  = 0;
     size_t total_h2d_bytes_ = 0;
     size_t total_h2d_calls_ = 0;
+    size_t batch_h2d_bytes_ = 0;
+    size_t batch_h2d_calls_ = 0;
+    size_t batch_fallbacks_ = 0;
 
     // Residency-invariant atomics — see public accessors above.
     std::atomic<size_t> required_chunks_{0};
     std::atomic<size_t> resident_hits_{0};
     std::atomic<size_t> load_misses_{0};
+    std::atomic<size_t> prefill_required_chunks_{0};
+    std::atomic<size_t> prefill_resident_hits_{0};
+    std::atomic<size_t> decode_required_chunks_{0};
+    std::atomic<size_t> decode_resident_hits_{0};
     std::atomic<size_t> redundant_h2d_skipped_{0};
     std::atomic<size_t> unexpected_h2d_for_resident_{0};
 

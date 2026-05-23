@@ -573,11 +573,12 @@ llama_model_loader::llama_model_loader(
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
-            // streamllm-ext byte-blob tensors (named ``streamllm.bytes.*``)
-            // are consumed out-of-band by StreamllmRuntime — they never
+            // streamllm-ext byte-blob and physical bundle tensors are
+            // consumed out-of-band by StreamllmRuntime — they never
             // correspond to an arch-level ``create_tensor()`` call, so
             // skip them here to keep ``n_tensors`` matched to the arch.
-            if (tensor_name.rfind("streamllm.bytes.", 0) == 0) {
+            if (tensor_name.rfind("streamllm.bytes.", 0) == 0 ||
+                tensor_name.rfind("streamllm.bundle.", 0) == 0) {
                 continue;
             }
             // make sure there is no duplicated tensor names
@@ -690,11 +691,12 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset info of the main file.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
-            // streamllm-ext byte-blob tensors (named ``streamllm.bytes.*``)
-            // are consumed out-of-band by StreamllmRuntime — they never
+            // streamllm-ext byte-blob and physical bundle tensors are
+            // consumed out-of-band by StreamllmRuntime — they never
             // correspond to an arch-level ``create_tensor()`` call, so
             // skip them here to keep ``n_tensors`` matched to the arch.
-            if (tensor_name.rfind("streamllm.bytes.", 0) == 0) {
+            if (tensor_name.rfind("streamllm.bytes.", 0) == 0 ||
+                tensor_name.rfind("streamllm.bundle.", 0) == 0) {
                 continue;
             }
             // make sure there is no duplicated tensor names

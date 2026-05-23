@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "chunked_tensor.h"
 #include "computation.h"
 #include "scheduler.h"
 #include "stream_reader.h"
@@ -45,6 +46,7 @@ namespace anybcq { class AnyBCQFamilyTensor; }
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Framework-level cap on how many data chunks a managed tensor can have.
@@ -122,6 +124,8 @@ public:
     EventHandle move_chunk(const std::string & wid, int cid,
                            Tier src, Tier dst,
                            StreamHandle compute_stream = nullptr);
+    EventHandle move_chunks_batch(const std::vector<ChunkKey> & keys,
+                                  StreamHandle compute_stream = nullptr);
 
     // (chunk_matmul / chunk_matmul_batched moved out of core. Callers
     // now invoke the encoder-side helpers in
@@ -216,6 +220,11 @@ public:
     void register_chunk_io(const std::string & wid,
                            std::vector<int64_t> chunk_file_offsets,
                            std::vector<int64_t> chunk_file_sizes);
+    void register_chunk_io(const std::string & wid,
+                           std::vector<int64_t> chunk_file_offsets,
+                           std::vector<int64_t> chunk_file_sizes,
+                           std::vector<uint8_t> chunk_file_kernel_ready,
+                           std::vector<std::string> chunk_file_bundle);
 
 private:
     struct Entry {
@@ -241,7 +250,28 @@ private:
         // and no streaming is required.
         std::vector<int64_t> chunk_file_offsets;
         std::vector<int64_t> chunk_file_sizes;
+        std::vector<uint8_t> chunk_file_kernel_ready;
+        std::vector<std::string> chunk_file_bundle;
     };
+
+    struct PreparedChunkPayload {
+        ChunkKey key;
+        std::vector<uint8_t> bytes;
+    };
+
+    bool prepare_chunk_payload_(const std::string & wid, int cid,
+                                PreparedChunkPayload & out);
+    void prepare_chunk_payloads_batch_(
+        const std::vector<ChunkKey> & keys,
+        std::vector<PreparedChunkPayload> & payloads,
+        size_t & packed_bytes);
+    void finish_loaded_chunk_(const std::string & wid, int cid,
+                              void * device_ptr);
+    void finish_loaded_chunks_batch_(
+        const std::vector<std::pair<ChunkKey, void *>> & loaded);
+    void begin_deferred_pointer_clears_(StreamHandle stream);
+    void flush_deferred_pointer_clears_();
+    void cancel_deferred_pointer_clears_();
 
     std::unique_ptr<VramChunkPool> pool_;
     std::unique_ptr<Scheduler>     scheduler_;
@@ -271,6 +301,11 @@ private:
     std::vector<void *>            host_ring_slot_ptrs_; // one ptr per slot
     std::vector<EventHandle>       host_ring_events_;    // event from last use
     size_t                         host_ring_slot_bytes_ = 0;
+    void *                         batch_staging_ = nullptr;
+    size_t                         batch_staging_bytes_ = 0;
+    bool                           defer_pointer_clears_ = false;
+    StreamHandle                   deferred_clear_stream_ = nullptr;
+    std::vector<PointerPatch>      deferred_clear_patches_;
 
     // Atomic so multiple async pread worker threads can fetch_add their
     // own slot indices without locks. Slots are large enough (32) that

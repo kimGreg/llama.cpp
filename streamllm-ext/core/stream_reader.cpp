@@ -54,6 +54,12 @@ std::vector<std::string> get_arr_str(const gguf_context * ctx, const char * key)
     return out;
 }
 
+std::vector<std::string> get_arr_str_or_empty(const gguf_context * ctx,
+                                              const char * key) {
+    if (optional_key(ctx, key) < 0) return {};
+    return get_arr_str(ctx, key);
+}
+
 // Uniform-array helpers. The gguf-py writer emits streamllm.tensor.*.shape
 // as an INT64 array (from `add_array([n, m])`) and chunk_bytes as an INT32
 // array; probe the element type at runtime and convert.
@@ -90,6 +96,18 @@ std::vector<uint32_t> get_arr_u32(const gguf_context * ctx, const char * key) {
     out.reserve(v64.size());
     for (auto x : v64) out.push_back((uint32_t)x);
     return out;
+}
+
+std::vector<uint32_t> get_arr_u32_or_empty(const gguf_context * ctx,
+                                           const char * key) {
+    if (optional_key(ctx, key) < 0) return {};
+    return get_arr_u32(ctx, key);
+}
+
+std::vector<int64_t> get_arr_i64_or_empty(const gguf_context * ctx,
+                                          const char * key) {
+    if (optional_key(ctx, key) < 0) return {};
+    return get_arr_i64(ctx, key);
 }
 
 // Optional bool — returns ``fallback`` if the key is absent. The gguf
@@ -210,6 +228,52 @@ std::optional<StreamReader> StreamReader::from_gguf(const gguf_context * ctx,
         r.layouts_.emplace(name, std::move(layout));
     }
 
+    const auto bundles = get_arr_str_or_empty(ctx, "streamllm.bundle_tensors");
+    r.bundle_slices_.reserve(bundles.size() * 48);
+    for (const auto & bundle : bundles) {
+        const std::string prefix = "streamllm.bundle." + bundle + ".";
+        const auto wids    = get_arr_str(ctx, (prefix + "wids").c_str());
+        const auto cids    = get_arr_u32(ctx, (prefix + "cids").c_str());
+        const auto offsets = get_arr_i64(ctx, (prefix + "offsets").c_str());
+        const auto sizes   = get_arr_i64(ctx, (prefix + "sizes").c_str());
+        const auto fmt     = get_str_or(ctx, (prefix + "format").c_str(), "");
+        if (fmt != "kernel_ready") {
+            throw std::runtime_error(
+                "streamllm-ext: unsupported bundle format for '" + bundle +
+                "': " + fmt);
+        }
+        if (wids.size() != cids.size() || wids.size() != offsets.size() ||
+            wids.size() != sizes.size()) {
+            throw std::runtime_error(
+                "streamllm-ext: bundle '" + bundle +
+                "' metadata arrays have different lengths");
+        }
+        int64_t tid = gguf_find_tensor(ctx, bundle.c_str());
+        if (tid < 0) {
+            throw std::runtime_error(
+                "streamllm-ext: bundle tensor '" + bundle + "' not found");
+        }
+        const int64_t base =
+            (int64_t)(gguf_get_data_offset(ctx) + gguf_get_tensor_offset(ctx, tid));
+        const int64_t nbytes = (int64_t)gguf_get_tensor_size(ctx, tid);
+        for (size_t i = 0; i < wids.size(); ++i) {
+            if (offsets[i] < 0 || sizes[i] < 0 || offsets[i] + sizes[i] > nbytes) {
+                throw std::runtime_error(
+                    "streamllm-ext: bundle '" + bundle +
+                    "' has out-of-range slice for " + wids[i]);
+            }
+            BundleChunkSlice s;
+            s.wid = wids[i];
+            s.cid = cids[i];
+            s.offset = base + offsets[i];
+            s.size = sizes[i];
+            s.bundle = bundle;
+            s.kernel_ready = true;
+            r.bundle_slices_.emplace(s.wid + "#" + std::to_string(s.cid),
+                                     std::move(s));
+        }
+    }
+
     return r;
 }
 
@@ -225,6 +289,7 @@ void dump(const StreamReader & r) {
     std::printf("  required_runtime  = %s\n", g.required_runtime ? "true" : "false");
     std::printf("  executor          = %s\n", g.executor.empty() ? "(unset)" : g.executor.c_str());
     std::printf("  managed_tensors   = %zu names\n", r.managed_tensor_names().size());
+    std::printf("  bundle_slices     = %zu\n", r.bundle_slice_count());
     if (!r.gguf_path().empty()) {
         std::printf("  gguf_path         = %s\n", r.gguf_path().c_str());
     }

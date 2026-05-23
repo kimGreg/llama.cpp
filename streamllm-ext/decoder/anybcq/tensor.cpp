@@ -88,6 +88,62 @@ void AnyBCQFamilyTensor::after_evict(int chunk_idx, StreamHandle stream) {
                          plane_first, n_planes, stream);
 }
 
+bool AnyBCQFamilyTensor::append_after_load_patch(
+    int chunk_idx, const void * device_ptr, std::vector<PointerPatch> & out)
+{
+    if (device_ptr == nullptr || d_qw_ptrs_ == nullptr ||
+        d_alpha_ptrs_ == nullptr) {
+        return false;
+    }
+    if (chunk_idx < 0 || chunk_idx >= host_.n_chunks) return false;
+
+    PointerPatch patch;
+    patch.d_qw       = d_qw_ptrs_;
+    patch.d_alpha    = d_alpha_ptrs_;
+    patch.chunk_base = const_cast<void *>(device_ptr);
+
+    if (host_.any_precision) {
+        if (chunk_idx >= (int)host_.chunk_planes.size()) return false;
+        const auto & cp = host_.chunk_planes[chunk_idx];
+        patch.kind         = PointerPatchKind::SetAnyPrec;
+        patch.d_qbias_slot = d_qbias_slot_;
+        patch.plane_first  = cp.plane_idx_first;
+        patch.n_planes     = cp.n_planes_this_chunk;
+        patch.precision    = cp.precision_at_chunk;
+        patch.qw_bytes     = host_.qw_bytes_per_chunk;
+        patch.alpha_bytes  = host_.alpha_bytes_per_chunk;
+    } else {
+        patch.kind        = PointerPatchKind::SetSsAnybcq;
+        patch.plane_first = chunk_idx;
+        patch.n_planes    = 1;
+        patch.qw_bytes    = host_.qw_bytes_per_chunk;
+    }
+    out.push_back(patch);
+    return true;
+}
+
+bool AnyBCQFamilyTensor::append_after_evict_patch(
+    int chunk_idx, std::vector<PointerPatch> & out)
+{
+    if (d_qw_ptrs_ == nullptr || d_alpha_ptrs_ == nullptr) return false;
+    if (chunk_idx < 0 || chunk_idx >= host_.n_chunks) return false;
+
+    PointerPatch patch;
+    patch.kind        = PointerPatchKind::ClearPlanes;
+    patch.d_qw        = d_qw_ptrs_;
+    patch.d_alpha     = d_alpha_ptrs_;
+    patch.plane_first = chunk_idx;
+    patch.n_planes    = 1;
+    if (host_.any_precision) {
+        if (chunk_idx >= (int)host_.chunk_planes.size()) return false;
+        const auto & cp = host_.chunk_planes[chunk_idx];
+        patch.plane_first = cp.plane_idx_first;
+        patch.n_planes    = cp.n_planes_this_chunk;
+    }
+    out.push_back(patch);
+    return true;
+}
+
 void AnyBCQFamilyTensor::set_device_state(void ** d_qw_ptrs,
                                            void ** d_alpha_ptrs,
                                            void ** d_qbias_slot) {

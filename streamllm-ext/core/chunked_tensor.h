@@ -32,10 +32,33 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace streamllm_ext {
 
 struct UpstreamLayoutHost;
+
+enum class PointerPatchKind : uint8_t {
+    ClearPlanes = 0,
+    SetSsAnybcq = 1,
+    SetAnyPrec  = 2,
+};
+
+struct PointerPatch {
+    PointerPatchKind kind = PointerPatchKind::ClearPlanes;
+
+    void ** d_qw         = nullptr;
+    void ** d_alpha      = nullptr;
+    void ** d_qbias_slot = nullptr;
+
+    int plane_first      = 0;
+    int n_planes         = 0;
+    int precision        = 0;
+
+    void * chunk_base    = nullptr;
+    size_t qw_bytes      = 0;
+    size_t alpha_bytes   = 0;
+};
 
 // Per-chunk (per-tensor) ABC. The pool calls ``disk_to_kernel`` on
 // the SSD-stream path and ``after_load`` once the kernel-format
@@ -91,6 +114,28 @@ public:
     // and overlaps with subsequent loads) or ``nullptr`` on teardown.
     virtual void after_evict(int chunk_idx,
                               StreamHandle stream)         = 0;
+
+    // Optional fast path: append a data-only description of the
+    // pointer-table mutation that after_load / after_evict would perform.
+    // Runtime batch loaders can collect these descriptions and apply them
+    // with one CUDA launch. Returning false asks the runtime to use the
+    // virtual callback above, preserving old behavior for encoders that do
+    // not expose a patch representation.
+    virtual bool append_after_load_patch(int chunk_idx,
+                                         const void * device_ptr,
+                                         std::vector<PointerPatch> & out) {
+        (void) chunk_idx;
+        (void) device_ptr;
+        (void) out;
+        return false;
+    }
+
+    virtual bool append_after_evict_patch(int chunk_idx,
+                                          std::vector<PointerPatch> & out) {
+        (void) chunk_idx;
+        (void) out;
+        return false;
+    }
 };
 
 }  // namespace streamllm_ext
