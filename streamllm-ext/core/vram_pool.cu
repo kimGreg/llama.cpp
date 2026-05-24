@@ -414,6 +414,151 @@ std::vector<ChunkHandle> VramChunkPool::load_batch_sync(
     return out;
 }
 
+std::vector<ChunkHandle> VramChunkPool::load_batch_scattered_sync(
+    const std::vector<BatchLoadItem> & items,
+    StreamHandle compute_stream)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<ChunkHandle> out;
+    if (items.empty()) return out;
+
+    size_t total_bytes = 0;
+    for (const auto & item : items) {
+        if (item.host_ptr == nullptr || item.nbytes == 0) {
+            return {};
+        }
+        if (item.nbytes > capacity_bytes_) {
+            throw std::runtime_error(
+                "vram_pool: chunk (" + item.key.wid + "," +
+                std::to_string(item.key.cid) + ") size " +
+                std::to_string(item.nbytes) + " exceeds capacity " +
+                std::to_string(capacity_bytes_));
+        }
+        if (residents_.find(item.key) != residents_.end()) {
+            unexpected_h2d_for_resident_.fetch_add(
+                1, std::memory_order_relaxed);
+            return {};
+        }
+        total_bytes += item.nbytes;
+    }
+
+    std::vector<Slot> slots;
+    slots.reserve(items.size());
+    for (const auto & item : items) {
+        std::optional<size_t> off_opt = allocate_(item.nbytes);
+        if (!off_opt.has_value()) {
+            for (const auto & s : slots) {
+                free_(s.offset, s.nbytes);
+            }
+            return {};
+        }
+        slots.push_back(Slot{*off_opt, item.nbytes});
+    }
+
+    cudaStream_t stream = copy_stream_ == nullptr || force_sync_h2d_
+        ? (cudaStream_t)0
+        : (cudaStream_t)copy_stream_;
+    size_t copy_calls = 0;
+
+    try {
+        if (copy_stream_ != nullptr && !force_sync_h2d_) {
+            bool in_capture = false;
+            if (compute_stream != nullptr) {
+                auto cs = (cudaStream_t) compute_stream;
+                cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(cs, &status) == cudaSuccess &&
+                    status == cudaStreamCaptureStatusActive) {
+                    in_capture = true;
+                    if (!capture_fork_event_) {
+                        cudaEvent_t ev;
+                        check_cuda(
+                            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+                            "cudaEventCreate(fork)");
+                        capture_fork_event_ = (EventHandle) ev;
+                    }
+                    check_cuda(
+                        cudaEventRecord((cudaEvent_t)capture_fork_event_, cs),
+                        "cudaEventRecord(fork)");
+                    check_cuda(
+                        cudaStreamWaitEvent(stream, (cudaEvent_t)capture_fork_event_, 0),
+                        "cudaStreamWaitEvent(fork)");
+                }
+            }
+            if (!in_capture && latest_compute_event_) {
+                check_cuda(
+                    cudaStreamWaitEvent(stream, (cudaEvent_t)latest_compute_event_, 0),
+                    "cudaStreamWaitEvent(compute)");
+            }
+
+            size_t i = 0;
+            while (i < items.size()) {
+                size_t nbytes = items[i].nbytes;
+                size_t j = i + 1;
+                while (j < items.size() &&
+                       slots[j - 1].offset + slots[j - 1].nbytes ==
+                           slots[j].offset &&
+                       (const char *)items[j - 1].host_ptr + items[j - 1].nbytes ==
+                           (const char *)items[j].host_ptr) {
+                    nbytes += items[j].nbytes;
+                    ++j;
+                }
+                check_cuda(
+                    cudaMemcpyAsync((char *)arena_ + slots[i].offset,
+                                    items[i].host_ptr, nbytes,
+                                    cudaMemcpyHostToDevice, stream),
+                    "cudaMemcpyAsync(H2D batch scattered)");
+                ++copy_calls;
+                i = j;
+            }
+            check_cuda(cudaStreamSynchronize(stream),
+                       "cudaStreamSynchronize(H2D batch scattered)");
+        } else {
+            size_t i = 0;
+            while (i < items.size()) {
+                size_t nbytes = items[i].nbytes;
+                size_t j = i + 1;
+                while (j < items.size() &&
+                       slots[j - 1].offset + slots[j - 1].nbytes ==
+                           slots[j].offset &&
+                       (const char *)items[j - 1].host_ptr + items[j - 1].nbytes ==
+                           (const char *)items[j].host_ptr) {
+                    nbytes += items[j].nbytes;
+                    ++j;
+                }
+                check_cuda(
+                    cudaMemcpy((char *)arena_ + slots[i].offset,
+                               items[i].host_ptr, nbytes,
+                               cudaMemcpyHostToDevice),
+                    "cudaMemcpy(H2D batch scattered sync)");
+                ++copy_calls;
+                i = j;
+            }
+        }
+    } catch (...) {
+        for (const auto & s : slots) {
+            free_(s.offset, s.nbytes);
+        }
+        throw;
+    }
+
+    out.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        residents_.emplace(items[i].key,
+                           Resident{slots[i], nullptr, ChunkState::H2D_ISSUED});
+        out.push_back(ChunkHandle{
+            (char *)arena_ + slots[i].offset,
+            slots[i].nbytes,
+            nullptr,
+        });
+    }
+    total_h2d_bytes_ += total_bytes;
+    total_h2d_calls_ += copy_calls;
+    batch_h2d_bytes_ += total_bytes;
+    batch_h2d_calls_ += copy_calls;
+    if (used_bytes_ > peak_used_bytes_) peak_used_bytes_ = used_bytes_;
+    return out;
+}
+
 
 void VramChunkPool::reset_stats() {
     std::lock_guard<std::mutex> lk(mu_);
@@ -465,6 +610,24 @@ size_t VramChunkPool::redundant_h2d_skipped() const {
 }
 size_t VramChunkPool::unexpected_h2d_for_resident() const {
     return unexpected_h2d_for_resident_.load(std::memory_order_relaxed);
+}
+
+size_t VramChunkPool::largest_free_span_bytes() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t best = 0;
+    for (const auto & span : free_list_) {
+        if (span.nbytes > best) best = span.nbytes;
+    }
+    return best;
+}
+
+size_t VramChunkPool::free_bytes() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t total = 0;
+    for (const auto & span : free_list_) {
+        total += span.nbytes;
+    }
+    return total;
 }
 
 void VramChunkPool::note_required_set(size_t n_required, size_t n_resident) {

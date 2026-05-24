@@ -8,7 +8,7 @@
 //                  this comp's pinned buffers.  Called once at graph
 //                  recording time; replays re-fire the captured copies.
 //   plan()       — pure host.  Reads the pinned input buffers,
-//                  computes per-expert max gate score, asks the
+//                  computes per-expert batch gate-square sums, asks the
 //                  scheduler for a per-expert chunk plan, fills the
 //                  ``host_n_chunks_per_expert_`` array (size n_experts).
 //                  Returns the chunk-indexed load_set and required_set.
@@ -121,10 +121,18 @@ public:
     // Eager-mode device planner hook. The executor may compute the
     // per-expert chunk counts once per layer dispatch and share them
     // across gate/up/down planning. Values <= 0 mean inactive expert.
-    void use_external_chunk_plan(const int * chunks_per_expert) {
+    void use_external_chunk_plan(const int * chunks_per_expert,
+                                 const int * expert_order = nullptr,
+                                 int         n_order = 0) {
         external_chunks_per_expert_ = chunks_per_expert;
+        external_expert_order_ = expert_order;
+        external_expert_order_n_ = n_order;
     }
-    void clear_external_chunk_plan() { external_chunks_per_expert_ = nullptr; }
+    void clear_external_chunk_plan() {
+        external_chunks_per_expert_ = nullptr;
+        external_expert_order_ = nullptr;
+        external_expert_order_n_ = 0;
+    }
 
 private:
     StreamllmRuntime *           rt_         = nullptr;
@@ -160,6 +168,9 @@ private:
     // both the H2D and the chunks→planes conversion that populates
     // it.  Allocated here so it lives for the comp's lifetime.
     void    * prec_per_eid_d_           = nullptr;  // device, [n_experts × int]
+    float   * plan_dp_prev_d_           = nullptr;  // device, capture planner scratch
+    float   * plan_dp_cur_d_            = nullptr;  // device, capture planner scratch
+    uint8_t * plan_trace_d_             = nullptr;  // device, capture planner scratch
 
     int max_n_tokens_ = 0;
     int max_n_used_   = 0;
@@ -175,6 +186,8 @@ private:
     bool have_renorm_weights_ = false;
 
     const int * external_chunks_per_expert_ = nullptr;
+    const int * external_expert_order_ = nullptr;
+    int         external_expert_order_n_ = 0;
 };
 
 // Free-fn lookup the dispatch shim uses to find a comp from a canonical

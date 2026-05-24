@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>   // getenv (STREAMLLM_VIOLATION_DUMP)
@@ -40,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace streamllm_ext { namespace qwen3 {
@@ -69,6 +71,10 @@ void MoEAnyBcqExecutor::free_dynamic_plan_()
 {
     if (dynamic_plan_.chunks_d)  cudaFree(dynamic_plan_.chunks_d);
     if (dynamic_plan_.chunks_h)  cudaFreeHost(dynamic_plan_.chunks_h);
+    if (dynamic_plan_.expert_order_d) cudaFree(dynamic_plan_.expert_order_d);
+    if (dynamic_plan_.expert_order_h) cudaFreeHost(dynamic_plan_.expert_order_h);
+    if (dynamic_plan_.n_active_d) cudaFree(dynamic_plan_.n_active_d);
+    if (dynamic_plan_.n_active_h) cudaFreeHost(dynamic_plan_.n_active_h);
     if (dynamic_plan_.dp_prev_d) cudaFree(dynamic_plan_.dp_prev_d);
     if (dynamic_plan_.dp_cur_d)  cudaFree(dynamic_plan_.dp_cur_d);
     if (dynamic_plan_.trace_d)   cudaFree(dynamic_plan_.trace_d);
@@ -88,6 +94,7 @@ bool MoEAnyBcqExecutor::ensure_dynamic_plan_(int n_experts, int B1)
     dynamic_plan_.n_experts = n_experts;
     dynamic_plan_.B1 = B1;
     const size_t chunks_bytes = (size_t) n_experts * sizeof(int);
+    const size_t n_active_bytes = sizeof(int);
     const size_t dp_bytes = (size_t) B1 * sizeof(float);
     const size_t trace_bytes = (size_t) n_experts * (size_t) B1 * sizeof(uint8_t);
 
@@ -96,6 +103,13 @@ bool MoEAnyBcqExecutor::ensure_dynamic_plan_(int n_experts, int B1)
         return false;
     }
     if (cudaMallocHost((void **) &dynamic_plan_.chunks_h, chunks_bytes) != cudaSuccess) {
+        free_dynamic_plan_();
+        return false;
+    }
+    if (cudaMalloc((void **) &dynamic_plan_.expert_order_d, chunks_bytes) != cudaSuccess ||
+        cudaMallocHost((void **) &dynamic_plan_.expert_order_h, chunks_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &dynamic_plan_.n_active_d, n_active_bytes) != cudaSuccess ||
+        cudaMallocHost((void **) &dynamic_plan_.n_active_h, n_active_bytes) != cudaSuccess) {
         free_dynamic_plan_();
         return false;
     }
@@ -324,6 +338,9 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
     int                    layer_idx)
 {
     cudaStream_t stream = (cudaStream_t) stream_h;
+    const bool decode_phase = n_tokens == 1;
+    launch_diag::set_current_decode_phase(decode_phase);
+    qwen3::scheduler_note_moe_layer(rt_->scheduler(), decode_phase, layer_idx);
 
     auto set_in = [&](qwen3::MoEInput & io,
                        const ggml_tensor * src1,
@@ -468,6 +485,8 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                     n_expert_in_probs,
                     gate_comp.n_chunks_max(),
                     dynamic_plan_.chunks_d,
+                    dynamic_plan_.expert_order_d,
+                    dynamic_plan_.n_active_d,
                     dynamic_plan_.dp_prev_d,
                     dynamic_plan_.dp_cur_d,
                     dynamic_plan_.trace_d,
@@ -478,12 +497,165 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                                 (size_t) n_expert_in_probs * sizeof(int),
                                 cudaMemcpyDeviceToHost,
                                 stream);
+                launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
+                cudaMemcpyAsync(dynamic_plan_.expert_order_h,
+                                dynamic_plan_.expert_order_d,
+                                (size_t) n_expert_in_probs * sizeof(int),
+                                cudaMemcpyDeviceToHost,
+                                stream);
+                launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
+                cudaMemcpyAsync(dynamic_plan_.n_active_h,
+                                dynamic_plan_.n_active_d,
+                                sizeof(int),
+                                cudaMemcpyDeviceToHost,
+                                stream);
                 launch_diag::note_stream_sync();
                 const cudaError_t sync_err = cudaStreamSynchronize(stream);
                 if (sync_err == cudaSuccess) {
-                    gate_comp.use_external_chunk_plan(dynamic_plan_.chunks_h);
-                    up_comp.use_external_chunk_plan(dynamic_plan_.chunks_h);
-                    down_comp.use_external_chunk_plan(dynamic_plan_.chunks_h);
+                    int n_external_order =
+                        dynamic_plan_.n_active_h != nullptr ?
+                        dynamic_plan_.n_active_h[0] : 0;
+                    if (n_external_order < 0) n_external_order = 0;
+                    if (n_external_order > n_expert_in_probs) {
+                        n_external_order = n_expert_in_probs;
+                    }
+                    if (const char * cmp_env =
+                            std::getenv("STREAMLLM_COMPARE_GPU_CPU_PLANNER")) {
+                        if (cmp_env[0] && cmp_env[0] != '0') {
+                            std::vector<int32_t> ids_h(
+                                (size_t) n_tokens * (size_t) n_used);
+                            cudaMemcpy2D(ids_h.data(),
+                                         (size_t) n_used * sizeof(int32_t),
+                                         ids->data, ids_row_stride,
+                                         (size_t) n_used * sizeof(int32_t),
+                                         (size_t) n_tokens,
+                                         cudaMemcpyDeviceToHost);
+
+                            std::vector<float> weights_h;
+                            if (weights != nullptr && weights->data != nullptr) {
+                                weights_h.resize(
+                                    (size_t) n_tokens * (size_t) n_used);
+                                cudaMemcpy2D(weights_h.data(),
+                                             (size_t) n_used * sizeof(float),
+                                             weights->data, weights_row_stride,
+                                             (size_t) n_used * sizeof(float),
+                                             (size_t) n_tokens,
+                                             cudaMemcpyDeviceToHost);
+                            }
+
+                            std::vector<float> probs_h;
+                            if (weights_h.empty() &&
+                                probs != nullptr && probs->data != nullptr) {
+                                probs_h.resize((size_t) n_tokens *
+                                               (size_t) n_expert_in_probs);
+                                cudaMemcpy2D(probs_h.data(),
+                                             (size_t) n_expert_in_probs * sizeof(float),
+                                             probs->data, probs_row_stride,
+                                             (size_t) n_expert_in_probs * sizeof(float),
+                                             (size_t) n_tokens,
+                                             cudaMemcpyDeviceToHost);
+                            }
+
+                            std::unordered_map<int, float> gate_sq_sum_by_expert;
+                            std::vector<int> unique_experts;
+                            gate_sq_sum_by_expert.reserve((size_t) n_used * 4);
+                            unique_experts.reserve((size_t) n_used * 4);
+                            for (int t = 0; t < n_tokens; ++t) {
+                                for (int u = 0; u < n_used; ++u) {
+                                    const int eid =
+                                        ids_h[(size_t) t * n_used + u];
+                                    if (eid < 0 || eid >= n_expert_in_probs) {
+                                        continue;
+                                    }
+                                    float g;
+                                    if (!weights_h.empty()) {
+                                        g = weights_h[(size_t) t * n_used + u];
+                                    } else if (!probs_h.empty()) {
+                                        g = probs_h[(size_t) t *
+                                                    n_expert_in_probs + eid];
+                                    } else {
+                                        g = 0.45f - 0.05f * (float) u;
+                                        if (g < 0.05f) g = 0.05f;
+                                    }
+                                    const float g2 = g * g;
+                                    auto it = gate_sq_sum_by_expert.find(eid);
+                                    if (it == gate_sq_sum_by_expert.end()) {
+                                        gate_sq_sum_by_expert.emplace(eid, g2);
+                                        unique_experts.push_back(eid);
+                                    } else {
+                                        it->second += g2;
+                                    }
+                                }
+                            }
+
+                            std::vector<float> gates(unique_experts.size());
+                            for (size_t i = 0; i < unique_experts.size(); ++i) {
+                                gates[i] = std::sqrt(std::max(
+                                    0.0f, gate_sq_sum_by_expert[unique_experts[i]]));
+                            }
+                            std::vector<int> cpu_K;
+                            const bool cpu_ok =
+                                qwen3::scheduler_allocate_dispatch_budget(
+                                    rt_->scheduler(), layer_idx,
+                                    unique_experts, gates, cpu_K);
+                            int mismatch = 0;
+                            int first_e = -1;
+                            int first_cpu = -1;
+                            int first_gpu = -1;
+                            long cpu_sum = 0;
+                            long gpu_sum = 0;
+                            std::vector<int> cpu_by_eid(
+                                (size_t) n_expert_in_probs, 0);
+                            if (cpu_ok) {
+                                for (size_t i = 0; i < unique_experts.size(); ++i) {
+                                    const int eid = unique_experts[i];
+                                    cpu_by_eid[(size_t) eid] = cpu_K[i];
+                                    cpu_sum += cpu_K[i];
+                                }
+                            }
+                            for (int eid = 0; eid < n_expert_in_probs; ++eid) {
+                                const int c = cpu_by_eid[(size_t) eid];
+                                const int g = dynamic_plan_.chunks_h[eid];
+                                gpu_sum += g;
+                                if (c != g) {
+                                    ++mismatch;
+                                    if (first_e < 0) {
+                                        first_e = eid;
+                                        first_cpu = c;
+                                        first_gpu = g;
+                                    }
+                                }
+                            }
+                            static std::atomic<int> cmp_prints{0};
+                            const int print_idx =
+                                cmp_prints.fetch_add(1, std::memory_order_relaxed);
+                            if (mismatch != 0 || print_idx < 8) {
+                                std::fprintf(stderr,
+                                    "streamllm-planner-compare L=%d tok=%d "
+                                    "active=%zu cpu_ok=%d mismatch=%d "
+                                    "cpu_sum=%ld gpu_sum=%ld first_e=%d "
+                                    "cpu=%d gpu=%d strides ids=%zu weights=%zu "
+                                    "probs=%zu\n",
+                                    layer_idx, n_tokens, unique_experts.size(),
+                                    cpu_ok ? 1 : 0, mismatch, cpu_sum, gpu_sum,
+                                    first_e, first_cpu, first_gpu,
+                                    ids_row_stride, weights_row_stride,
+                                    probs_row_stride);
+                            }
+                        }
+                    }
+                    gate_comp.use_external_chunk_plan(
+                        dynamic_plan_.chunks_h,
+                        dynamic_plan_.expert_order_h,
+                        n_external_order);
+                    up_comp.use_external_chunk_plan(
+                        dynamic_plan_.chunks_h,
+                        dynamic_plan_.expert_order_h,
+                        n_external_order);
+                    down_comp.use_external_chunk_plan(
+                        dynamic_plan_.chunks_h,
+                        dynamic_plan_.expert_order_h,
+                        n_external_order);
                     plan_gate = gate_comp.plan(in_gate);
                     plan_up   = up_comp.plan(in_up);
                     plan_down = down_comp.plan(in_down);
@@ -505,39 +677,79 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
         //    Each canonical's pre_inputs writes to its own pinned arrays;
         //    we're issuing 3× D2H_ids + 3× D2H_probs + 3× D2H_weights but
         //    serialised on one stream and followed by ONE sync.
-        for (auto & c : canon) {
-            for (auto & m : c.comp->pre_inputs(*c.in)) {
-                if (m.bytes == 0) continue;
-                if (m.is_2d) {
-                    launch_diag::note_launch(launch_diag::Kind::Memcpy2DAsync);
-                    cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
-                        m.device_src, m.src_pitch,
-                        m.bytes, m.height,
-                        cudaMemcpyDeviceToHost, stream);
-                } else {
-                    launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
-                    cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
-                        cudaMemcpyDeviceToHost, stream);
+        {
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::PreInputsD2H, decode_phase);
+            for (auto & c : canon) {
+                for (auto & m : c.comp->pre_inputs(*c.in)) {
+                    if (m.bytes == 0) continue;
+                    if (m.is_2d) {
+                        launch_diag::note_launch(launch_diag::Kind::Memcpy2DAsync);
+                        cudaMemcpy2DAsync(m.host_dst, m.dst_pitch,
+                            m.device_src, m.src_pitch,
+                            m.bytes, m.height,
+                            cudaMemcpyDeviceToHost, stream);
+                    } else {
+                        launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
+                        cudaMemcpyAsync(m.host_dst, m.device_src, m.bytes,
+                            cudaMemcpyDeviceToHost, stream);
+                    }
                 }
             }
+
+            // ── Phase 0b: single sync — host now sees the routed ids/probs/
+            //    weights for every comp.
+            launch_diag::note_stream_sync();
+            cudaStreamSynchronize(stream);
         }
 
-        // ── Phase 0b: single sync — host now sees the routed ids/probs/
-        //    weights for every comp.
-        launch_diag::note_stream_sync();
-        cudaStreamSynchronize(stream);
-
         // ── Phase 0c: plan all three.
-        plan_gate = gate_comp.plan(in_gate);
-        plan_up   = up_comp.plan(in_up);
-        plan_down = down_comp.plan(in_down);
+        {
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::Plan, decode_phase);
+            plan_gate = gate_comp.plan(in_gate);
+            plan_up   = up_comp.plan(in_up);
+            plan_down = down_comp.plan(in_down);
+        }
         }
 
         auto count_residency = [&](const ChunkPlan & pl) {
             if (pl.required_set.empty()) return;
             size_t hits = 0;
+            static std::mutex cache_trace_mu;
+            static FILE * cache_trace_fp = []() -> FILE * {
+                const char * path = std::getenv("STREAMLLM_CACHE_TRACE_FILE");
+                if (path == nullptr || path[0] == '\0') return nullptr;
+                FILE * fp = std::fopen(path, "w");
+                if (fp != nullptr) {
+                    std::fprintf(fp, "#seq phase cid bytes resident wid\n");
+                }
+                return fp;
+            }();
+            static std::atomic<uint64_t> cache_trace_seq{0};
             for (const auto & k : pl.required_set) {
-                if (rt_->pool().is_resident(k.wid, k.cid)) ++hits;
+                const bool resident = rt_->pool().is_resident(k.wid, k.cid);
+                if (resident) ++hits;
+                launch_diag::note_required_chunk(n_tokens == 1,
+                                                 k.cid, resident);
+                if (cache_trace_fp != nullptr) {
+                    size_t bytes = 0;
+                    if (cid_is_chunk(k.cid)) {
+                        ChunkedTensor * tensor = rt_->tensor(k.wid);
+                        const int p = cid_chunk_index(k.cid);
+                        if (tensor != nullptr && p >= 0) {
+                            bytes = tensor->kernel_bytes(p);
+                        }
+                    }
+                    const uint64_t seq = cache_trace_seq.fetch_add(
+                        1, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lk(cache_trace_mu);
+                    std::fprintf(cache_trace_fp, "%lu %c %d %zu %d %s\n",
+                                 (unsigned long)seq,
+                                 n_tokens == 1 ? 'D' : 'P',
+                                 k.cid, bytes, resident ? 1 : 0,
+                                 k.wid.c_str());
+                }
             }
             rt_->pool().note_required_set_phase(pl.required_set.size(), hits,
                                                 n_tokens == 1);
@@ -553,9 +765,13 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                     rt_->scheduler(), k.wid, k.cid);
             }
         };
-        reserve_plan(plan_gate);
-        reserve_plan(plan_up);
-        reserve_plan(plan_down);
+        {
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::Reserve, decode_phase);
+            reserve_plan(plan_gate);
+            reserve_plan(plan_up);
+            reserve_plan(plan_down);
+        }
 
         // ── Phase 0e: submit the union of all three load_sets as a
         //    single batch.  Gate/up/down canonical names are distinct
@@ -575,6 +791,8 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
             const char * batch_env = std::getenv("STREAMLLM_BATCH_CHUNK_LOAD");
             const bool batch_on =
                 batch_env != nullptr && batch_env[0] && batch_env[0] != '0';
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::Load, decode_phase);
             if (batch_on) {
                 std::vector<ChunkKey> missing;
                 missing.reserve(union_size);
@@ -582,7 +800,11 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                 auto collect_plan = [&](const ChunkPlan & pl) {
                     for (const auto & k : pl.load_set) {
                         if (rt_->pool().is_resident(k.wid, k.cid)) continue;
-                        if (seen.insert(k).second) missing.push_back(k);
+                        if (seen.insert(k).second) {
+                            missing.push_back(k);
+                            launch_diag::note_unique_load_chunk(
+                                n_tokens == 1, k.cid);
+                        }
                     }
                 };
                 collect_plan(plan_gate);
@@ -681,9 +903,15 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
         }
 
         // ── Phase 0f: validate all three.
-        if (!validate_required_set_(plan_gate, stream_h) ||
-            !validate_required_set_(plan_up,   stream_h) ||
-            !validate_required_set_(plan_down, stream_h))
+        bool valid = false;
+        {
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::Validate, decode_phase);
+            valid = validate_required_set_(plan_gate, stream_h) &&
+                    validate_required_set_(plan_up,   stream_h) &&
+                    validate_required_set_(plan_down, stream_h);
+        }
+        if (!valid)
         {
             release_all();
             std::fprintf(stderr,
@@ -781,35 +1009,43 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
     }
 
     // ── Phase 1+2: Gate + Up matmul, each as its own launch.
-    gate_comp.execute(in_gate, out_gate, stream_h);
-    if (do_dump) dump_buf("gate_out_t0u0", slot_a_data, n_ff);
-    up_comp.execute(in_up, out_up, stream_h);
-    if (do_dump) dump_buf("up_out_t0u0",   slot_b_data, n_ff);
-
-    // ── Phase 3: gated activation: slot_b ← act(slot_a) * slot_b.
     {
-        const size_t N_swiglu =
-            (size_t) n_tokens * (size_t) n_used * (size_t) n_ff;
-        qwen3::launch_swiglu_mul(
+        launch_diag::PhaseTimer _pt(
+            launch_diag::Phase::Execute, decode_phase);
+        gate_comp.execute(in_gate, out_gate, stream_h);
+        if (do_dump) dump_buf("gate_out_t0u0", slot_a_data, n_ff);
+        up_comp.execute(in_up, out_up, stream_h);
+        if (do_dump) dump_buf("up_out_t0u0",   slot_b_data, n_ff);
+
+        // ── Phase 3: gated activation: slot_b ← act(slot_a) * slot_b.
+        {
+            const size_t N_swiglu =
+                (size_t) n_tokens * (size_t) n_used * (size_t) n_ff;
+            qwen3::launch_swiglu_mul(
+                (const float *) slot_a_data,
+                (const float *) slot_b_data,
+                (float *)       slot_b_data,
+                N_swiglu, stream_h, activation_);
+        }
+        if (do_dump) dump_buf("gated_t0u0",    slot_b_data, n_ff);
+        // ── Phase 4: Down matmul → slot_a (reused buffer).
+        down_comp.execute(in_down, out_down, stream_h);
+        if (do_dump) dump_buf("down_out_t0u0", slot_a_data, n_embd);
+        // ── Phase 5: weighted reduce slot_a → layer_out.
+        qwen3::launch_weighted_reduce_slots(
             (const float *) slot_a_data,
-            (const float *) slot_b_data,
-            (float *)       slot_b_data,
-            N_swiglu, stream_h, activation_);
+            (const float *) weights->data,
+            (float *)       layer_out->data,
+            n_tokens, n_used, n_embd, stream_h);
+        if (do_dump) dump_buf("layer_out_t0",  layer_out->data, n_embd);
     }
-    if (do_dump) dump_buf("gated_t0u0",    slot_b_data, n_ff);
-    // ── Phase 4: Down matmul → slot_a (reused buffer).
-    down_comp.execute(in_down, out_down, stream_h);
-    if (do_dump) dump_buf("down_out_t0u0", slot_a_data, n_embd);
-    // ── Phase 5: weighted reduce slot_a → layer_out.
-    qwen3::launch_weighted_reduce_slots(
-        (const float *) slot_a_data,
-        (const float *) weights->data,
-        (float *)       layer_out->data,
-        n_tokens, n_used, n_embd, stream_h);
-    if (do_dump) dump_buf("layer_out_t0",  layer_out->data, n_embd);
 
     // ── Phase 6: release the union of reserved chunks.
-    release_all();
+    {
+        launch_diag::PhaseTimer _pt(
+            launch_diag::Phase::Release, decode_phase);
+        release_all();
+    }
     return true;
 }
 

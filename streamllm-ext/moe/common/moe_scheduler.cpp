@@ -435,6 +435,7 @@ public:
             dynamic_kbar_.store((float)std::atof(s),
                                    std::memory_order_relaxed);
         }
+        init_phase_schedule_();
 
         // Eagerly build all per-canonical MoeExpertTable instances now,
         // so the first mul_mat_id hook call doesn't pay the build cost
@@ -600,7 +601,11 @@ public:
         if (desired > P)  desired = P;
 
         for (int p = 0; p < desired; ++p) {
-            tracker_.touch(synthetic, cid_chunk(p), p);
+            if (logical_cache_age_) {
+                tracker_.touch_at(synthetic, cid_chunk(p), p, cache_epoch_);
+            } else {
+                tracker_.touch(synthetic, cid_chunk(p), p);
+            }
         }
         // Host LRU touch — uses the per-chunk byte sizes captured at
         // install (per_chunk_bytes_anyprec_) so cap accounting reflects
@@ -683,7 +688,11 @@ public:
         // hit branch, otherwise cached plans (the >99% post-warmup case)
         // would never refresh tracker positions.
         for (int p = 0; p < desired; ++p) {
-            tracker_.touch(synthetic, cid_chunk(p), p);
+            if (logical_cache_age_) {
+                tracker_.touch_at(synthetic, cid_chunk(p), p, cache_epoch_);
+            } else {
+                tracker_.touch(synthetic, cid_chunk(p), p);
+            }
         }
         // Host (DRAM) LRU touch — only when a cap is active. Each
         // (synthetic, cid) admitted to the LRU contributes
@@ -755,14 +764,24 @@ public:
 
   public:
     bool make_room_for(VramChunkPool & pool,
-                        size_t /*nbytes_needed*/) override {
-        // Single victim per call — runtime retries until the load
-        // succeeds or this returns false. Passing rt_ lets the tracker
-        // also clear the entry's per-plane device-pointer slot so the
-        // kernel doesn't read stale memory after the freed VRAM slot
-        // gets reused. ``*this`` carries the replay-reservation set
-        // the tracker consults to skip chunks still in-flight.
-        return tracker_.make_room(pool, *rt_, *this);
+                        size_t nbytes_needed) override {
+        // Preserve the tracker policy, but avoid the runtime-level
+        // allocate/fail/retry loop for contiguous batch loads.  Each
+        // iteration still asks the tracker for the next single victim in
+        // policy order; this just performs enough of those evictions in
+        // one scheduler call to satisfy the requested arena span.
+        if (nbytes_needed == 0) {
+            return tracker_.make_room(pool, *rt_, *this);
+        }
+
+        bool made_progress = false;
+        while (pool.largest_free_span_bytes() < nbytes_needed) {
+            if (!tracker_.make_room(pool, *rt_, *this)) {
+                return made_progress;
+            }
+            made_progress = true;
+        }
+        return made_progress;
     }
 
     void reserve_for_dispatch(const std::string & wid, int cid) {
@@ -773,6 +792,26 @@ public:
     }
     void touch_resident(const std::string & wid, int cid, int plane) {
         tracker_.touch(wid, cid, plane);
+    }
+
+    void note_moe_layer(bool decode_phase, int layer_idx) {
+        if (!logical_cache_age_) return;
+        if (layer_idx < 0) return;
+        const uint64_t n_layers =
+            dynamic_n_layers_ > 0 ? (uint64_t)dynamic_n_layers_ : 64ull;
+        if (!decode_phase) {
+            cache_in_decode_ = false;
+            cache_decode_token_ = 0;
+            cache_last_layer_ = layer_idx;
+            cache_epoch_ = (uint64_t)layer_idx;
+            return;
+        }
+        if (!cache_in_decode_ || layer_idx <= cache_last_layer_) {
+            ++cache_decode_token_;
+        }
+        cache_in_decode_ = true;
+        cache_last_layer_ = layer_idx;
+        cache_epoch_ = cache_decode_token_ * n_layers + (uint64_t)layer_idx;
     }
 
     const MoeExpertTable * moe_expert_table(
@@ -947,6 +986,8 @@ public:
     void on_graph_compute_begin(StreamHandle compute_stream,
                                  const struct ggml_cgraph * cgraph) override {
         if (rt_ == nullptr || cgraph == nullptr) return;
+
+        update_schedule_for_graph_(cgraph);
 
         // Snapshot KBar + version once per cgraph_compute. The version
         // is read by ggml-cuda's graph-cache predicate so a dial swap
@@ -1233,7 +1274,11 @@ public:
         if (t > (long) n * K_max) t = (long) n * K_max;
         const int target = (int) t;
 
-        // Pre-compute the cost table  C[i, K] = gᵢ² · R[L, eᵢ, K]
+        // Pre-compute the cost table  C[i, K] = Sᵢ · R[L, eᵢ, K],
+        // where Sᵢ is the batch-aggregated sum of squared gate scores for
+        // expert eᵢ.  Older call sites passed a single gate g and relied on
+        // the square below; current batch semantics pass sqrt(Sᵢ), so this
+        // multiplication remains the single cost definition.
         // for K ∈ [K_min, K_max].  Hot-loop access is contiguous over K.
         thread_local std::vector<float> tls_C;
         tls_C.assign((size_t) n * n_K, 0.0f);
@@ -1400,6 +1445,22 @@ private:
         if (!s || !s[0]) return fallback;
         return (float)std::atof(s);
     }
+    static bool read_float_env_opt(const char * name, float & out) {
+        const char * s = getenv(name);
+        if (!s || !s[0]) return false;
+        out = (float)std::atof(s);
+        return true;
+    }
+    static int64_t read_i64_env(const char * name, int64_t fallback) {
+        const char * s = getenv(name);
+        if (!s || !s[0]) return fallback;
+        return (int64_t)std::atoll(s);
+    }
+    static uint64_t read_u64_env(const char * name, uint64_t fallback) {
+        const char * s = getenv(name);
+        if (!s || !s[0]) return fallback;
+        return (uint64_t)std::strtoull(s, nullptr, 10);
+    }
     static std::vector<int> build_chunks(int n) {
         std::vector<int> out;
         out.reserve(n + 1);
@@ -1409,6 +1470,117 @@ private:
     }
 
     StreamllmRuntime * rt_ = nullptr;
+
+    void init_phase_schedule_() {
+        const float base = dynamic_kbar_.load(std::memory_order_relaxed);
+        bool any = false;
+        float v = 0.0f;
+        if (read_float_env_opt("STREAMLLM_KBAR_PP_BEGIN", v)) {
+            schedule_pp_begin_ = v; any = true;
+        } else {
+            schedule_pp_begin_ = base;
+        }
+        if (read_float_env_opt("STREAMLLM_KBAR_PP_END", v)) {
+            schedule_pp_end_ = v; any = true;
+        } else {
+            schedule_pp_end_ = schedule_pp_begin_;
+        }
+        if (read_float_env_opt("STREAMLLM_KBAR_TG_BEGIN", v)) {
+            schedule_tg_begin_ = v; any = true;
+        } else {
+            schedule_tg_begin_ = base;
+        }
+        if (read_float_env_opt("STREAMLLM_KBAR_TG_END", v)) {
+            schedule_tg_end_ = v; any = true;
+        } else {
+            schedule_tg_end_ = schedule_tg_begin_;
+        }
+        schedule_tg_decay_start_ =
+            read_u64_env("STREAMLLM_KBAR_TG_DECAY_START", 0);
+        schedule_tg_decay_end_ =
+            read_u64_env("STREAMLLM_KBAR_TG_DECAY_END",
+                         schedule_tg_decay_start_);
+        schedule_pp_end_token_ =
+            read_u64_env("STREAMLLM_KBAR_PP_DECAY_END", 0);
+        if (std::getenv("STREAMLLM_KBAR_TG_DECAY_START") ||
+            std::getenv("STREAMLLM_KBAR_TG_DECAY_END") ||
+            std::getenv("STREAMLLM_KBAR_PP_DECAY_END")) {
+            any = true;
+        }
+        phase_schedule_enabled_ = any;
+        schedule_last_kbar_ = base;
+        if (phase_schedule_enabled_) {
+            std::fprintf(stderr,
+                "streamllm-scheduler[moe]: KBar schedule PP %.3f->%.3f "
+                "TG %.3f->%.3f decay=[%lu,%lu] pp_end=%lu\n",
+                (double)schedule_pp_begin_, (double)schedule_pp_end_,
+                (double)schedule_tg_begin_, (double)schedule_tg_end_,
+                (unsigned long)schedule_tg_decay_start_,
+                (unsigned long)schedule_tg_decay_end_,
+                (unsigned long)schedule_pp_end_token_);
+        }
+    }
+
+    void update_schedule_for_graph_(const struct ggml_cgraph * cgraph) {
+        if (!phase_schedule_enabled_ || cgraph == nullptr) return;
+        int n_tokens = 0;
+        const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node =
+                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
+            if (node == nullptr) continue;
+            if (std::strncmp(node->name, "streamllm.moe_layer_", 20) != 0) {
+                continue;
+            }
+            const ggml_tensor * cur = node->src[0];
+            if (cur != nullptr) {
+                n_tokens = (int) cur->ne[1];
+            }
+            break;
+        }
+        if (n_tokens <= 0) return;
+
+        float next = dynamic_kbar_.load(std::memory_order_relaxed);
+        if (n_tokens > 1) {
+            const uint64_t span = (uint64_t) n_tokens;
+            const double mid = (double) schedule_prefill_seen_tokens_
+                             + 0.5 * (double) span;
+            const double end = schedule_pp_end_token_ > 0
+                ? (double) schedule_pp_end_token_
+                : (double) schedule_prefill_seen_tokens_ + (double) span;
+            const double denom = end > 0.0 ? end : 1.0;
+            double a = mid / denom;
+            if (a < 0.0) a = 0.0;
+            if (a > 1.0) a = 1.0;
+            next = schedule_pp_begin_
+                + (schedule_pp_end_ - schedule_pp_begin_) * (float)a;
+            schedule_prefill_seen_tokens_ += span;
+            schedule_in_decode_ = false;
+        } else {
+            const uint64_t tok0 = schedule_tg_token_;
+            double a = 0.0;
+            if (schedule_tg_decay_end_ > schedule_tg_decay_start_) {
+                a = ((double)tok0 - (double)schedule_tg_decay_start_) /
+                    ((double)schedule_tg_decay_end_ -
+                     (double)schedule_tg_decay_start_);
+                if (a < 0.0) a = 0.0;
+                if (a > 1.0) a = 1.0;
+            } else if (tok0 >= schedule_tg_decay_start_) {
+                a = 1.0;
+            }
+            next = schedule_tg_begin_
+                + (schedule_tg_end_ - schedule_tg_begin_) * (float)a;
+            ++schedule_tg_token_;
+            schedule_in_decode_ = true;
+        }
+
+        if (!(next >= 0.0f)) return;
+        if (std::fabs(next - schedule_last_kbar_) > 1.0e-6f) {
+            dial_version_.fetch_add(1, std::memory_order_relaxed);
+        }
+        schedule_last_kbar_ = next;
+        dynamic_kbar_.store(next, std::memory_order_relaxed);
+    }
 
     // Score-threshold table.  Length n_score_tiers_ = max n_chunks
     // across managed tensors; score_thresholds_[k] is the lower-edge
@@ -1423,6 +1595,19 @@ private:
     int                  dynamic_K_max_     = 0;
     std::atomic<float>   dynamic_kbar_{0.0f};
     qwen3::KBarAllocatorMode    kbar_allocator_mode_{qwen3::KBarAllocatorMode::Profile};
+
+    float schedule_pp_begin_ = 0.0f;
+    float schedule_pp_end_ = 0.0f;
+    float schedule_tg_begin_ = 0.0f;
+    float schedule_tg_end_ = 0.0f;
+    uint64_t schedule_tg_decay_start_ = 0;
+    uint64_t schedule_tg_decay_end_ = 0;
+    uint64_t schedule_pp_end_token_ = 0;
+    uint64_t schedule_prefill_seen_tokens_ = 0;
+    uint64_t schedule_tg_token_ = 0;
+    bool schedule_in_decode_ = false;
+    bool phase_schedule_enabled_ = false;
+    float schedule_last_kbar_ = 0.0f;
 
     // STREAMLLM_ALLOW_CAPTURE=1: opt-in to CUDA-graph capture for the
     // managed cgraph. Only legal when the operator has set
@@ -1491,6 +1676,17 @@ private:
     std::unordered_map<HostKey, std::list<HostKey>::iterator,
                        HostKeyHash> host_pos_;
 
+    // Logical cache clock.  Runtime-mode MoE calls note_moe_layer()
+    // once per layer before planning all three canonicals.  All chunks
+    // touched by that layer share one timestamp, so LRU age tracks
+    // token/layer recency instead of per-chunk loop order.
+    uint64_t cache_epoch_ = 0;
+    uint64_t cache_decode_token_ = 0;
+    int      cache_last_layer_ = -1;
+    bool     cache_in_decode_ = false;
+    bool     logical_cache_age_ =
+        read_int_env("STREAMLLM_MOE_LOGICAL_CACHE_AGE", 0) != 0;
+
     // Plane-priority residency tracker for on-demand chunks. Pinned
     // [0, MIN) planes are not tracked (never evicted by this scheduler);
     // make_room_for pops victims here when pool.load() runs out of
@@ -1505,6 +1701,7 @@ private:
         read_float_env("STREAMLLM_MOE_EVICT_PLANE_WEIGHT", 8.0f),
         read_float_env("STREAMLLM_MOE_EVICT_AGE_WEIGHT",   1.0f),
         read_float_env("STREAMLLM_MOE_EVICT_FREQ_WEIGHT",  0.0f),
+        read_i64_env("STREAMLLM_MOE_EVICT_AGE_PLANE_TIE_WINDOW", -1),
     };
 
     // Per-(synthetic_wid, desired_chunks) plan cache.
@@ -1647,6 +1844,14 @@ void scheduler_touch_resident(
     int                 plane)
 {
     as_moe(sched).touch_resident(wid, cid, plane);
+}
+
+void scheduler_note_moe_layer(
+    Scheduler & sched,
+    bool        decode_phase,
+    int         layer_idx)
+{
+    as_moe(sched).note_moe_layer(decode_phase, layer_idx);
 }
 
 void scheduler_after_compute(

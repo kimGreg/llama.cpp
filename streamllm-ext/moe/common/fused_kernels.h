@@ -220,8 +220,8 @@ void launch_plan_per_expert_planes(
 // ─── Capture-mode K̄-knapsack plan kernel ──────────────────────────
 // Same role as launch_plan_per_expert_planes but for the rung-2
 // per-dispatch budget allocator: total chunks = round(n_active × kbar),
-// distributed across active experts by greedy g²·ΔR.  Reads the
-// residuals table on device (uploaded by the scheduler at install
+// distributed across active experts by exact DP over sum(gate^2) times
+// residual. Reads the residuals table on device (uploaded by the scheduler at install
 // time) and writes ``planes_per_eid_d`` entirely on device — no host
 // round-trip, capture-safe.
 //
@@ -248,6 +248,9 @@ void launch_plan_per_expert_kbar(
     int             n_chunks_max,
     int             base_p,
     bool            any_precision,
+    float *         dp_prev_d,
+    float *         dp_cur_d,
+    uint8_t *       trace_d,
     int *           planes_per_eid_d,
     StreamHandle    stream);
 
@@ -285,6 +288,8 @@ void launch_plan_chunks_kbar_exact_strided(
     int             n_expert,
     int             n_chunks_max,
     int *           chunks_per_eid_d,
+    int *           expert_order_d,
+    int *           n_active_d,
     float *         dp_prev_d,
     float *         dp_cur_d,
     uint8_t *       trace_d,

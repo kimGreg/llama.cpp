@@ -4,6 +4,7 @@
 #include "runtime.h"
 #include "decoder_registry.h"
 #include "pointer_patch.h"
+#include "launch_diag.h"
 #include "runtime_diag.h"
 #include "streamllm_nvtx.h"
 
@@ -27,12 +28,16 @@ static_assert(kMaxChunksPerTensor == kNaverMaxPrecision,
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -113,6 +118,17 @@ StreamllmRuntime::StreamllmRuntime(size_t capacity_bytes, int device,
 }
 
 StreamllmRuntime::~StreamllmRuntime() {
+    if (!batch_pread_workers_.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(batch_pread_mu_);
+            batch_pread_stop_.store(true, std::memory_order_relaxed);
+        }
+        batch_pread_cv_work_.notify_all();
+        for (auto & t : batch_pread_workers_) {
+            if (t.joinable()) t.join();
+        }
+        batch_pread_workers_.clear();
+    }
     // Stop the prefetch worker pool first — workers may still be
     // dereferencing entries_ or pool_ when this dtor runs.
     if (!io_workers_.empty()) {
@@ -154,6 +170,10 @@ StreamllmRuntime::~StreamllmRuntime() {
         ::close(gguf_fd_);
         gguf_fd_ = -1;
     }
+    if (gguf_direct_fd_ >= 0) {
+        ::close(gguf_direct_fd_);
+        gguf_direct_fd_ = -1;
+    }
 }
 
 void StreamllmRuntime::install(const StreamReader & reader,
@@ -174,6 +194,21 @@ void StreamllmRuntime::install(const StreamReader & reader,
             "StreamllmRuntime::install: cannot open " + gguf_path +
             ": " + std::strerror(errno));
     }
+#ifdef O_DIRECT
+    if (const char * env = std::getenv("STREAMLLM_SSD_O_DIRECT")) {
+        if (std::atoi(env) != 0) {
+            gguf_direct_fd_ = ::open(
+                gguf_path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+            if (gguf_direct_fd_ < 0) {
+                std::fprintf(
+                    stderr,
+                    "streamllm-ext: O_DIRECT open failed for %s: %s; "
+                    "falling back to cached pread fd\n",
+                    gguf_path.c_str(), std::strerror(errno));
+            }
+        }
+    }
+#endif
 
     // Pinned-host ring for SSD-stream pread destinations. Sized so
     // the cudaMemcpyAsync from pinned host memory is a true async DMA
@@ -272,7 +307,95 @@ void StreamllmRuntime::install(const StreamReader & reader,
         }
     }
 
+    {
+        int n_workers = 4;
+        if (const char * w = getenv("STREAMLLM_BATCH_PREAD_THREADS")) {
+            n_workers = std::atoi(w);
+            if (n_workers < 0) n_workers = 0;
+            if (n_workers > 32) n_workers = 32;
+        }
+        batch_pread_stop_.store(false, std::memory_order_relaxed);
+        batch_pread_workers_.reserve((size_t)n_workers);
+        for (int i = 0; i < n_workers; ++i) {
+            batch_pread_workers_.emplace_back(
+                &StreamllmRuntime::batch_pread_worker_loop_, this);
+        }
+    }
+
     installed_ = true;
+}
+
+int StreamllmRuntime::streaming_pread_fd_(const void * dst,
+                                          int64_t off,
+                                          size_t nbytes) const {
+#ifdef O_DIRECT
+    if (gguf_direct_fd_ >= 0) {
+        constexpr std::uintptr_t kDirectAlign = 4096;
+        const auto ptr = reinterpret_cast<std::uintptr_t>(dst);
+        if ((ptr % kDirectAlign) == 0 &&
+            ((uint64_t)off % kDirectAlign) == 0 &&
+            (nbytes % kDirectAlign) == 0) {
+            return gguf_direct_fd_;
+        }
+    }
+#endif
+    return gguf_fd_;
+}
+
+void StreamllmRuntime::pread_span_(uint8_t * dst, int64_t off,
+                                   size_t nbytes) const {
+    const int fd = streaming_pread_fd_(dst, off, nbytes);
+    size_t total = 0;
+    while (total < nbytes) {
+        ssize_t got = ::pread(
+            fd,
+            dst + total,
+            nbytes - total,
+            (off_t)(off + (int64_t)total));
+        if (got < 0) {
+            int err = errno;
+            throw std::runtime_error(
+                "StreamllmRuntime::pread_span_: pread failed: " +
+                std::string(std::strerror(err)));
+        }
+        if (got == 0) {
+            throw std::runtime_error(
+                "StreamllmRuntime::pread_span_: short pread");
+        }
+        total += (size_t)got;
+    }
+    if (fd == gguf_fd_) {
+        (void)::posix_fadvise(gguf_fd_, (off_t)off, (off_t)nbytes,
+                              POSIX_FADV_DONTNEED);
+    }
+}
+
+bool StreamllmRuntime::run_batch_preads_(
+    const std::vector<BatchPreadSpan> & spans) {
+    if (spans.empty()) return true;
+    if (batch_pread_workers_.empty()) return false;
+
+    auto state = std::make_shared<BatchPreadState>();
+    state->remaining.store((uint32_t)spans.size(), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(batch_pread_mu_);
+        for (const BatchPreadSpan & span : spans) {
+            batch_pread_queue_.push_back(
+                BatchPreadRequest{span.dst, span.off, span.nbytes, state});
+        }
+    }
+    batch_pread_cv_work_.notify_all();
+
+    std::unique_lock<std::mutex> lk(batch_pread_mu_);
+    batch_pread_cv_done_.wait(lk, [&] {
+        return state->remaining.load(std::memory_order_acquire) == 0;
+    });
+    lk.unlock();
+
+    if (state->first_error) {
+        std::rethrow_exception(state->first_error);
+    }
+    return !state->failed.load(std::memory_order_acquire);
 }
 
 void StreamllmRuntime::register_layout(const std::string & wid,
@@ -596,21 +719,26 @@ bool StreamllmRuntime::prepare_chunk_payload_(
         e.chunk_file_kernel_ready[p] != 0;
     std::vector<uint8_t> disk_bytes((size_t)size);
     int64_t total = 0;
-    while (total < size) {
-        ssize_t got = ::pread(gguf_fd_, disk_bytes.data() + total,
-                              (size_t)(size - total),
-                              (off_t)(off + total));
-        if (got < 0) {
-            int err = errno;
-            throw std::runtime_error(
-                "StreamllmRuntime::prepare_chunk_payload_: pread failed: " +
-                std::string(std::strerror(err)));
+    {
+        launch_diag::PhaseTimer _pt(
+            launch_diag::Phase::Pread,
+            launch_diag::current_decode_phase());
+        while (total < size) {
+            ssize_t got = ::pread(gguf_fd_, disk_bytes.data() + total,
+                                  (size_t)(size - total),
+                                  (off_t)(off + total));
+            if (got < 0) {
+                int err = errno;
+                throw std::runtime_error(
+                    "StreamllmRuntime::prepare_chunk_payload_: pread failed: " +
+                    std::string(std::strerror(err)));
+            }
+            if (got == 0) {
+                throw std::runtime_error(
+                    "StreamllmRuntime::prepare_chunk_payload_: short pread for " + wid);
+            }
+            total += got;
         }
-        if (got == 0) {
-            throw std::runtime_error(
-                "StreamllmRuntime::prepare_chunk_payload_: short pread for " + wid);
-        }
-        total += got;
     }
     (void)::posix_fadvise(gguf_fd_, (off_t)off, (off_t)size,
                           POSIX_FADV_DONTNEED);
@@ -763,6 +891,9 @@ void StreamllmRuntime::prepare_chunk_payloads_batch_(
         const int64_t span_size = span_end - span_off;
         std::vector<uint8_t> span((size_t)span_size);
         {
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::Pread,
+                launch_diag::current_decode_phase());
             DiagSpan _t(diag::MoveSite::Pread);
             int64_t total = 0;
             while (total < span_size) {
@@ -938,6 +1069,7 @@ EventHandle StreamllmRuntime::move_chunks_batch(
         int p = -1;
         int64_t off = 0;
         size_t nbytes = 0;
+        size_t packed_off = 0;
         std::string bundle;
     };
 
@@ -948,6 +1080,24 @@ EventHandle StreamllmRuntime::move_chunks_batch(
             max_batch_bytes = (size_t)mb * 1024ull * 1024ull;
         }
     }
+    bool scatter_batch_alloc = true;
+    if (const char * env = std::getenv("STREAMLLM_BATCH_SCATTER_ALLOC")) {
+        scatter_batch_alloc = !(env[0] == '0');
+    }
+
+    auto make_room_for_batch = [&](size_t nbytes) -> bool {
+        if (!scatter_batch_alloc) {
+            return scheduler_->make_room_for(*pool_, nbytes);
+        }
+        bool made_progress = false;
+        while (pool_->free_bytes() < nbytes) {
+            if (!scheduler_->make_room_for(*pool_, 0)) {
+                return made_progress;
+            }
+            made_progress = true;
+        }
+        return true;
+    };
 
     auto ensure_batch_staging = [&](size_t nbytes) {
         if (nbytes <= batch_staging_bytes_) return;
@@ -1011,7 +1161,7 @@ EventHandle StreamllmRuntime::move_chunks_batch(
             }
             refs.push_back(BundleBatchRef{
                 key, &e, p, e.chunk_file_offsets[p],
-                kernel_chunk_bytes, e.chunk_file_bundle[p],
+                kernel_chunk_bytes, 0, e.chunk_file_bundle[p],
             });
         }
         if (refs.empty()) return true;
@@ -1023,81 +1173,52 @@ EventHandle StreamllmRuntime::move_chunks_batch(
                 return a.off < b.off;
             });
 
-        auto run_ref_batch = [&](size_t first, size_t last, size_t nbytes) {
-            ensure_batch_staging(nbytes);
+        auto run_preloaded_ref_batch =
+            [&](size_t first, size_t last, size_t nbytes) -> bool {
+            if (first >= last) return true;
             uint8_t * packed = reinterpret_cast<uint8_t *>(batch_staging_);
             std::vector<BatchLoadItem> items;
             items.reserve(last - first);
             std::vector<std::pair<ChunkKey, void *>> loaded;
             loaded.reserve(last - first);
 
-            size_t cursor = 0;
             for (size_t i = first; i < last; ++i) {
                 items.push_back(BatchLoadItem{
                     refs[i].key,
-                    packed + cursor,
+                    packed + refs[i].packed_off,
                     refs[i].nbytes,
                 });
-                cursor += refs[i].nbytes;
-            }
-
-            cursor = 0;
-            size_t i = first;
-            while (i < last) {
-                const size_t packed_start = cursor;
-                const int64_t src_start = refs[i].off;
-                int64_t src_end = refs[i].off + (int64_t)refs[i].nbytes;
-                cursor += refs[i].nbytes;
-                size_t j = i + 1;
-                while (j < last &&
-                       refs[j].bundle == refs[i].bundle &&
-                       refs[j].off == src_end) {
-                    src_end += (int64_t)refs[j].nbytes;
-                    cursor += refs[j].nbytes;
-                    ++j;
-                }
-
-                const int64_t span_size = src_end - src_start;
-                int64_t total = 0;
-                {
-                    DiagSpan _t(diag::MoveSite::Pread);
-                    while (total < span_size) {
-                        ssize_t got = ::pread(
-                            gguf_fd_,
-                            packed + packed_start + total,
-                            (size_t)(span_size - total),
-                            (off_t)(src_start + total));
-                        if (got < 0) {
-                            int err = errno;
-                            throw std::runtime_error(
-                                "StreamllmRuntime::move_chunks_batch: pread "
-                                "failed: " + std::string(std::strerror(err)));
-                        }
-                        if (got == 0) {
-                            throw std::runtime_error(
-                                "StreamllmRuntime::move_chunks_batch: short "
-                                "pread");
-                        }
-                        total += got;
-                    }
-                    (void)::posix_fadvise(gguf_fd_, (off_t)src_start,
-                                          (off_t)span_size,
-                                          POSIX_FADV_DONTNEED);
-                }
-                diag::record_move_event(diag::MoveEvent::SsdMiss);
-                i = j;
             }
 
             std::vector<ChunkHandle> handles;
             begin_deferred_pointer_clears_(pool_->copy_stream());
             try {
                 for (;;) {
-                    handles = pool_->load_batch_sync(items, packed,
-                                                     nbytes, compute_stream);
+                    {
+                        launch_diag::PhaseTimer _pt(
+                            launch_diag::Phase::PoolLoad,
+                            launch_diag::current_decode_phase());
+                        if (scatter_batch_alloc) {
+                            handles = pool_->load_batch_scattered_sync(
+                                items, compute_stream);
+                        } else {
+                            handles = pool_->load_batch_sync(
+                                items, packed + refs[first].packed_off,
+                                nbytes, compute_stream);
+                        }
+                    }
                     if (!handles.empty()) break;
-                    if (!scheduler_->make_room_for(*pool_, nbytes)) {
+                    const size_t free_before_room =
+                        scatter_batch_alloc ? pool_->free_bytes() : 0;
+                    if (!make_room_for_batch(nbytes)) {
                         flush_deferred_pointer_clears_();
                         return false;
+                    }
+                    if (scatter_batch_alloc &&
+                        free_before_room >= nbytes &&
+                        pool_->free_bytes() >= nbytes &&
+                        handles.empty()) {
+                        (void)scheduler_->make_room_for(*pool_, 0);
                     }
                 }
                 flush_deferred_pointer_clears_();
@@ -1109,12 +1230,213 @@ EventHandle StreamllmRuntime::move_chunks_batch(
             for (size_t j = 0; j < handles.size(); ++j) {
                 loaded.push_back({refs[first + j].key, handles[j].device_ptr});
             }
-            finish_loaded_chunks_batch_(loaded);
+            {
+                launch_diag::PhaseTimer _pt(
+                    launch_diag::Phase::PointerPatch,
+                    launch_diag::current_decode_phase());
+                finish_loaded_chunks_batch_(loaded);
+            }
             if (pool_->copy_stream() != nullptr) {
                 cudaStreamSynchronize((cudaStream_t)pool_->copy_stream());
             }
             return true;
         };
+
+        auto pread_span = [&](uint8_t * packed,
+                              size_t dst_off,
+                              int64_t src_start,
+                              size_t span_size) {
+            pread_span_(packed + dst_off, src_start, span_size);
+        };
+
+        auto run_ref_batch = [&](size_t first, size_t last,
+                                 size_t nbytes) -> bool {
+            ensure_batch_staging(nbytes);
+            uint8_t * packed = reinterpret_cast<uint8_t *>(batch_staging_);
+
+            size_t cursor = 0;
+            for (size_t i = first; i < last; ++i) {
+                refs[i].packed_off = cursor;
+                cursor += refs[i].nbytes;
+            }
+
+            size_t physical_bytes = 0;
+            size_t span_count = 0;
+            size_t i = first;
+            while (i < last) {
+                const size_t packed_start = refs[i].packed_off;
+                const int64_t src_start = refs[i].off;
+                int64_t src_end = refs[i].off + (int64_t)refs[i].nbytes;
+                size_t j = i + 1;
+                while (j < last &&
+                       refs[j].bundle == refs[i].bundle &&
+                       refs[j].off == src_end) {
+                    src_end += (int64_t)refs[j].nbytes;
+                    ++j;
+                }
+
+                const size_t span_size = (size_t)(src_end - src_start);
+                physical_bytes += span_size;
+                ++span_count;
+                {
+                    launch_diag::PhaseTimer _pt(
+                        launch_diag::Phase::Pread,
+                        launch_diag::current_decode_phase());
+                    DiagSpan _t(diag::MoveSite::Pread);
+                    pread_span(packed, packed_start, src_start, span_size);
+                }
+                diag::record_move_event(diag::MoveEvent::SsdMiss);
+                i = j;
+            }
+            launch_diag::note_pread_io(
+                launch_diag::current_decode_phase(),
+                nbytes, physical_bytes, span_count);
+
+            return run_preloaded_ref_batch(first, last, nbytes);
+        };
+
+        auto try_decode_pread_ahead = [&]() -> bool {
+            if (!launch_diag::current_decode_phase()) return false;
+
+            long pread_threads = 4;
+            if (const char * env =
+                    std::getenv("STREAMLLM_BATCH_PREAD_THREADS")) {
+                pread_threads = std::strtol(env, nullptr, 10);
+            }
+            if (pread_threads <= 1) return false;
+
+            size_t pread_ahead_max_bytes = 32ull * 1024ull * 1024ull;
+            if (const char * env =
+                    std::getenv("STREAMLLM_BATCH_PREAD_AHEAD_MAX_MB")) {
+                const long mb = std::strtol(env, nullptr, 10);
+                if (mb <= 0) return false;
+                pread_ahead_max_bytes = (size_t)mb * 1024ull * 1024ull;
+            }
+
+            size_t total_bytes = 0;
+            for (auto & ref : refs) {
+                ref.packed_off = total_bytes;
+                total_bytes += ref.nbytes;
+            }
+            if (total_bytes == 0 ||
+                total_bytes > pread_ahead_max_bytes) {
+                return false;
+            }
+
+            size_t coalesce_gap_bytes = 256ull * 1024ull;
+            if (const char * env =
+                    std::getenv("STREAMLLM_BATCH_PREAD_COALESCE_GAP_KB")) {
+                const long kb = std::strtol(env, nullptr, 10);
+                coalesce_gap_bytes = kb > 0 ? (size_t)kb * 1024ull : 0;
+            }
+
+            struct ReadSpan {
+                size_t dst_off = 0;
+                size_t scratch_off = 0;
+                int64_t src_start = 0;
+                size_t nbytes = 0;
+                size_t first_ref = 0;
+                size_t last_ref = 0;
+            };
+
+            std::vector<ReadSpan> spans;
+            spans.reserve(refs.size());
+            size_t physical_bytes = 0;
+            size_t i = 0;
+            while (i < refs.size()) {
+                const size_t packed_start = refs[i].packed_off;
+                const int64_t src_start = refs[i].off;
+                int64_t src_end = refs[i].off + (int64_t)refs[i].nbytes;
+                size_t j = i + 1;
+                while (j < refs.size() &&
+                       refs[j].bundle == refs[i].bundle) {
+                    const int64_t gap = refs[j].off - src_end;
+                    if (gap < 0 ||
+                        (size_t)gap > coalesce_gap_bytes) {
+                        break;
+                    }
+                    src_end += (int64_t)refs[j].nbytes;
+                    ++j;
+                }
+                const size_t span_size = (size_t)(src_end - src_start);
+                spans.push_back(ReadSpan{
+                    packed_start, physical_bytes, src_start, span_size, i, j});
+                physical_bytes += span_size;
+                i = j;
+            }
+            if (spans.size() <= 1) return false;
+            if (physical_bytes > pread_ahead_max_bytes) return false;
+
+            const bool has_read_gaps = physical_bytes > total_bytes;
+            ensure_batch_staging(total_bytes +
+                                 (has_read_gaps ? physical_bytes : 0));
+            uint8_t * packed = reinterpret_cast<uint8_t *>(batch_staging_);
+            uint8_t * scratch = has_read_gaps ? packed + total_bytes : packed;
+            {
+                launch_diag::PhaseTimer _pt(
+                    launch_diag::Phase::Pread,
+                    launch_diag::current_decode_phase());
+                DiagSpan _t(diag::MoveSite::Pread);
+
+                std::vector<BatchPreadSpan> pread_spans;
+                pread_spans.reserve(spans.size());
+                for (const ReadSpan & span : spans) {
+                    pread_spans.push_back(BatchPreadSpan{
+                        scratch + (has_read_gaps
+                                       ? span.scratch_off
+                                       : span.dst_off),
+                        span.src_start,
+                        span.nbytes,
+                    });
+                }
+                if (!run_batch_preads_(pread_spans)) {
+                    return false;
+                }
+            }
+            if (has_read_gaps) {
+                for (const ReadSpan & span : spans) {
+                    for (size_t ref_idx = span.first_ref;
+                         ref_idx < span.last_ref;
+                         ++ref_idx) {
+                        const size_t src_delta =
+                            (size_t)(refs[ref_idx].off - span.src_start);
+                        std::memcpy(packed + refs[ref_idx].packed_off,
+                                    scratch + span.scratch_off + src_delta,
+                                    refs[ref_idx].nbytes);
+                    }
+                }
+            }
+            for (size_t s = 0; s < spans.size(); ++s) {
+                diag::record_move_event(diag::MoveEvent::SsdMiss);
+            }
+            launch_diag::note_pread_io(
+                launch_diag::current_decode_phase(),
+                total_bytes, physical_bytes, spans.size());
+
+            size_t first = 0;
+            size_t cur_bytes = 0;
+            for (size_t idx = 0; idx < refs.size(); ++idx) {
+                const size_t n = refs[idx].nbytes;
+                if (idx > first && cur_bytes + n > max_batch_bytes) {
+                    if (!run_preloaded_ref_batch(first, idx, cur_bytes)) {
+                        return false;
+                    }
+                    first = idx;
+                    cur_bytes = 0;
+                }
+                cur_bytes += n;
+            }
+            if (first < refs.size()) {
+                if (!run_preloaded_ref_batch(first, refs.size(), cur_bytes)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (try_decode_pread_ahead()) {
+            return true;
+        }
 
         size_t first = 0;
         size_t cur_bytes = 0;
@@ -1166,10 +1488,22 @@ EventHandle StreamllmRuntime::move_chunks_batch(
         begin_deferred_pointer_clears_(pool_->copy_stream());
         try {
             for (;;) {
-                handles = pool_->load_batch_sync(items, packed,
-                                                 nbytes, compute_stream);
+                {
+                    launch_diag::PhaseTimer _pt(
+                        launch_diag::Phase::PoolLoad,
+                        launch_diag::current_decode_phase());
+                    if (scatter_batch_alloc) {
+                        handles = pool_->load_batch_scattered_sync(
+                            items, compute_stream);
+                    } else {
+                        handles = pool_->load_batch_sync(items, packed,
+                                                         nbytes, compute_stream);
+                    }
+                }
                 if (!handles.empty()) break;
-                if (!scheduler_->make_room_for(*pool_, nbytes)) {
+                const size_t free_before_room =
+                    scatter_batch_alloc ? pool_->free_bytes() : 0;
+                if (!make_room_for_batch(nbytes)) {
                     flush_deferred_pointer_clears_();
                     pool_->note_batch_fallback();
                     for (size_t i = first; i < last; ++i) {
@@ -1180,6 +1514,12 @@ EventHandle StreamllmRuntime::move_chunks_batch(
                                               compute_stream);
                     }
                     return;
+                }
+                if (scatter_batch_alloc &&
+                    free_before_room >= nbytes &&
+                    pool_->free_bytes() >= nbytes &&
+                    handles.empty()) {
+                    (void)scheduler_->make_room_for(*pool_, 0);
                 }
             }
             flush_deferred_pointer_clears_();
@@ -1194,7 +1534,12 @@ EventHandle StreamllmRuntime::move_chunks_batch(
             const size_t i = first + j;
             loaded.push_back({payloads[i].key, handles[j].device_ptr});
         }
-        finish_loaded_chunks_batch_(loaded);
+        {
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::PointerPatch,
+                launch_diag::current_decode_phase());
+            finish_loaded_chunks_batch_(loaded);
+        }
         if (pool_->copy_stream() != nullptr) {
             cudaStreamSynchronize((cudaStream_t)pool_->copy_stream());
         }
@@ -1341,9 +1686,10 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
             uint64_t pread_ns = 0;
             {
                 DiagSpan _t(diag::MoveSite::Pread);
+                const int fd = streaming_pread_fd_(dst, off, (size_t)size);
                 int64_t total = 0;
                 while (total < size) {
-                    ssize_t got = ::pread(gguf_fd_, (char *)dst + total,
+                    ssize_t got = ::pread(fd, (char *)dst + total,
                                           (size_t)(size - total),
                                           (off_t)(off + total));
                     if (got < 0) {
@@ -1358,8 +1704,13 @@ EventHandle StreamllmRuntime::move_chunk(const std::string & wid, int cid,
                     }
                     total += got;
                 }
-                (void)::posix_fadvise(gguf_fd_, (off_t)off, (off_t)size,
-                                      POSIX_FADV_DONTNEED);
+                if (fd == gguf_fd_) {
+                    (void)::posix_fadvise(gguf_fd_, (off_t)off, (off_t)size,
+                                          POSIX_FADV_DONTNEED);
+                }
+                launch_diag::note_pread_io(
+                    launch_diag::current_decode_phase(),
+                    (size_t)size, (size_t)size, 1);
                 if (prof) {
                     auto dt = std::chrono::steady_clock::now() - t_pread_start;
                     pread_ns = (uint64_t)std::chrono::duration_cast<
@@ -1653,6 +2004,47 @@ void StreamllmRuntime::wait_async_load_batch(
     io_cv_done_.wait(lk, [&] {
         return remaining->load(std::memory_order_acquire) == 0;
     });
+}
+
+void StreamllmRuntime::batch_pread_worker_loop_() {
+    for (;;) {
+        BatchPreadRequest req;
+        {
+            std::unique_lock<std::mutex> lk(batch_pread_mu_);
+            batch_pread_cv_work_.wait(lk, [this] {
+                return batch_pread_stop_.load(std::memory_order_relaxed) ||
+                       !batch_pread_queue_.empty();
+            });
+            if (batch_pread_queue_.empty()) {
+                if (batch_pread_stop_.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                continue;
+            }
+            req = std::move(batch_pread_queue_.front());
+            batch_pread_queue_.pop_front();
+        }
+
+        if (req.state &&
+            !req.state->failed.load(std::memory_order_acquire)) {
+            try {
+                pread_span_(req.dst, req.off, req.nbytes);
+            } catch (...) {
+                req.state->failed.store(true, std::memory_order_release);
+                std::lock_guard<std::mutex> lk(req.state->error_mu);
+                if (!req.state->first_error) {
+                    req.state->first_error = std::current_exception();
+                }
+            }
+        }
+
+        if (req.state &&
+            req.state->remaining.fetch_sub(
+                1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lk(batch_pread_mu_);
+            batch_pread_cv_done_.notify_all();
+        }
+    }
 }
 
 void StreamllmRuntime::io_worker_loop_() {

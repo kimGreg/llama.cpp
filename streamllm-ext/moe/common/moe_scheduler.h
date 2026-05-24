@@ -74,6 +74,14 @@ void scheduler_touch_resident(
     int                 cid,
     int                 plane);
 
+// Logical cache clock for MoE residency. Runtime mode calls this once
+// per MoE layer before planning gate/up/down so all chunks touched by
+// the same layer share one age timestamp.
+void scheduler_note_moe_layer(
+    Scheduler & sched,
+    bool        decode_phase,
+    int         layer_idx);
+
 // Post-compute hook: called after a managed mul_mat has launched and
 // the pool's compute event has been recorded.  Schedulers that want
 // "flush after use" semantics evict tail chunks here.

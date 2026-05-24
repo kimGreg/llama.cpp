@@ -584,10 +584,13 @@ void clear() {
         const auto & p = g_runtime->pool();
         std::fprintf(stderr,
             "streamllm-ext stats: scheduler=%s peak_pool=%.1f MB "
+            "used_pool=%.1f MB residents=%zu "
             "h2d=%.1f MB in %zu moves (avg %.1f KB/move) "
             "batch_h2d=%.1f MB in %zu moves fallback=%zu\n",
             g_runtime->scheduler().name(),
             (double)p.peak_used_bytes() / 1024.0 / 1024.0,
+            (double)p.used_bytes() / 1024.0 / 1024.0,
+            p.n_resident(),
             (double)p.total_h2d_bytes() / 1024.0 / 1024.0,
             p.total_h2d_calls(),
             p.total_h2d_calls()

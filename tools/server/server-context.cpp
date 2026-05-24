@@ -2933,6 +2933,7 @@ private:
 
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
+                    common_sampler_streamllm_begin_generation(slot.smpl.get());
 
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
@@ -4221,21 +4222,112 @@ void server_routes::init_routes() {
             res->ok({{"status", "cleared"}});
             return res;
         }
-        if (!body.is_object() ||
-            !body.contains("thresholds") || !body["thresholds"].is_array() ||
-            !body.contains("kbars")      || !body["kbars"].is_array())
-        {
+        if (!body.is_object()) {
             res->error(format_error_response(
                 "body must be {\"thresholds\":[ints],\"kbars\":[floats],"
-                "\"allocator\":\"profile|uniform\"} with |kbars|=|thresholds|+1 "
-                "(or {\"clear\":true})",
+                "\"allocator\":\"profile|uniform\"} with |kbars|=|thresholds|+1, "
+                "{\"pp_budget\":7,\"tg_high_budget\":4,\"tg_low_budget\":2,"
+                "\"tg_decay_start\":128,\"tg_decay_end\":256,"
+                "\"allocator\":\"profile|uniform\"}, "
+                "{\"prefill\":7,\"front\":4,\"rear\":2,\"front_tokens\":128,"
+                "\"allocator\":\"profile|uniform\"}, or {\"clear\":true}",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         std::vector<int>   thr;
         std::vector<float> kbars;
-        for (const auto & v : body["thresholds"]) thr.push_back(v.get<int>());
-        for (const auto & v : body["kbars"]) kbars.push_back(v.get<float>());
+        if (body.contains("pp_budget")       && body.contains("tg_high_budget") &&
+            body.contains("tg_low_budget")   && body.contains("tg_decay_start") &&
+            body.contains("tg_decay_end"))
+        {
+            if (!body["pp_budget"].is_number() ||
+                !body["tg_high_budget"].is_number() ||
+                !body["tg_low_budget"].is_number() ||
+                !body["tg_decay_start"].is_number_integer() ||
+                !body["tg_decay_end"].is_number_integer())
+            {
+                res->error(format_error_response(
+                    "linear schedule must use numeric pp_budget/"
+                    "tg_high_budget/tg_low_budget and integer "
+                    "tg_decay_start/tg_decay_end",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const float pp_budget = body["pp_budget"].get<float>();
+            const float tg_high   = body["tg_high_budget"].get<float>();
+            const float tg_low    = body["tg_low_budget"].get<float>();
+            const int decay_start = body["tg_decay_start"].get<int>();
+            const int decay_end   = body["tg_decay_end"].get<int>();
+            if (pp_budget < 0.0f || tg_high < 0.0f || tg_low < 0.0f ||
+                decay_start < 0 || decay_end <= decay_start)
+            {
+                res->error(format_error_response(
+                    "linear schedule requires non-negative budgets, "
+                    "tg_decay_start >= 0, and tg_decay_end > tg_decay_start",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            thr.push_back(0);
+            kbars.push_back(pp_budget);
+            kbars.push_back(tg_high);
+            const int first_decay_threshold = std::max(1, decay_start);
+            for (int t = first_decay_threshold; t < decay_end; ++t) {
+                const int next_token = t + 1;
+                float kbar = tg_low;
+                if (next_token <= decay_start) {
+                    kbar = tg_high;
+                } else if (next_token < decay_end) {
+                    const float alpha =
+                        (float) (next_token - decay_start) /
+                        (float) (decay_end - decay_start);
+                    kbar = tg_high + alpha * (tg_low - tg_high);
+                }
+                thr.push_back(t);
+                kbars.push_back(kbar);
+            }
+        } else if (body.contains("prefill") && body.contains("front") &&
+            body.contains("rear")    && body.contains("front_tokens"))
+        {
+            if (!body["prefill"].is_number() || !body["front"].is_number() ||
+                !body["rear"].is_number()    || !body["front_tokens"].is_number_integer())
+            {
+                res->error(format_error_response(
+                    "compact schedule must use numeric prefill/front/rear and "
+                    "integer front_tokens",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const int front_tokens = body["front_tokens"].get<int>();
+            if (front_tokens <= 0) {
+                res->error(format_error_response(
+                    "compact schedule requires front_tokens > 0",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            thr = { 0, front_tokens };
+            kbars = {
+                body["prefill"].get<float>(),
+                body["front"].get<float>(),
+                body["rear"].get<float>(),
+            };
+        } else if (body.contains("thresholds") && body["thresholds"].is_array() &&
+                   body.contains("kbars")      && body["kbars"].is_array())
+        {
+            for (const auto & v : body["thresholds"]) thr.push_back(v.get<int>());
+            for (const auto & v : body["kbars"]) kbars.push_back(v.get<float>());
+        } else {
+            res->error(format_error_response(
+                "body must be {\"thresholds\":[ints],\"kbars\":[floats],"
+                "\"allocator\":\"profile|uniform\"} with |kbars|=|thresholds|+1, "
+                "{\"pp_budget\":7,\"tg_high_budget\":4,\"tg_low_budget\":2,"
+                "\"tg_decay_start\":128,\"tg_decay_end\":256,"
+                "\"allocator\":\"profile|uniform\"}, "
+                "{\"prefill\":7,\"front\":4,\"rear\":2,\"front_tokens\":128,"
+                "\"allocator\":\"profile|uniform\"}, or {\"clear\":true}",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         const std::string allocator =
             body.value("allocator", std::string("profile"));
         const int allocator_mode = allocator == "uniform" ? 1 : 0;

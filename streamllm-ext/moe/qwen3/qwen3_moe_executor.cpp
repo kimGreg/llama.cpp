@@ -6,6 +6,7 @@
 #include "moe_scheduler.h"
 #include "runtime.h"
 #include "stream_reader.h"
+#include "launch_diag.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -14,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <stdexcept>
@@ -57,6 +59,11 @@ std::string staging_wid(int kind) {
         "__streamllm_direct_stage_down",
     };
     return names[kind];
+}
+
+bool direct_refresh_decode_every_call() {
+    const char * env = std::getenv("STREAMLLM_DIRECT_REFRESH_EVERY_DECODE");
+    return env != nullptr && std::strcmp(env, "0") != 0;
 }
 
 } // namespace
@@ -173,7 +180,11 @@ bool Qwen3BaselineExecutor::prepare_moe_mul_mat_id(
     }
 
     LayerState & st = layers_[layer];
+    const bool direct_decode_phase = (int) ids->ne[1] == 1;
+    const bool force_decode_refresh =
+        direct_decode_phase && direct_refresh_decode_every_call();
     const bool need_prepare =
+        force_decode_refresh ||
         st.ids_data != ids->data ||
         st.n_used != (int) ids->ne[0] ||
         st.n_tokens != (int) ids->ne[1] ||
@@ -182,6 +193,8 @@ bool Qwen3BaselineExecutor::prepare_moe_mul_mat_id(
     cudaStream_t stream = (cudaStream_t) stream_h;
 
     if (need_prepare) {
+        launch_diag::PhaseTimer _pt_prepare(
+            launch_diag::Phase::DirectPrepare, direct_decode_phase);
         st.ids_data = ids->data;
         st.n_used = (int) ids->ne[0];
         st.n_tokens = (int) ids->ne[1];
@@ -189,13 +202,17 @@ bool Qwen3BaselineExecutor::prepare_moe_mul_mat_id(
         if (st.n_used <= 0 || st.n_tokens <= 0) return false;
 
         std::vector<uint8_t> ids_host(ggml_nbytes(ids));
-        if (ids->buffer != nullptr && ggml_backend_buffer_is_host(ids->buffer)) {
-            std::memcpy(ids_host.data(), ids->data, ids_host.size());
-        } else {
-            check_cuda(cudaMemcpyAsync(ids_host.data(), ids->data, ids_host.size(),
-                                       cudaMemcpyDeviceToHost, stream),
-                       "ids D2H");
-            check_cuda(cudaStreamSynchronize(stream), "ids D2H sync");
+        {
+            launch_diag::PhaseTimer _pt(
+                launch_diag::Phase::DirectIdsD2H, direct_decode_phase);
+            if (ids->buffer != nullptr && ggml_backend_buffer_is_host(ids->buffer)) {
+                std::memcpy(ids_host.data(), ids->data, ids_host.size());
+            } else {
+                check_cuda(cudaMemcpyAsync(ids_host.data(), ids->data, ids_host.size(),
+                                           cudaMemcpyDeviceToHost, stream),
+                           "ids D2H");
+                check_cuda(cudaStreamSynchronize(stream), "ids D2H sync");
+            }
         }
 
         for (int t = 0; t < st.n_tokens; ++t) {
@@ -224,43 +241,64 @@ bool Qwen3BaselineExecutor::prepare_moe_mul_mat_id(
         }
 
         try {
-            for (int eid : st.active_experts) {
-                const std::string wid = expert_wid(layer, eid);
-                rt_->move_chunk(wid, expert_cid, Tier::RAM, Tier::VRAM, stream_h);
-                rt_->pool().wait_on_stream(wid, expert_cid, stream_h);
-                qwen3::scheduler_touch_resident(
-                    rt_->scheduler(), wid, expert_cid, 0);
+            {
+                launch_diag::PhaseTimer _pt(
+                    launch_diag::Phase::DirectLoad, direct_decode_phase);
+                struct ScopedDecodePhase {
+                    bool prev;
+                    explicit ScopedDecodePhase(bool decode)
+                        : prev(launch_diag::current_decode_phase()) {
+                        launch_diag::set_current_decode_phase(decode);
+                    }
+                    ~ScopedDecodePhase() {
+                        launch_diag::set_current_decode_phase(prev);
+                    }
+                } _decode_phase(direct_decode_phase);
+                for (int eid : st.active_experts) {
+                    const std::string wid = expert_wid(layer, eid);
+                    rt_->move_chunk(wid, expert_cid, Tier::RAM, Tier::VRAM, stream_h);
+                    rt_->pool().wait_on_stream(wid, expert_cid, stream_h);
+                    qwen3::scheduler_touch_resident(
+                        rt_->scheduler(), wid, expert_cid, 0);
+                }
+            }
 
-                ChunkedTensor * tensor = rt_->tensor(wid);
-                if (tensor == nullptr || !tensor->host().direct_expert_block) {
-                    throw std::runtime_error(
-                        "qwen3_direct_stock_v1: missing direct expert block " + wid);
-                }
-                const auto & host = tensor->host();
-                auto h = rt_->pool().view(wid, expert_cid);
-                if (h.device_ptr == nullptr) {
-                    throw std::runtime_error(
-                        "qwen3_direct_stock_v1: expert block not resident " + wid);
-                }
-                for (int k = 0; k < 3; ++k) {
-                    const auto & r = host.expert_records[k];
-                    if (r.nbytes == 0) {
+            {
+                launch_diag::PhaseTimer _pt(
+                    launch_diag::Phase::DirectD2D, direct_decode_phase);
+                for (int eid : st.active_experts) {
+                    const std::string wid = expert_wid(layer, eid);
+                    ChunkedTensor * tensor = rt_->tensor(wid);
+                    if (tensor == nullptr || !tensor->host().direct_expert_block) {
                         throw std::runtime_error(
-                            "qwen3_direct_stock_v1: empty expert subrecord " + wid);
+                            "qwen3_direct_stock_v1: missing direct expert block " + wid);
                     }
-                    if (st.slice_bytes[k] == 0) st.slice_bytes[k] = r.nbytes;
-                    if (st.slice_bytes[k] != r.nbytes) {
+                    const auto & host = tensor->host();
+                    auto h = rt_->pool().view(wid, expert_cid);
+                    if (h.device_ptr == nullptr) {
                         throw std::runtime_error(
-                            "qwen3_direct_stock_v1: inconsistent expert slice size");
+                            "qwen3_direct_stock_v1: expert block not resident " + wid);
                     }
-                    allocate_staging_(k, (size_t) src0->ne[2] * r.nbytes);
-                    check_cuda(cudaMemcpyAsync(
-                        (char *) staging_[k] + (size_t) eid * r.nbytes,
-                        (const char *) h.device_ptr + r.offset,
-                        r.nbytes,
-                        cudaMemcpyDeviceToDevice,
-                        stream),
-                        "expert D2D hydrate");
+                    for (int k = 0; k < 3; ++k) {
+                        const auto & r = host.expert_records[k];
+                        if (r.nbytes == 0) {
+                            throw std::runtime_error(
+                                "qwen3_direct_stock_v1: empty expert subrecord " + wid);
+                        }
+                        if (st.slice_bytes[k] == 0) st.slice_bytes[k] = r.nbytes;
+                        if (st.slice_bytes[k] != r.nbytes) {
+                            throw std::runtime_error(
+                                "qwen3_direct_stock_v1: inconsistent expert slice size");
+                        }
+                        allocate_staging_(k, (size_t) src0->ne[2] * r.nbytes);
+                        check_cuda(cudaMemcpyAsync(
+                            (char *) staging_[k] + (size_t) eid * r.nbytes,
+                            (const char *) h.device_ptr + r.offset,
+                            r.nbytes,
+                            cudaMemcpyDeviceToDevice,
+                            stream),
+                            "expert D2D hydrate");
+                    }
                 }
             }
             rt_->pool().record_compute_event(stream_h);

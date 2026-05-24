@@ -11,7 +11,7 @@
 // a monotonically-increasing global counter so the eviction policy
 // can compare staleness across planes.
 //
-// Eviction policy is a weighted score:
+// Default eviction policy is a weighted score:
 //
 //     score = plane_w · plane_idx
 //           + age_w   · touches_since_last_seen          ← LRU
@@ -25,6 +25,14 @@
 //   freq_w  = 0  — disabled by default (no-op LFU). Set via
 //                  STREAMLLM_MOE_EVICT_FREQ_WEIGHT to enable.
 //
+// Alternative diagnostic policy:
+//
+//     STREAMLLM_MOE_EVICT_AGE_PLANE_TIE_WINDOW >= 0
+//
+//     Pick the oldest candidate first; if candidates are within the
+//     configured age window, evict the higher plane first.  A window
+//     of 0 is literal "pure age with high-plane exact tie-break".
+//
 // Reservations: the chunks the *current* dispatch needs are kept in
 // `reserved_` for the load+compute window; `make_room` skips them.
 //
@@ -36,6 +44,7 @@
 
 #include "runtime.h"
 #include "vram_pool.h"
+#include "launch_diag.h"
 
 #include <array>
 #include <atomic>
@@ -50,13 +59,29 @@ namespace streamllm_ext {
 
 class MoEResidencyTracker {
 public:
-    MoEResidencyTracker(double plane_w, double age_w, double freq_w)
-        : plane_weight_(plane_w), age_weight_(age_w), freq_weight_(freq_w) {}
+    MoEResidencyTracker(double plane_w, double age_w, double freq_w,
+                         int64_t age_plane_tie_window)
+        : plane_weight_(plane_w),
+          age_weight_(age_w),
+          freq_weight_(freq_w),
+          age_plane_tie_window_(age_plane_tie_window) {}
 
     void touch(const std::string & wid, int cid, int plane) {
         if (plane < 0 || plane >= kMaxChunksPerTensor) return;
         std::lock_guard<std::mutex> lk(mu_);
         const uint64_t ts = ++touch_ts_;
+        touch_locked_(wid, cid, plane, ts);
+    }
+
+    void touch_at(const std::string & wid, int cid, int plane, uint64_t ts) {
+        if (plane < 0 || plane >= kMaxChunksPerTensor) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ts > touch_ts_) touch_ts_ = ts;
+        touch_locked_(wid, cid, plane, ts);
+    }
+
+private:
+    void touch_locked_(const std::string & wid, int cid, int plane, uint64_t ts) {
         ChunkKey k{wid, cid};
         auto it = index_.find(k);
         if (it != index_.end()) {
@@ -74,6 +99,7 @@ public:
                               ts, /*touch_count=*/1});
     }
 
+public:
     void reserve(const std::string & wid, int cid) {
         std::lock_guard<std::mutex> lk(mu_);
         reserved_.insert(ChunkKey{wid, cid});
@@ -110,6 +136,7 @@ public:
         const uint64_t now = touch_ts_;
         int    best_p   = -1;
         double best_sc  = -1.0;
+        uint64_t best_age = 0;
         std::list<ChunkKey>::iterator best_it;
         for (int p = 0; p < kMaxChunksPerTensor; ++p) {
             auto & bucket = buckets_[p];
@@ -120,6 +147,23 @@ public:
                 if (ix == index_.end()) continue;  // defensive
                 const uint64_t age = now - ix->second.last_touch_ts;
                 const uint64_t cnt = ix->second.touch_count;
+                if (age_plane_tie_window_ >= 0) {
+                    const uint64_t win = (uint64_t)age_plane_tie_window_;
+                    bool take = best_p < 0;
+                    if (!take) {
+                        if (age > best_age + win) {
+                            take = true;
+                        } else if (best_age <= age + win) {
+                            take = p > best_p;
+                        }
+                    }
+                    if (take) {
+                        best_p = p;
+                        best_age = age;
+                        best_it = it;
+                    }
+                    break;
+                }
                 const double sc = plane_weight_ * (double)p
                                 + age_weight_   * (double)age
                                 + freq_weight_  / (double)(cnt + 1);
@@ -152,6 +196,7 @@ public:
             g_evictions_during_dispatch_.fetch_add(
                 1, std::memory_order_relaxed);
         }
+        launch_diag::note_evicted_chunk(victim.cid);
         pool.evict(victim.wid, victim.cid);
         // Clear the per-plane device pointer-table slot async on the
         // pool's copy_stream (SSOT §6.1.6 step 6).  The worker is
@@ -195,6 +240,7 @@ private:
     double   plane_weight_;
     double   age_weight_;
     double   freq_weight_;
+    int64_t  age_plane_tie_window_;
     mutable std::mutex mu_;
 
     // Static atomic counters (process-wide, all trackers share).

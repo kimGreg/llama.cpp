@@ -115,6 +115,24 @@ MoEMatMulComp::MoEMatMulComp(
             prec_per_eid_d_ = nullptr;
         }
     }
+    const int B1 = std::max(1, n_experts_) * std::max(1, n_chunks_) + 1;
+    const size_t dp_bytes = (size_t) B1 * sizeof(float);
+    const size_t trace_bytes = (size_t) std::max(1, n_experts_) *
+                               (size_t) B1 * sizeof(uint8_t);
+    if (cudaMalloc((void **) &plan_dp_prev_d_, dp_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &plan_dp_cur_d_,  dp_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &plan_trace_d_,   trace_bytes) != cudaSuccess) {
+        std::fprintf(stderr,
+            "streamllm-ext: MoEMatMulComp(%s): capture planner scratch "
+            "allocation failed\n",
+            canonical_.c_str());
+        if (plan_dp_prev_d_) cudaFree(plan_dp_prev_d_);
+        if (plan_dp_cur_d_)  cudaFree(plan_dp_cur_d_);
+        if (plan_trace_d_)   cudaFree(plan_trace_d_);
+        plan_dp_prev_d_ = nullptr;
+        plan_dp_cur_d_ = nullptr;
+        plan_trace_d_ = nullptr;
+    }
 
 }
 
@@ -125,6 +143,9 @@ MoEMatMulComp::~MoEMatMulComp() {
     if (host_n_chunks_per_expert_) cudaFreeHost(host_n_chunks_per_expert_);
     if (probs_pinned_)             cudaFreeHost(probs_pinned_);
     if (prec_per_eid_d_)           cudaFree(prec_per_eid_d_);
+    if (plan_dp_prev_d_)           cudaFree(plan_dp_prev_d_);
+    if (plan_dp_cur_d_)            cudaFree(plan_dp_cur_d_);
+    if (plan_trace_d_)             cudaFree(plan_trace_d_);
 }
 
 
@@ -227,26 +248,39 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
 
     const float replay_kbar = rt_->current_replay_kbar();
 
-    // ── Pass 1: per-expert max gate score across the minibatch.
-    std::unordered_map<int, float> max_gate_by_expert;
+    // ── Pass 1: aggregate gate energy per expert across the minibatch.
+    // Correct batched semantics are Σ_{tokens, top-k slots for e} g², not
+    // max(g).  The allocator API squares its gate input internally, so we
+    // pass sqrt(Σg²) below to preserve one cost definition.
+    std::unordered_map<int, float> gate_sq_sum_by_expert;
     std::unordered_map<int, int>   chunks_by_expert;
     std::vector<int>               unique_experts;
     const size_t reserve_n = (size_t) n_used * 4;
-    max_gate_by_expert.reserve(reserve_n);
+    gate_sq_sum_by_expert.reserve(reserve_n);
     chunks_by_expert.reserve(reserve_n);
     unique_experts.reserve(reserve_n);
 
     std::vector<float> g_per_tu((size_t) n_tokens * n_used, 0.0f);
     if (external_chunks_per_expert_ != nullptr) {
-        for (int eid = 0; eid < n_experts_; ++eid) {
+        auto accept_external_eid = [&](int eid) {
+            if (eid < 0 || eid >= n_experts_) return;
             int n_c = external_chunks_per_expert_[eid];
-            if (n_c <= 0) continue;
+            if (n_c <= 0) return;
             if (n_c > n_chunks_max) n_c = n_chunks_max;
             unique_experts.push_back(eid);
-            max_gate_by_expert.emplace(eid, 0.0f);
+            gate_sq_sum_by_expert.emplace(eid, 0.0f);
             chunks_by_expert[eid] = n_c;
             if (host_n_chunks_per_expert_ != nullptr) {
                 host_n_chunks_per_expert_[eid] = n_c;
+            }
+        };
+        if (external_expert_order_ != nullptr && external_expert_order_n_ > 0) {
+            for (int i = 0; i < external_expert_order_n_; ++i) {
+                accept_external_eid(external_expert_order_[i]);
+            }
+        } else {
+            for (int eid = 0; eid < n_experts_; ++eid) {
+                accept_external_eid(eid);
             }
         }
     } else {
@@ -264,12 +298,13 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
                     g = 0.45f - 0.05f * (float) u;
                     if (g < 0.05f) g = 0.05f;
                 }
-                auto it_g = max_gate_by_expert.find(eid);
-                if (it_g == max_gate_by_expert.end()) {
-                    max_gate_by_expert.emplace(eid, g);
+                const float g2 = g * g;
+                auto it_g = gate_sq_sum_by_expert.find(eid);
+                if (it_g == gate_sq_sum_by_expert.end()) {
+                    gate_sq_sum_by_expert.emplace(eid, g2);
                     unique_experts.push_back(eid);
-                } else if (g > it_g->second) {
-                    it_g->second = g;
+                } else {
+                    it_g->second += g2;
                 }
                 g_per_tu[(size_t) t * n_used + u] = g;
             }
@@ -304,7 +339,8 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     {
         std::vector<float> gates(unique_experts.size());
         for (size_t i = 0; i < unique_experts.size(); ++i) {
-            gates[i] = max_gate_by_expert[unique_experts[i]];
+            gates[i] = std::sqrt(std::max(
+                0.0f, gate_sq_sum_by_expert[unique_experts[i]]));
         }
         std::vector<int> K_out;
         const bool ok = qwen3::scheduler_allocate_dispatch_budget(
@@ -366,11 +402,11 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
                     d_count > 0 ? (double) total_ns / (double) d_count / 1000.0 : 0.0;
                 std::fprintf(stderr,
                     "streamllm-ext kbar L=%d  dispatches=%lu  active_experts=%zu  "
-                    "K_mean=%.3f  max_gate=%.6g  decision_us/dispatch=%.3f\n",
+                    "K_mean=%.3f  gate_sq_sum0=%.6g  decision_us/dispatch=%.3f\n",
                     layer_index_, (unsigned long) d_count,
                     chunks_by_expert.size(), kbar,
                     chunks_by_expert.empty() ? 0.0 :
-                        (double) max_gate_by_expert.begin()->second,
+                        (double) gate_sq_sum_by_expert.begin()->second,
                     avg_decision_us);
             }
         }
@@ -561,6 +597,9 @@ void MoEMatMulComp::execute(const ComputationInput & in_base,
                 /*n_chunks_max=*/ n_chunks_,
                 layout->base_precision > 0 ? layout->base_precision : 1,
                 layout->any_precision,
+                plan_dp_prev_d_,
+                plan_dp_cur_d_,
+                plan_trace_d_,
                 (int *) prec_per_eid_d_,
                 stream_h);
         } else if (layout != nullptr) {

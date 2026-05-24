@@ -272,6 +272,16 @@ private:
     void begin_deferred_pointer_clears_(StreamHandle stream);
     void flush_deferred_pointer_clears_();
     void cancel_deferred_pointer_clears_();
+    int streaming_pread_fd_(const void * dst, int64_t off,
+                            size_t nbytes) const;
+    void pread_span_(uint8_t * dst, int64_t off, size_t nbytes) const;
+
+    struct BatchPreadSpan {
+        uint8_t * dst = nullptr;
+        int64_t   off = 0;
+        size_t    nbytes = 0;
+    };
+    bool run_batch_preads_(const std::vector<BatchPreadSpan> & spans);
 
     std::unique_ptr<VramChunkPool> pool_;
     std::unique_ptr<Scheduler>     scheduler_;
@@ -285,6 +295,7 @@ private:
     // subsequent cudaMemcpyAsync runs as a true async DMA without an
     // internal pageable→pinned staging copy.
     int                            gguf_fd_ = -1;       // cached fd, owned
+    int                            gguf_direct_fd_ = -1; // O_DIRECT fd, owned
 
     // Single-allocation slab for per-tensor pointer arrays.
     // ``register_layout`` slices ``2 × kMaxChunksPerTensor × void*`` out
@@ -352,6 +363,27 @@ private:
     std::mutex                         io_stream_mu_;
 
     void io_worker_loop_();
+
+    struct BatchPreadState {
+        std::atomic<uint32_t> remaining{0};
+        std::atomic<bool>     failed{false};
+        std::exception_ptr    first_error;
+        std::mutex            error_mu;
+    };
+    struct BatchPreadRequest {
+        uint8_t * dst = nullptr;
+        int64_t   off = 0;
+        size_t    nbytes = 0;
+        std::shared_ptr<BatchPreadState> state;
+    };
+    std::vector<std::thread>           batch_pread_workers_;
+    std::mutex                         batch_pread_mu_;
+    std::condition_variable            batch_pread_cv_work_;
+    std::condition_variable            batch_pread_cv_done_;
+    std::deque<BatchPreadRequest>      batch_pread_queue_;
+    std::atomic<bool>                  batch_pread_stop_{false};
+
+    void batch_pread_worker_loop_();
 
 public:
     // Submit a chunk for async load. Fire-and-forget within a hook

@@ -38,6 +38,22 @@ static bool parse_streamllm_float(const char * s, float & out) {
     return end != s && out >= 0.0f;
 }
 
+static bool parse_streamllm_int(const char * s, int & out) {
+    if (!s || !*s) return false;
+    char * end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s || v < 0 || v > INT_MAX) return false;
+    out = (int) v;
+    return true;
+}
+
+static const char * streamllm_getenv2(const char * primary, const char * fallback) {
+    const char * v = std::getenv(primary);
+    if (v && *v) return v;
+    v = std::getenv(fallback);
+    return (v && *v) ? v : nullptr;
+}
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -155,11 +171,35 @@ struct common_sampler {
     int                           schedule_allocator_mode = 0;
     int                           n_tokens_generated = 0;
     int                           schedule_next_idx  = 0;
+    bool                          schedule_generation_started = false;
+    bool                          schedule_linear_decay = false;
+    float                         schedule_pp_budget = 0.0f;
+    float                         schedule_tg_high_budget = 0.0f;
+    float                         schedule_tg_low_budget = 0.0f;
+    float                         schedule_last_applied_budget = -1.0f;
+    int                           schedule_tg_decay_start = 0;
+    int                           schedule_tg_decay_end = 0;
 
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+
+        if (schedule_enabled) {
+            schedule_generation_started = false;
+            n_tokens_generated = 0;
+            schedule_next_idx = 0;
+            schedule_last_applied_budget = -1.0f;
+            const float kbar0 = schedule_linear_decay
+                ? schedule_pp_budget
+                : (!schedule_kbars.empty() ? schedule_kbars[0] : -1.0f);
+            if (kbar0 >= 0.0f) {
+                const bool ok = streamllm_set_kbar(kbar0, schedule_allocator_mode);
+                schedule_last_applied_budget = kbar0;
+                LOG_INF("streamllm kbar schedule: reset, primed kbar[0]=%s\n",
+                        ok ? "ok" : "no-op (no runtime)");
+            }
+        }
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -470,6 +510,25 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .phase_aware_enabled = */ false,
+        /* .kbar_reasoning = */ 0.0f,
+        /* .kbar_generation = */ 0.0f,
+        /* .prev_rbudget_state = */ REASONING_BUDGET_IDLE,
+        /* .schedule_enabled = */ false,
+        /* .schedule_thresholds = */ {},
+        /* .schedule_kbars = */ {},
+        /* .schedule_allocator_mode = */ 0,
+        /* .n_tokens_generated = */ 0,
+        /* .schedule_next_idx = */ 0,
+        /* .schedule_generation_started = */ false,
+        /* .schedule_linear_decay = */ false,
+        /* .schedule_pp_budget = */ 0.0f,
+        /* .schedule_tg_high_budget = */ 0.0f,
+        /* .schedule_tg_low_budget = */ 0.0f,
+        /* .schedule_last_applied_budget = */ -1.0f,
+        /* .schedule_tg_decay_start = */ 0,
+        /* .schedule_tg_decay_end = */ 0,
+        /* .t_total_us = */ 0,
     };
 
     bool sch_from_api = false;
@@ -494,8 +553,91 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                 result->schedule_thresholds.size(),
                 ok ? "ok" : "no-op (no runtime)");
     }
-    const char * sch_thr_csv  = !sch_from_api ? std::getenv("STREAMLLM_KBAR_SCHEDULE_TOKENS") : nullptr;
-    const char * sch_dial_csv = !sch_from_api ? std::getenv("STREAMLLM_KBAR_SCHEDULE_VALUES") : nullptr;
+    const char * sch_pp_env        = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_PP_BUDGET", "STREAMLLM_PP_BUDGET") : nullptr;
+    const char * sch_tg_high_env   = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_HIGH_BUDGET", "STREAMLLM_TG_HIGH_BUDGET") : nullptr;
+    const char * sch_tg_low_env    = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_LOW_BUDGET", "STREAMLLM_TG_LOW_BUDGET") : nullptr;
+    const char * sch_decay_start_env = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_DECAY_START", "STREAMLLM_TG_DECAY_START") : nullptr;
+    const char * sch_decay_end_env   = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_DECAY_END", "STREAMLLM_TG_DECAY_END") : nullptr;
+    float sch_pp = 0.0f;
+    float sch_tg_high = 0.0f;
+    float sch_tg_low = 0.0f;
+    int sch_decay_start = 0;
+    int sch_decay_end = 0;
+    const bool sch_linear_present =
+        sch_pp_env || sch_tg_high_env || sch_tg_low_env ||
+        sch_decay_start_env || sch_decay_end_env;
+    if (!sch_from_api && sch_linear_present) {
+        const bool valid =
+            parse_streamllm_float(sch_pp_env,      sch_pp) &&
+            parse_streamllm_float(sch_tg_high_env, sch_tg_high) &&
+            parse_streamllm_float(sch_tg_low_env,  sch_tg_low) &&
+            parse_streamllm_int  (sch_decay_start_env, sch_decay_start) &&
+            parse_streamllm_int  (sch_decay_end_env,   sch_decay_end) &&
+            sch_decay_end > sch_decay_start;
+        if (valid) {
+            result->schedule_enabled          = true;
+            result->schedule_linear_decay     = true;
+            result->schedule_pp_budget        = sch_pp;
+            result->schedule_tg_high_budget   = sch_tg_high;
+            result->schedule_tg_low_budget    = sch_tg_low;
+            result->schedule_tg_decay_start   = sch_decay_start;
+            result->schedule_tg_decay_end     = sch_decay_end;
+            result->n_tokens_generated        = 0;
+            result->schedule_next_idx         = 0;
+            const bool ok = streamllm_set_kbar(
+                result->schedule_pp_budget, result->schedule_allocator_mode);
+            result->schedule_last_applied_budget = result->schedule_pp_budget;
+            LOG_INF("streamllm linear kbar schedule: pp=%.3f, tg_high=%.3f, "
+                    "tg_low=%.3f, decay=[%d,%d] (primed pp=%s)\n",
+                    sch_pp, sch_tg_high, sch_tg_low,
+                    sch_decay_start, sch_decay_end,
+                    ok ? "ok" : "no-op (no runtime)");
+        } else {
+            LOG_WRN("streamllm linear kbar schedule: env vars present but "
+                    "malformed — expected PP/TG_HIGH/TG_LOW budgets and "
+                    "TG_DECAY_END > TG_DECAY_START — disabled\n");
+        }
+    }
+
+    const char * sch_prefill_env = (!sch_from_api && !result->schedule_enabled) ? std::getenv("STREAMLLM_KBAR_PREFILL") : nullptr;
+    const char * sch_front_env   = !sch_from_api ? std::getenv("STREAMLLM_KBAR_FRONT") : nullptr;
+    const char * sch_rear_env    = !sch_from_api ? std::getenv("STREAMLLM_KBAR_REAR") : nullptr;
+    const char * sch_front_n_env = !sch_from_api ? std::getenv("STREAMLLM_KBAR_FRONT_TOKENS") : nullptr;
+    float sch_prefill = 0.0f;
+    float sch_front   = 0.0f;
+    float sch_rear    = 0.0f;
+    int sch_front_tokens = 0;
+    const bool sch_three_present =
+        sch_prefill_env || sch_front_env || sch_rear_env || sch_front_n_env;
+    if (!sch_from_api && !result->schedule_enabled && sch_three_present) {
+        const bool valid =
+            parse_streamllm_float(sch_prefill_env, sch_prefill) &&
+            parse_streamllm_float(sch_front_env,   sch_front) &&
+            parse_streamllm_float(sch_rear_env,    sch_rear) &&
+            parse_streamllm_int  (sch_front_n_env, sch_front_tokens) &&
+            sch_front_tokens > 0;
+        if (valid) {
+            result->schedule_enabled    = true;
+            result->schedule_thresholds = { 0, sch_front_tokens };
+            result->schedule_kbars      = { sch_prefill, sch_front, sch_rear };
+            result->n_tokens_generated  = 0;
+            result->schedule_next_idx   = 0;
+            const bool ok = streamllm_set_kbar(
+                result->schedule_kbars[0], result->schedule_allocator_mode);
+            LOG_INF("streamllm 3-level kbar schedule: prefill=%.3f, "
+                    "front=%.3f for %d generated token(s), rear=%.3f "
+                    "(primed prefill=%s)\n",
+                    sch_prefill, sch_front, sch_front_tokens, sch_rear,
+                    ok ? "ok" : "no-op (no runtime)");
+        } else {
+            LOG_WRN("streamllm 3-level kbar schedule: env vars present but "
+                    "malformed — expected STREAMLLM_KBAR_PREFILL, "
+                    "STREAMLLM_KBAR_FRONT, STREAMLLM_KBAR_REAR, and "
+                    "STREAMLLM_KBAR_FRONT_TOKENS>0 — disabled\n");
+        }
+    }
+    const char * sch_thr_csv  = (!sch_from_api && !result->schedule_enabled) ? std::getenv("STREAMLLM_KBAR_SCHEDULE_TOKENS") : nullptr;
+    const char * sch_dial_csv = (!sch_from_api && !result->schedule_enabled) ? std::getenv("STREAMLLM_KBAR_SCHEDULE_VALUES") : nullptr;
     // Treat empty strings as unset — the orchestrator may clear env
     // explicitly when using the HTTP API path.
     if (sch_thr_csv  && !sch_thr_csv[0])  sch_thr_csv  = nullptr;
@@ -589,6 +731,62 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
+static float streamllm_linear_budget_for_token(const common_sampler * gsmpl, int token_idx) {
+    if (token_idx <= gsmpl->schedule_tg_decay_start) {
+        return gsmpl->schedule_tg_high_budget;
+    }
+    if (token_idx >= gsmpl->schedule_tg_decay_end) {
+        return gsmpl->schedule_tg_low_budget;
+    }
+    const float denom = (float) (gsmpl->schedule_tg_decay_end - gsmpl->schedule_tg_decay_start);
+    const float alpha = (float) (token_idx - gsmpl->schedule_tg_decay_start) / denom;
+    return gsmpl->schedule_tg_high_budget +
+           alpha * (gsmpl->schedule_tg_low_budget - gsmpl->schedule_tg_high_budget);
+}
+
+static bool streamllm_apply_scheduled_kbar(common_sampler * gsmpl, float kbar) {
+    if (gsmpl->schedule_last_applied_budget >= 0.0f &&
+        std::fabs(gsmpl->schedule_last_applied_budget - kbar) < 1.0e-6f)
+    {
+        return true;
+    }
+    const bool ok = streamllm_set_kbar(kbar, gsmpl->schedule_allocator_mode);
+    gsmpl->schedule_last_applied_budget = kbar;
+    return ok;
+}
+
+void common_sampler_streamllm_begin_generation(struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->schedule_enabled || gsmpl->schedule_generation_started) {
+        return;
+    }
+
+    gsmpl->schedule_generation_started = true;
+    gsmpl->n_tokens_generated = 0;
+
+    if (gsmpl->schedule_linear_decay) {
+        const bool ok = streamllm_apply_scheduled_kbar(
+            gsmpl, gsmpl->schedule_tg_high_budget);
+        LOG_INF("streamllm linear kbar schedule: generation begin, "
+                "tg_high=%.3f (set_kbar=%s)\n",
+                gsmpl->schedule_tg_high_budget, ok ? "ok" : "no-op");
+        return;
+    }
+
+    while (gsmpl->schedule_next_idx <
+           (int) gsmpl->schedule_thresholds.size() &&
+           gsmpl->schedule_thresholds[gsmpl->schedule_next_idx] == 0)
+    {
+        const int next_dial = gsmpl->schedule_next_idx + 1;
+        const float kbar = gsmpl->schedule_kbars[next_dial];
+        const bool ok = streamllm_set_kbar(
+            kbar, gsmpl->schedule_allocator_mode);
+        LOG_INF("streamllm kbar schedule: generation begin, "
+                "swap to kbar[%d] (set_kbar=%s)\n",
+                next_dial, ok ? "ok" : "no-op");
+        gsmpl->schedule_next_idx++;
+    }
+}
+
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
@@ -610,28 +808,49 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     }
 
     const auto tm = gsmpl->tm();
+    const bool is_generation_accept = accept_grammar;
 
     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
     accept_grammar = accept_grammar && grammar_should_apply(gsmpl);
 
     llama_sampler_accept(gsmpl->rbudget, token);
 
-    if (gsmpl->schedule_enabled) {
+    if (gsmpl->schedule_enabled && !gsmpl->schedule_generation_started && is_generation_accept) {
+        common_sampler_streamllm_begin_generation(gsmpl);
+    }
+
+    if (gsmpl->schedule_enabled && gsmpl->schedule_generation_started) {
         gsmpl->n_tokens_generated++;
-        while (gsmpl->schedule_next_idx <
+        if (gsmpl->schedule_linear_decay) {
+            const int next_token_idx = gsmpl->n_tokens_generated + 1;
+            const float next_kbar =
+                streamllm_linear_budget_for_token(gsmpl, next_token_idx);
+            const bool ok = streamllm_apply_scheduled_kbar(gsmpl, next_kbar);
+            if (gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_start ||
+                gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_end - 1 ||
+                gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_end)
+            {
+                LOG_INF("streamllm linear kbar schedule: at token %d, "
+                        "next_token=%d kbar=%.3f (set_kbar=%s)\n",
+                        gsmpl->n_tokens_generated, next_token_idx,
+                        next_kbar, ok ? "ok" : "no-op");
+            }
+        } else {
+            while (gsmpl->schedule_next_idx <
                (int) gsmpl->schedule_thresholds.size() &&
                gsmpl->n_tokens_generated >=
                gsmpl->schedule_thresholds[gsmpl->schedule_next_idx])
-        {
-            const int next_dial = gsmpl->schedule_next_idx + 1;
-            const float kbar = gsmpl->schedule_kbars[next_dial];
-            const bool ok = streamllm_set_kbar(
-                kbar, gsmpl->schedule_allocator_mode);
-            LOG_INF("streamllm kbar schedule: at token %d, "
-                    "swap to kbar[%d] (set_kbar=%s)\n",
-                    gsmpl->n_tokens_generated, next_dial,
-                    ok ? "ok" : "no-op");
-            gsmpl->schedule_next_idx++;
+            {
+                const int next_dial = gsmpl->schedule_next_idx + 1;
+                const float kbar = gsmpl->schedule_kbars[next_dial];
+                const bool ok = streamllm_set_kbar(
+                    kbar, gsmpl->schedule_allocator_mode);
+                LOG_INF("streamllm kbar schedule: at token %d, "
+                        "swap to kbar[%d] (set_kbar=%s)\n",
+                        gsmpl->n_tokens_generated, next_dial,
+                        ok ? "ok" : "no-op");
+                gsmpl->schedule_next_idx++;
+            }
         }
     }
 
@@ -683,6 +902,25 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .phase_aware_enabled = */ gsmpl->phase_aware_enabled,
+        /* .kbar_reasoning = */ gsmpl->kbar_reasoning,
+        /* .kbar_generation = */ gsmpl->kbar_generation,
+        /* .prev_rbudget_state = */ gsmpl->prev_rbudget_state,
+        /* .schedule_enabled = */ gsmpl->schedule_enabled,
+        /* .schedule_thresholds = */ gsmpl->schedule_thresholds,
+        /* .schedule_kbars = */ gsmpl->schedule_kbars,
+        /* .schedule_allocator_mode = */ gsmpl->schedule_allocator_mode,
+        /* .n_tokens_generated = */ gsmpl->n_tokens_generated,
+        /* .schedule_next_idx = */ gsmpl->schedule_next_idx,
+        /* .schedule_generation_started = */ gsmpl->schedule_generation_started,
+        /* .schedule_linear_decay = */ gsmpl->schedule_linear_decay,
+        /* .schedule_pp_budget = */ gsmpl->schedule_pp_budget,
+        /* .schedule_tg_high_budget = */ gsmpl->schedule_tg_high_budget,
+        /* .schedule_tg_low_budget = */ gsmpl->schedule_tg_low_budget,
+        /* .schedule_last_applied_budget = */ gsmpl->schedule_last_applied_budget,
+        /* .schedule_tg_decay_start = */ gsmpl->schedule_tg_decay_start,
+        /* .schedule_tg_decay_end = */ gsmpl->schedule_tg_decay_end,
+        /* .t_total_us = */ gsmpl->t_total_us,
     };
 }
 

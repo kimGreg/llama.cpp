@@ -54,6 +54,10 @@ struct DynamicGpuPlanScratch {
     int      B1        = 0;
     int *    chunks_d  = nullptr;
     int *    chunks_h  = nullptr;
+    int *    expert_order_d = nullptr;
+    int *    expert_order_h = nullptr;
+    int *    n_active_d = nullptr;
+    int *    n_active_h = nullptr;
     float *  dp_prev_d = nullptr;
     float *  dp_cur_d  = nullptr;
     uint8_t * trace_d  = nullptr;

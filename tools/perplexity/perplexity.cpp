@@ -1515,6 +1515,93 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
+    if (llama_n_seq_max(ctx) == 1) {
+        LOG_INF("%s: serial multiple-choice scoring with n_parallel=1\n", __func__);
+
+        llama_batch batch = llama_batch_init(n_ctx, 0, 1);
+        std::vector<float> tok_logits(n_vocab);
+        std::vector<float> batch_logits(size_t(n_ctx)*n_vocab);
+
+        int n_done = 0;
+        int n_correct = 0;
+        int n_tot_answers = 0;
+
+        for (auto & cur_task : tasks) {
+            cur_task.log_probs.resize(cur_task.seq_tokens.size());
+
+            for (int s = 0; s < int(cur_task.seq_tokens.size()); ++s) {
+                const auto & seq = cur_task.seq_tokens[s];
+                if (seq.size() > (size_t) n_ctx) {
+                    LOG_ERR("%s : task %d answer %d does not fit in the context window (requires %zu tokens)\n",
+                            __func__, n_done, s, seq.size());
+                    llama_batch_free(batch);
+                    return;
+                }
+
+                common_batch_clear(batch);
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    const bool needs_logits =
+                        i + 1 < seq.size() && i + 1 >= cur_task.common_prefix;
+                    common_batch_add(batch, seq[i], i, { 0 }, needs_logits);
+                }
+
+                llama_memory_clear(llama_get_memory(ctx), true);
+                if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
+                    LOG_ERR("%s: llama_decode() failed\n", __func__);
+                    llama_batch_free(batch);
+                    return;
+                }
+
+                size_t i_logits = 0;
+                size_t count = 0;
+                float log_prob = 0.0f;
+                for (size_t i = 0; i + 1 < seq.size(); ++i) {
+                    if (i + 1 < cur_task.common_prefix) {
+                        continue;
+                    }
+                    std::memcpy(tok_logits.data(),
+                            batch_logits.data() + i_logits*n_vocab,
+                            n_vocab*sizeof(float));
+                    const auto probs = softmax(tok_logits);
+                    log_prob += std::log(probs[seq[i + 1]]);
+                    ++count;
+                    ++i_logits;
+                }
+                cur_task.log_probs[s] = count > 0 ? log_prob / count : -INFINITY;
+            }
+
+            size_t logprob_max_idx = 0;
+            float  logprob_max_val = cur_task.log_probs[0];
+            for (size_t s = 1; s < cur_task.log_probs.size(); s++) {
+                if (cur_task.log_probs[s] > logprob_max_val) {
+                    logprob_max_val = cur_task.log_probs[s];
+                    logprob_max_idx = s;
+                }
+            }
+
+            n_tot_answers += cur_task.log_probs.size();
+            if (cur_task.mc1.labels[logprob_max_idx] == 1) {
+                ++n_correct;
+            }
+            ++n_done;
+            LOG("%d\t%.8lf\n", n_done, 100.*n_correct/n_done);
+        }
+
+        llama_batch_free(batch);
+
+        if (n_done < 100 && (params.multiple_choice_tasks != 0 && params.multiple_choice_tasks < (size_t)n_task)) return;
+
+        float p = 1.f*n_correct/n_done;
+        float sigma = sqrt(p*(1-p)/(n_done-1));
+        LOG("\n");
+        LOG_INF("Final result: %.4f +/- %.4f\n", 100.f*p, 100.f*sigma);
+        p = 1.f*n_done/n_tot_answers;
+        sigma = sqrt(p*(1-p)/(n_done-1));
+        LOG_INF("Random chance: %.4f +/- %.4f\n", 100.f*p, 100.f*sigma);
+        LOG_INF("\n");
+        return;
+    }
+
     const int max_tasks_per_batch = 32;
     const int max_seq = std::min(4*max_tasks_per_batch, (int) llama_n_seq_max(ctx));
 
@@ -2026,8 +2113,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const char * serial_mc = std::getenv("STREAMLLM_MC_SERIAL_NP1");
+    const bool serial_mc_np1 =
+        serial_mc != nullptr && serial_mc[0] != '\0' && serial_mc[0] != '0';
     if (params.hellaswag || params.winogrande || params.multiple_choice) {
-        params.n_parallel = std::max(4, params.n_parallel);
+        params.n_parallel = serial_mc_np1 && params.multiple_choice
+            ? 1
+            : std::max(4, params.n_parallel);
         params.kv_unified = true;
     } else { // Perplexity & KL divergence
         params.n_parallel = std::max(1, params.n_batch / n_ctx);

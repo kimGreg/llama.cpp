@@ -722,21 +722,19 @@ void launch_plan_per_expert_planes(
 //
 // One block does the entire per-dispatch allocation:
 //   Phase 1 (parallel across threads):
-//     scan (n_tokens × n_used) ids → per-expert max gate score, active-flag.
+//     scan (n_tokens × n_used) ids → per-expert Σ gate², active-flag.
 //   Phase 2 (single thread):
-//     B_local = round(n_active × kbar);
-//     K[e]    = active[e] ? K_min : 0;     used = Σ K[e];
-//     while (used < B_local):
-//        e*   = argmax over active experts with K[e]<K_max of g²·ΔR;
-//        if e* < 0: break;
-//        K[e*] += 1; used += 1;
+//     exact DP over active experts:
+//       minimise Σ_e Σ_g²[e] · R[L,e,K[e]]
+//       subject to Σ_e K[e] = round(n_active × kbar)
 //   Phase 3 (parallel):
 //     planes_per_eid_d[e] = any_precision ? base_p + K[e] - 1 : K[e]
 //
 // Shared mem layout (sized for n_expert ≤ 256 and n_K ≤ 8):
-//   s_max_g  [N]   float    — per-expert max gate
+//   s_sum_g2 [N]   float    — per-expert Σ gate² across the batch
 //   s_active [N]   int      — 0/1 routed flag
 //   s_K      [N]   int      — current K per expert (== chunks pinned)
+//   s_eids   [N]   int      — active experts in first-routed order
 namespace {
 
 constexpr int K_KBAR_N_EXPERT_MAX = 256;
@@ -757,22 +755,26 @@ __global__ void k_plan_per_expert_kbar(
     int n_chunks_max,
     int base_p,
     int any_precision,
+    float * __restrict__ dp_prev,
+    float * __restrict__ dp_cur,
+    uint8_t * __restrict__ trace,
     int * __restrict__ planes_per_eid)
 {
-    __shared__ float s_max_g [K_KBAR_N_EXPERT_MAX];
+    __shared__ float s_sum_g2[K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_active[K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_K     [K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_eids  [K_KBAR_N_EXPERT_MAX];
 
     const int tid = (int) threadIdx.x;
     // Init.
     for (int e = tid; e < n_expert; e += (int) blockDim.x) {
-        s_max_g [e] = 0.0f;
+        s_sum_g2[e] = 0.0f;
         s_active[e] = 0;
         s_K     [e] = 0;
     }
     __syncthreads();
 
-    // Phase 1: per-expert max gate.
+    // Phase 1: per-expert batch gate energy, Σ g².
     const int total = n_tokens * n_used;
     for (int idx = tid; idx < total; idx += (int) blockDim.x) {
         const int e = ids[idx];
@@ -790,48 +792,79 @@ __global__ void k_plan_per_expert_kbar(
             if (g < 0.05f) g = 0.05f;
         }
         if (g < 0.0f) g = 0.0f;
-        // Atomic max via __float_as_uint trick (gates non-negative here).
-        atomicMax((unsigned int *) &s_max_g[e], __float_as_uint(g));
+        atomicAdd(&s_sum_g2[e], g * g);
     }
     __syncthreads();
 
-    // Phase 2: knapsack — single thread.  n_expert ≤ 128 × n_K ≤ 6
-    // → 128 × 4 = 512 compares total. Sub-microsecond.
+    // Phase 2: exact dynamic program.  Matches the eager runtime
+    // planner, including first-routed active expert order for
+    // deterministic tie-breaking.
     if (tid == 0) {
         int n_active = 0;
-        for (int e = 0; e < n_expert; ++e) {
-            if (s_active[e]) {
-                s_K[e] = K_min;
-                ++n_active;
-            }
-        }
-        const long target = (long) lrintf((float) n_active * kbar);
-        long used = (long) n_active * (long) K_min;
-        long remaining = target - used;
-
-        while (remaining > 0) {
-            int   best_e = -1;
-            float best_g = -1.0f;
-            for (int e = 0; e < n_expert; ++e) {
-                if (!s_active[e]) continue;
-                if (s_K[e] >= K_max) continue;
-                // ki = s_K[e] - K_min + 1 = next plane index ≥ 1
-                const int ki = s_K[e] - K_min + 1;
-                if (ki >= n_K) continue;
-                const float R_prev = R[e * n_K + (ki - 1)];
-                const float R_here = R[e * n_K + ki];
-                float dR = R_prev - R_here;
-                if (dR < 0.0f) dR = 0.0f;
-                const float g  = s_max_g[e];
-                const float gain = g * g * dR;
-                if (gain > best_g) {
-                    best_g = gain;
-                    best_e = e;
+        for (int idx = 0; idx < total; ++idx) {
+            const int e = ids[idx];
+            if (e < 0 || e >= n_expert || !s_active[e]) continue;
+            bool seen = false;
+            for (int j = 0; j < n_active; ++j) {
+                if (s_eids[j] == e) {
+                    seen = true;
+                    break;
                 }
             }
-            if (best_e < 0) break;
-            s_K[best_e] += 1;
-            remaining   -= 1;
+            if (!seen) s_eids[n_active++] = e;
+        }
+
+        if (n_active > 0) {
+            int target = (int) lrintf((float) n_active * kbar);
+            const int B_lo = n_active * K_min;
+            const int B_hi = n_active * K_max;
+            if (target < B_lo) target = B_lo;
+            if (target > B_hi) target = B_hi;
+
+            const float INF = 1.0e30f;
+            for (int b = 0; b <= target; ++b) {
+                dp_prev[b] = INF;
+                dp_cur[b] = INF;
+            }
+            dp_prev[0] = 0.0f;
+
+            float * prev = dp_prev;
+            float * cur  = dp_cur;
+            const int B1 = n_expert * K_max + 1;
+            for (int i = 0; i < n_active; ++i) {
+                for (int b = 0; b <= target; ++b) cur[b] = INF;
+                const int e = s_eids[i];
+                const float g2 = s_sum_g2[e];
+                for (int prev_b = 0; prev_b <= target; ++prev_b) {
+                    const float base = prev[prev_b];
+                    if (base >= INF * 0.5f) continue;
+                    for (int K = K_min; K <= K_max; ++K) {
+                        const int nb = prev_b + K;
+                        if (nb > target) break;
+                        const float cost =
+                            base + g2 * R[e * n_K + (K - K_min)];
+                        if (cost < cur[nb]) {
+                            cur[nb] = cost;
+                            trace[(size_t) i * (size_t) B1 + (size_t) nb] =
+                                (uint8_t) K;
+                        }
+                    }
+                }
+                float * tmp = prev;
+                prev = cur;
+                cur = tmp;
+            }
+
+            int b = target;
+            for (int i = n_active - 1; i >= 0; --i) {
+                const int e = s_eids[i];
+                int K = (int) trace[(size_t) i * (size_t) B1 + (size_t) b];
+                if (K < K_min || K > K_max) K = K_min;
+                if (K > n_chunks_max) K = n_chunks_max;
+                s_K[e] = K;
+                b -= K;
+                if (b < 0) b = 0;
+            }
         }
 
         // ── Runtime sanity check — PROBLEM.md §10 invariants.
@@ -850,11 +883,17 @@ __global__ void k_plan_per_expert_kbar(
             }
             check_sum += K_i;
         }
-        const long expected = target - remaining;
+        long expected = n_active > 0
+            ? (long) lrintf((float) n_active * kbar)
+            : 0;
+        const long B_lo = (long) n_active * (long) K_min;
+        const long B_hi = (long) n_active * (long) K_max;
+        if (expected < B_lo) expected = B_lo;
+        if (expected > B_hi) expected = B_hi;
         if (check_sum != expected) {
             printf("streamllm-allocator[gpu]: Σ K[e]=%ld != "
-                    "expected=%ld (target=%ld remaining=%ld n_active=%d kbar=%g)\n",
-                    check_sum, expected, target, remaining, n_active,
+                    "expected=%ld (n_active=%d kbar=%g)\n",
+                    check_sum, expected, n_active,
                     (double) kbar);
             __trap();
         }
@@ -891,11 +930,15 @@ void launch_plan_per_expert_kbar(
     int             n_chunks_max,
     int             base_p,
     bool            any_precision,
+    float *         dp_prev_d,
+    float *         dp_cur_d,
+    uint8_t *       trace_d,
     int *           planes_per_eid_d,
     StreamHandle    stream)
 {
     if (n_expert <= 0 || planes_per_eid_d == nullptr) return;
     if (ids_d == nullptr || R_d == nullptr)            return;
+    if (dp_prev_d == nullptr || dp_cur_d == nullptr || trace_d == nullptr) return;
     if (n_tokens <= 0 || n_used <= 0)                  return;
     if (K_max <= K_min)                                 return;
     if (!(kbar > 0.0f))                                 return;
@@ -909,6 +952,7 @@ void launch_plan_per_expert_kbar(
         n_tokens, n_used, n_expert, n_K,
         K_min, K_max, kbar,
         n_chunks_max, base_p, any_precision ? 1 : 0,
+        dp_prev_d, dp_cur_d, trace_d,
         planes_per_eid_d);
 }
 
@@ -992,17 +1036,19 @@ __global__ void k_plan_chunks_kbar_exact_strided(
     float kbar,
     int n_chunks_max,
     int * __restrict__ chunks_per_eid,
+    int * __restrict__ expert_order,
+    int * __restrict__ n_active_out,
     float * __restrict__ dp_prev,
     float * __restrict__ dp_cur,
     uint8_t * __restrict__ trace)
 {
-    __shared__ float s_max_g[K_KBAR_N_EXPERT_MAX];
+    __shared__ float s_sum_g2[K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_active[K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_eids[K_KBAR_N_EXPERT_MAX];
 
     const int tid = (int) threadIdx.x;
     for (int e = tid; e < n_expert; e += (int) blockDim.x) {
-        s_max_g[e] = 0.0f;
+        s_sum_g2[e] = 0.0f;
         s_active[e] = 0;
         chunks_per_eid[e] = 0;
     }
@@ -1026,14 +1072,40 @@ __global__ void k_plan_chunks_kbar_exact_strided(
             if (g < 0.05f) g = 0.05f;
         }
         if (g < 0.0f) g = 0.0f;
-        atomicMax((unsigned int *) &s_max_g[e], __float_as_uint(g));
+        atomicAdd(&s_sum_g2[e], g * g);
     }
     __syncthreads();
 
     if (tid == 0) {
+        if (n_active_out != nullptr) {
+            *n_active_out = 0;
+        }
+        // Match MoEMatMulComp::plan() exactly: the CPU allocator builds
+        // its active expert list in first-routed order, not sorted eid
+        // order.  DP tie-breaking depends on this order because equal-cost
+        // states keep the first trace entry.
         int n_active = 0;
-        for (int e = 0; e < n_expert; ++e) {
-            if (s_active[e]) s_eids[n_active++] = e;
+        for (int idx = 0; idx < total; ++idx) {
+            const int t = idx / n_used;
+            const int u = idx - t * n_used;
+            const int e = (int) load_i32_strided(ids, ids_row_stride, t, u);
+            if (e < 0 || e >= n_expert || !s_active[e]) continue;
+            bool seen = false;
+            for (int j = 0; j < n_active; ++j) {
+                if (s_eids[j] == e) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) s_eids[n_active++] = e;
+        }
+        if (expert_order != nullptr) {
+            for (int i = 0; i < n_active; ++i) {
+                expert_order[i] = s_eids[i];
+            }
+        }
+        if (n_active_out != nullptr) {
+            *n_active_out = n_active;
         }
         if (n_active > 0) {
             int target = (int) lrintf((float) n_active * kbar);
@@ -1055,7 +1127,7 @@ __global__ void k_plan_chunks_kbar_exact_strided(
             for (int i = 0; i < n_active; ++i) {
                 for (int b = 0; b <= target; ++b) cur[b] = INF;
                 const int e = s_eids[i];
-                const float g2 = s_max_g[e] * s_max_g[e];
+                const float g2 = s_sum_g2[e];
                 for (int prev_b = 0; prev_b <= target; ++prev_b) {
                     const float base = prev[prev_b];
                     if (base >= INF * 0.5f) continue;
@@ -1108,6 +1180,8 @@ void launch_plan_chunks_kbar_exact_strided(
     int             n_expert,
     int             n_chunks_max,
     int *           chunks_per_eid_d,
+    int *           expert_order_d,
+    int *           n_active_d,
     float *         dp_prev_d,
     float *         dp_cur_d,
     uint8_t *       trace_d,
@@ -1129,7 +1203,8 @@ void launch_plan_chunks_kbar_exact_strided(
         R_layer,
         n_tokens, n_used, n_expert, n_K,
         K_min, K_max, kbar, n_chunks_max,
-        chunks_per_eid_d, dp_prev_d, dp_cur_d, trace_d);
+        chunks_per_eid_d, expert_order_d, n_active_d,
+        dp_prev_d, dp_cur_d, trace_d);
 }
 
 }}  // namespace streamllm_ext::qwen3

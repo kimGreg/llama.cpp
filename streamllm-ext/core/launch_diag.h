@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 
 namespace streamllm_ext { namespace launch_diag {
 
@@ -75,6 +76,64 @@ inline std::atomic<uint64_t> g_dispatch_one_canonical_calls{0};
 inline std::atomic<uint64_t> g_load_set_size_sum{0};
 inline std::atomic<uint64_t> g_load_set_dispatch_count{0};
 
+enum class Phase : int {
+    PreInputsD2H = 0,
+    Plan,
+    Reserve,
+    Load,
+    Validate,
+    Execute,
+    Release,
+    Pread,
+    PoolLoad,
+    PointerPatch,
+    DirectPrepare,
+    DirectIdsD2H,
+    DirectLoad,
+    DirectD2D,
+    _COUNT
+};
+
+inline const char * phase_name(Phase p) {
+    switch (p) {
+        case Phase::PreInputsD2H:  return "pre_inputs_d2h";
+        case Phase::Plan:          return "plan";
+        case Phase::Reserve:       return "reserve";
+        case Phase::Load:          return "load";
+        case Phase::Validate:      return "validate";
+        case Phase::Execute:       return "execute";
+        case Phase::Release:       return "release";
+        case Phase::Pread:         return "pread";
+        case Phase::PoolLoad:      return "pool_load";
+        case Phase::PointerPatch:  return "pointer_patch";
+        case Phase::DirectPrepare: return "direct_prepare";
+        case Phase::DirectIdsD2H:  return "direct_ids_d2h";
+        case Phase::DirectLoad:    return "direct_load";
+        case Phase::DirectD2D:     return "direct_d2d";
+        default:                   return "?";
+    }
+}
+
+// Index 0 = prefill / multi-token, index 1 = decode / single-token.
+inline std::atomic<uint64_t> g_phase_ns[2][(int)Phase::_COUNT] = {};
+inline std::atomic<uint64_t> g_phase_calls[2][(int)Phase::_COUNT] = {};
+inline std::atomic<uint64_t> g_pread_logical_bytes[2] = {};
+inline std::atomic<uint64_t> g_pread_physical_bytes[2] = {};
+inline std::atomic<uint64_t> g_pread_spans[2] = {};
+inline std::atomic<uint64_t> g_required_by_chunk[2][8] = {};
+inline std::atomic<uint64_t> g_resident_by_chunk[2][8] = {};
+inline std::atomic<uint64_t> g_unique_load_by_chunk[2][8] = {};
+inline std::atomic<uint64_t> g_evicted_by_chunk[8] = {};
+inline thread_local bool g_current_decode_phase = false;
+
+inline void set_current_decode_phase(bool decode) {
+    g_current_decode_phase = decode;
+}
+
+inline bool current_decode_phase() {
+    return g_current_decode_phase;
+}
+
 inline void note_launch(Kind k) {
     const int i = (int) k;
     if (i < 0 || i >= (int) Kind::_COUNT) return;
@@ -98,6 +157,69 @@ inline void note_load_set(size_t n) {
     g_load_set_dispatch_count.fetch_add(1,       std::memory_order_relaxed);
 }
 
+inline void note_phase(Phase p, bool decode, uint64_t ns) {
+    const int i = (int) p;
+    if (i < 0 || i >= (int) Phase::_COUNT) return;
+    const int ph = decode ? 1 : 0;
+    g_phase_ns[ph][i].fetch_add(ns, std::memory_order_relaxed);
+    g_phase_calls[ph][i].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void note_pread_io(bool decode, size_t logical_bytes,
+                          size_t physical_bytes, size_t spans) {
+    const int ph = decode ? 1 : 0;
+    g_pread_logical_bytes[ph].fetch_add(
+        (uint64_t) logical_bytes, std::memory_order_relaxed);
+    g_pread_physical_bytes[ph].fetch_add(
+        (uint64_t) physical_bytes, std::memory_order_relaxed);
+    g_pread_spans[ph].fetch_add((uint64_t) spans,
+                                std::memory_order_relaxed);
+}
+
+inline int chunk_bucket_from_cid(int cid) {
+    constexpr int kCidChunkBaseLocal = 100;
+    const int p = cid - kCidChunkBaseLocal;
+    return (p >= 0 && p < 8) ? p : -1;
+}
+
+inline void note_required_chunk(bool decode, int cid, bool resident) {
+    const int p = chunk_bucket_from_cid(cid);
+    if (p < 0) return;
+    const int ph = decode ? 1 : 0;
+    g_required_by_chunk[ph][p].fetch_add(1, std::memory_order_relaxed);
+    if (resident) {
+        g_resident_by_chunk[ph][p].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void note_unique_load_chunk(bool decode, int cid) {
+    const int p = chunk_bucket_from_cid(cid);
+    if (p < 0) return;
+    const int ph = decode ? 1 : 0;
+    g_unique_load_by_chunk[ph][p].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void note_evicted_chunk(int cid) {
+    const int p = chunk_bucket_from_cid(cid);
+    if (p < 0) return;
+    g_evicted_by_chunk[p].fetch_add(1, std::memory_order_relaxed);
+}
+
+class PhaseTimer {
+public:
+    PhaseTimer(Phase p, bool decode)
+        : p_(p), decode_(decode), t0_(std::chrono::steady_clock::now()) {}
+    ~PhaseTimer() {
+        const auto dt = std::chrono::steady_clock::now() - t0_;
+        note_phase(p_, decode_, (uint64_t) std::chrono::duration_cast<
+            std::chrono::nanoseconds>(dt).count());
+    }
+private:
+    Phase p_;
+    bool decode_;
+    std::chrono::steady_clock::time_point t0_;
+};
+
 // Reset every counter to zero.  Useful between bench phases.
 inline void reset() {
     for (int i = 0; i < (int) Kind::_COUNT; ++i) {
@@ -112,6 +234,23 @@ inline void reset() {
     g_dispatch_one_canonical_calls.store(0, std::memory_order_relaxed);
     g_load_set_size_sum.store(0,            std::memory_order_relaxed);
     g_load_set_dispatch_count.store(0,      std::memory_order_relaxed);
+    for (int ph = 0; ph < 2; ++ph) {
+        for (int i = 0; i < (int) Phase::_COUNT; ++i) {
+            g_phase_ns[ph][i].store(0, std::memory_order_relaxed);
+            g_phase_calls[ph][i].store(0, std::memory_order_relaxed);
+        }
+        g_pread_logical_bytes[ph].store(0, std::memory_order_relaxed);
+        g_pread_physical_bytes[ph].store(0, std::memory_order_relaxed);
+        g_pread_spans[ph].store(0, std::memory_order_relaxed);
+        for (int p = 0; p < 8; ++p) {
+            g_required_by_chunk[ph][p].store(0, std::memory_order_relaxed);
+            g_resident_by_chunk[ph][p].store(0, std::memory_order_relaxed);
+            g_unique_load_by_chunk[ph][p].store(0, std::memory_order_relaxed);
+        }
+    }
+    for (int p = 0; p < 8; ++p) {
+        g_evicted_by_chunk[p].store(0, std::memory_order_relaxed);
+    }
 }
 
 inline void dump_to_stderr() {
@@ -156,6 +295,90 @@ inline void dump_to_stderr() {
         std::fprintf(stderr,
             "    %-22s = %10lu  (%.2f / forward_moe_layer)\n",
             kind_name((Kind) i), (unsigned long) v, per_fwd);
+    }
+
+    std::fprintf(stderr, "  phase timings by phase:\n");
+    for (int ph = 0; ph < 2; ++ph) {
+        const char * ph_name = ph ? "decode" : "prefill";
+        uint64_t total_ns = 0;
+        for (int i = 0; i < (int) Phase::_COUNT; ++i) {
+            total_ns += g_phase_ns[ph][i].load(std::memory_order_relaxed);
+        }
+        if (total_ns == 0) continue;
+        std::fprintf(stderr, "    [%s]\n", ph_name);
+        for (int i = 0; i < (int) Phase::_COUNT; ++i) {
+            const uint64_t ns = g_phase_ns[ph][i].load(std::memory_order_relaxed);
+            const uint64_t calls = g_phase_calls[ph][i].load(std::memory_order_relaxed);
+            if (ns == 0 && calls == 0) continue;
+            std::fprintf(stderr,
+                "      %-16s calls=%8lu total=%10.3f ms avg=%9.2f us\n",
+                phase_name((Phase) i),
+                (unsigned long) calls,
+                ns / 1.0e6,
+                calls ? (double) ns / (double) calls / 1.0e3 : 0.0);
+        }
+        const uint64_t logical =
+            g_pread_logical_bytes[ph].load(std::memory_order_relaxed);
+        const uint64_t physical =
+            g_pread_physical_bytes[ph].load(std::memory_order_relaxed);
+        const uint64_t spans =
+            g_pread_spans[ph].load(std::memory_order_relaxed);
+        if (logical || physical || spans) {
+            std::fprintf(stderr,
+                "      pread_io         logical=%8.1f MB physical=%8.1f MB "
+                "gap=%8.1f MB spans=%8lu avg_span=%8.1f KB\n",
+                logical / 1048576.0,
+                physical / 1048576.0,
+                physical >= logical ? (physical - logical) / 1048576.0 : 0.0,
+                (unsigned long) spans,
+                spans ? (double) physical / (double) spans / 1024.0 : 0.0);
+        }
+        bool any_chunk = false;
+        for (int p = 0; p < 8; ++p) {
+            if (g_required_by_chunk[ph][p].load(std::memory_order_relaxed) ||
+                g_unique_load_by_chunk[ph][p].load(std::memory_order_relaxed)) {
+                any_chunk = true;
+                break;
+            }
+        }
+        if (any_chunk) {
+            std::fprintf(stderr,
+                "      chunk residency by chunk index:\n"
+                "        c | required | resident | hit%% | unique_loads\n");
+            for (int p = 0; p < 8; ++p) {
+                const uint64_t req =
+                    g_required_by_chunk[ph][p].load(std::memory_order_relaxed);
+                const uint64_t hit =
+                    g_resident_by_chunk[ph][p].load(std::memory_order_relaxed);
+                const uint64_t loads =
+                    g_unique_load_by_chunk[ph][p].load(std::memory_order_relaxed);
+                if (!req && !loads) continue;
+                std::fprintf(stderr,
+                    "        %d | %8lu | %8lu | %5.1f | %12lu\n",
+                    p, (unsigned long) req, (unsigned long) hit,
+                    req ? 100.0 * (double) hit / (double) req : 0.0,
+                    (unsigned long) loads);
+            }
+        }
+    }
+    bool any_evict = false;
+    for (int p = 0; p < 8; ++p) {
+        if (g_evicted_by_chunk[p].load(std::memory_order_relaxed)) {
+            any_evict = true;
+            break;
+        }
+    }
+    if (any_evict) {
+        std::fprintf(stderr,
+            "  evictions by chunk index:\n"
+            "    c | evictions\n");
+        for (int p = 0; p < 8; ++p) {
+            const uint64_t ev =
+                g_evicted_by_chunk[p].load(std::memory_order_relaxed);
+            if (!ev) continue;
+            std::fprintf(stderr, "    %d | %9lu\n",
+                         p, (unsigned long) ev);
+        }
     }
 }
 

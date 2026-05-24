@@ -139,6 +139,14 @@ public:
         size_t packed_nbytes,
         StreamHandle compute_stream = nullptr);
 
+    // Upload a batch while preserving chunk-sized cache slots. This
+    // allocates one slot per item and coalesces H2D only for adjacent
+    // destination/source runs. It returns empty on capacity failure
+    // without requiring a contiguous span for the whole batch.
+    std::vector<ChunkHandle> load_batch_scattered_sync(
+        const std::vector<BatchLoadItem> & items,
+        StreamHandle compute_stream = nullptr);
+
 
     // Evict a chunk. No-op if not resident. Always evicts when resident
     // — pool does not track pin state.
@@ -196,7 +204,9 @@ public:
     // Total capacity / current usage.
     size_t capacity_bytes() const { return capacity_bytes_; }
     size_t used_bytes()     const { return used_bytes_; }
+    size_t free_bytes() const;
     size_t peak_used_bytes() const { return peak_used_bytes_; }
+    size_t largest_free_span_bytes() const;
     size_t n_resident()     const { return residents_.size(); }
     bool   has_copy_stream() const { return copy_stream_ != nullptr; }
     StreamHandle copy_stream() const { return copy_stream_; }
