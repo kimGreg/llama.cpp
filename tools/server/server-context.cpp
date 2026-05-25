@@ -23,42 +23,42 @@
 #include <utility>
 #include <vector>
 
-// streamllm-ext live KBar dial — forward decls so server-context
-// doesn't take a hard include dependency on the streamllm-ext tree.
-// The symbols are linked in via the static lib when STREAMLLM_EXT is
+// dp-moe-ext live KBar dial — forward decls so server-context
+// doesn't take a hard include dependency on the dp-moe-ext tree.
+// The symbols are linked in via the static lib when DP_MOE_EXT is
 // enabled at build time.
-extern "C" bool streamllm_set_kbar(float kbar, int allocator_mode);
-extern "C" bool streamllm_get_kbar(float * out_kbar, int * out_allocator_mode);
+extern "C" bool dp_moe_set_kbar(float kbar, int allocator_mode);
+extern "C" bool dp_moe_get_kbar(float * out_kbar, int * out_allocator_mode);
 
-extern "C" bool streamllm_kbar_schedule_set(
+extern "C" bool dp_moe_kbar_schedule_set(
     const int * thresholds, int n_thresh,
     const float * kbars, int n_kbars,
     int allocator_mode);
-extern "C" void streamllm_schedule_clear(void);
-extern "C" bool streamllm_schedule_active(void);
+extern "C" void dp_moe_schedule_clear(void);
+extern "C" bool dp_moe_schedule_active(void);
 
-// /streamllm/stats accessors. Each is a single atomic read from the
-// streamllm-ext runtime; safe to call at high frequency.
+// /dp_moe/stats accessors. Each is a single atomic read from the
+// dp-moe-ext runtime; safe to call at high frequency.
 extern "C" {
-unsigned long long streamllm_stat_pool_used_bytes(void);
-unsigned long long streamllm_stat_pool_peak_bytes(void);
-unsigned long long streamllm_stat_pool_cap_bytes(void);
-unsigned long long streamllm_stat_pool_h2d_bytes(void);
-unsigned long long streamllm_stat_pool_h2d_calls(void);
-unsigned long long streamllm_stat_host_dram_bytes(void);
-unsigned long long streamllm_stat_hook_calls(void);
-unsigned long long streamllm_stat_dispatch_count(void);
-unsigned long long streamllm_stat_async_load_attempts(void);
-unsigned long long streamllm_stat_async_load_skipped(void);
-unsigned long long streamllm_stat_async_load_issued(void);
-unsigned long long streamllm_stat_make_room_calls(void);
-unsigned long long streamllm_stat_mc_calls(void);
-unsigned long long streamllm_stat_mc_pread_ns(void);
-unsigned long long streamllm_stat_tier_attempts(void);
-unsigned long long streamllm_stat_tier_vram_hits(void);
-unsigned long long streamllm_stat_tier_dram_hits(void);
-unsigned long long streamllm_stat_tier_ssd_misses(void);
-int                streamllm_stat_diag_enabled(void);
+unsigned long long dp_moe_stat_pool_used_bytes(void);
+unsigned long long dp_moe_stat_pool_peak_bytes(void);
+unsigned long long dp_moe_stat_pool_cap_bytes(void);
+unsigned long long dp_moe_stat_pool_h2d_bytes(void);
+unsigned long long dp_moe_stat_pool_h2d_calls(void);
+unsigned long long dp_moe_stat_host_dram_bytes(void);
+unsigned long long dp_moe_stat_hook_calls(void);
+unsigned long long dp_moe_stat_dispatch_count(void);
+unsigned long long dp_moe_stat_async_load_attempts(void);
+unsigned long long dp_moe_stat_async_load_skipped(void);
+unsigned long long dp_moe_stat_async_load_issued(void);
+unsigned long long dp_moe_stat_make_room_calls(void);
+unsigned long long dp_moe_stat_mc_calls(void);
+unsigned long long dp_moe_stat_mc_pread_ns(void);
+unsigned long long dp_moe_stat_tier_attempts(void);
+unsigned long long dp_moe_stat_tier_vram_hits(void);
+unsigned long long dp_moe_stat_tier_dram_hits(void);
+unsigned long long dp_moe_stat_tier_ssd_misses(void);
+int                dp_moe_stat_diag_enabled(void);
 }
 
 // fix problem with std::min and std::max
@@ -2933,7 +2933,7 @@ private:
 
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
-                    common_sampler_streamllm_begin_generation(slot.smpl.get());
+                    common_sampler_dp_moe_begin_generation(slot.smpl.get());
 
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
@@ -4165,7 +4165,7 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_streamllm_kbar = [this](const server_http_req & req) {
+    this->post_dp_moe_kbar = [this](const server_http_req & req) {
         auto res = create_response(true);  // bypass-sleep: no model needed
         bool ctx_server; GGML_UNUSED(ctx_server);
         const json body = json::parse(req.body);
@@ -4180,9 +4180,9 @@ void server_routes::init_routes() {
             body.value("allocator", std::string("profile"));
         const int allocator_mode = allocator == "uniform" ? 1 : 0;
         const float kbar = body["kbar"].get<float>();
-        if (!streamllm_set_kbar(kbar, allocator_mode)) {
+        if (!dp_moe_set_kbar(kbar, allocator_mode)) {
             res->error(format_error_response(
-                "streamllm runtime not active or KBar was rejected",
+                "dp_moe runtime not active or KBar was rejected",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -4194,14 +4194,14 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->get_streamllm_kbar = [this](const server_http_req &) {
+    this->get_dp_moe_kbar = [this](const server_http_req &) {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
         float kbar = 0.0f;
         int allocator_mode = 0;
-        if (!streamllm_get_kbar(&kbar, &allocator_mode)) {
+        if (!dp_moe_get_kbar(&kbar, &allocator_mode)) {
             res->error(format_error_response(
-                "streamllm runtime not active — no model with "
+                "dp_moe runtime not active — no model with "
                 "required_runtime=true is loaded.",
                 ERROR_TYPE_NOT_FOUND));
             return res;
@@ -4213,12 +4213,12 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_streamllm_kbar_schedule = [this](const server_http_req & req) {
+    this->post_dp_moe_kbar_schedule = [this](const server_http_req & req) {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
         const json body = json::parse(req.body);
         if (body.is_object() && body.value("clear", false)) {
-            streamllm_schedule_clear();
+            dp_moe_schedule_clear();
             res->ok({{"status", "cleared"}});
             return res;
         }
@@ -4331,12 +4331,12 @@ void server_routes::init_routes() {
         const std::string allocator =
             body.value("allocator", std::string("profile"));
         const int allocator_mode = allocator == "uniform" ? 1 : 0;
-        if (!streamllm_kbar_schedule_set(
+        if (!dp_moe_kbar_schedule_set(
                 thr.data(), (int) thr.size(), kbars.data(), (int) kbars.size(),
                 allocator_mode))
         {
             res->error(format_error_response(
-                "streamllm: kbar_schedule rejected (thresholds must be "
+                "dp_moe: kbar_schedule rejected (thresholds must be "
                 "ascending and |kbars|=|thresholds|+1)",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
@@ -4351,42 +4351,42 @@ void server_routes::init_routes() {
     };
 
 
-    // /streamllm/stats — realtime cache + prefetch counters. Each
+    // /dp_moe/stats — realtime cache + prefetch counters. Each
     // accessor is a single atomic load, so polling at 1 Hz adds
     // negligible overhead. Tier-hit aggregates are present only when
-    // STREAMLLM_DIAG=ON; otherwise they appear as zeros and the
+    // DP_MOE_DIAG=ON; otherwise they appear as zeros and the
     // diag_enabled flag is 0 so the panel can hide that section.
-    this->get_streamllm_stats = [this](const server_http_req &) {
+    this->get_dp_moe_stats = [this](const server_http_req &) {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
-        const auto used  = streamllm_stat_pool_used_bytes();
-        const auto peak  = streamllm_stat_pool_peak_bytes();
-        const auto cap   = streamllm_stat_pool_cap_bytes();
-        const auto attempts = streamllm_stat_tier_attempts();
-        const auto vh = streamllm_stat_tier_vram_hits();
-        const auto dh = streamllm_stat_tier_dram_hits();
-        const auto sm = streamllm_stat_tier_ssd_misses();
+        const auto used  = dp_moe_stat_pool_used_bytes();
+        const auto peak  = dp_moe_stat_pool_peak_bytes();
+        const auto cap   = dp_moe_stat_pool_cap_bytes();
+        const auto attempts = dp_moe_stat_tier_attempts();
+        const auto vh = dp_moe_stat_tier_vram_hits();
+        const auto dh = dp_moe_stat_tier_dram_hits();
+        const auto sm = dp_moe_stat_tier_ssd_misses();
         res->ok({
             {"pool", {
                 {"used_mb",        used / (1024.0 * 1024.0)},
                 {"peak_mb",        peak / (1024.0 * 1024.0)},
                 {"cap_mb",         cap  / (1024.0 * 1024.0)},
-                {"h2d_mb",         streamllm_stat_pool_h2d_bytes() / (1024.0 * 1024.0)},
-                {"h2d_calls",      streamllm_stat_pool_h2d_calls()},
-                {"make_room_calls",streamllm_stat_make_room_calls()},
-                {"host_dram_mb",   streamllm_stat_host_dram_bytes() / (1024.0 * 1024.0)},
+                {"h2d_mb",         dp_moe_stat_pool_h2d_bytes() / (1024.0 * 1024.0)},
+                {"h2d_calls",      dp_moe_stat_pool_h2d_calls()},
+                {"make_room_calls",dp_moe_stat_make_room_calls()},
+                {"host_dram_mb",   dp_moe_stat_host_dram_bytes() / (1024.0 * 1024.0)},
             }},
             {"hook", {
-                {"calls",             streamllm_stat_hook_calls()},
-                {"dispatches",        streamllm_stat_dispatch_count()},
-                {"async_load_attempts", streamllm_stat_async_load_attempts()},
-                {"async_load_skipped",  streamllm_stat_async_load_skipped()},
-                {"async_load_issued",   streamllm_stat_async_load_issued()},
-                {"mc_calls",          streamllm_stat_mc_calls()},
-                {"mc_pread_ns",       streamllm_stat_mc_pread_ns()},
+                {"calls",             dp_moe_stat_hook_calls()},
+                {"dispatches",        dp_moe_stat_dispatch_count()},
+                {"async_load_attempts", dp_moe_stat_async_load_attempts()},
+                {"async_load_skipped",  dp_moe_stat_async_load_skipped()},
+                {"async_load_issued",   dp_moe_stat_async_load_issued()},
+                {"mc_calls",          dp_moe_stat_mc_calls()},
+                {"mc_pread_ns",       dp_moe_stat_mc_pread_ns()},
             }},
             {"tier_hits", {
-                {"diag_enabled", streamllm_stat_diag_enabled() != 0},
+                {"diag_enabled", dp_moe_stat_diag_enabled() != 0},
                 {"attempts",     attempts},
                 {"vram_hits",    vh},
                 {"dram_hits",    dh},

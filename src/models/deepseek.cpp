@@ -72,15 +72,15 @@ llm_build_deepseek::llm_build_deepseek(const llama_model & model, const llm_grap
         } else {
             // MoE branch
             ggml_tensor * moe_out = nullptr;
-            if (model.streamllm_executor != nullptr) {
-                static bool _streamllm_log_once = false;
-                if (!_streamllm_log_once) {
+            if (model.dp_moe_executor != nullptr) {
+                static bool _dp_moe_log_once = false;
+                if (!_dp_moe_log_once) {
                     std::fprintf(stderr,
-                        "streamllm-ext / DeepSeek: sentinel branch active "
+                        "dp-moe-ext / DeepSeek: sentinel branch active "
                         "(first MoE layer = %d)\n", il);
-                    _streamllm_log_once = true;
+                    _dp_moe_log_once = true;
                 }
-                // StreamLLM Mode A — emit a per-layer sentinel that
+                // DP_MoE Mode A — emit a per-layer sentinel that
                 // the runtime ``pre_op_hook`` routes to
                 // ``forward_moe_layer``.  DeepSeek-MoE-16B uses
                 // hard-coded SOFTMAX + SiLU + norm_w=false; the

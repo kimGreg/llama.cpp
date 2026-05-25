@@ -155,8 +155,8 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
 
-            if (model.streamllm_executor != nullptr) {
-                // StreamLLM Mode A — Gemma 4 MoE goes through the
+            if (model.dp_moe_executor != nullptr) {
+                // DP_MoE Mode A — Gemma 4 MoE goes through the
                 // pre_routed sentinel.  We've already built the
                 // custom logits above; reuse them.  Gemma 4 uses
                 // SOFTMAX + norm_w=true + GELU; the executor must

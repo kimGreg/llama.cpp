@@ -41,10 +41,10 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
 void common_sampler_free(struct common_sampler * gsmpl);
 
-// StreamLLM dynamic KBar schedules are primed during sampler init for
+// DP_MoE dynamic KBar schedules are primed during sampler init for
 // prompt evaluation. Generation entrypoints call this once after prompt
 // eval and before generated tokens are fed back into decode.
-void                    common_sampler_streamllm_begin_generation(struct common_sampler * gsmpl);
+void                    common_sampler_dp_moe_begin_generation(struct common_sampler * gsmpl);
 
 // if accept_grammar is true, the token is accepted both by the sampling chain and the grammar
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar);

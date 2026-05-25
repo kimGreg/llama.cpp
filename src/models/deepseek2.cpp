@@ -243,8 +243,8 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
         } else {
             // MoE branch
             ggml_tensor * moe_out = nullptr;
-            if (model.streamllm_executor != nullptr) {
-                // streamllm-ext Mode A: route the routed-expert FFN through
+            if (model.dp_moe_executor != nullptr) {
+                // dp-moe-ext Mode A: route the routed-expert FFN through
                 // the per-layer sentinel; shared experts stay on the normal
                 // build_ffn path (added below).  Requires the simple
                 // softmax-topk routing — DeepSeek-MoE-16B-chat satisfies
@@ -253,16 +253,16 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                 // variant exceeds those assumptions.
                 if (model.layers[il].ffn_exp_probs_b != nullptr) {
                     GGML_ABORT(
-                        "streamllm-ext / DeepSeek-MoE (L=%d): "
+                        "dp-moe-ext / DeepSeek-MoE (L=%d): "
                         "ffn_exp_probs_b bias is not supported by the simple "
-                        "sentinel router. Disable streamllm-ext or extend "
+                        "sentinel router. Disable dp-moe-ext or extend "
                         "llm_build_moe_sentinel_pre_routed.", il);
                 }
                 if ((int) hparams.expert_gating_func != 0 /* SOFTMAX */) {
                     GGML_ABORT(
-                        "streamllm-ext / DeepSeek-MoE (L=%d): "
+                        "dp-moe-ext / DeepSeek-MoE (L=%d): "
                         "expert_gating_func=%d unsupported (expected SOFTMAX=0). "
-                        "Disable streamllm-ext or extend the sentinel.",
+                        "Disable dp-moe-ext or extend the sentinel.",
                         il, (int) hparams.expert_gating_func);
                 }
                 ggml_tensor * logits =

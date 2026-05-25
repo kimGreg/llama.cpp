@@ -1305,7 +1305,7 @@ ggml_tensor * llm_graph_context::build_ffn(
 
 // Mode A milestone 1, S3 — shared MoE router/topk/renorm helper.
 // Factored out of build_moe_ffn's simple SOFTMAX path so external
-// callers (streamllm-ext executor) can share the implementation
+// callers (dp-moe-ext executor) can share the implementation
 // without copy-paste. See llama-graph.h for the full contract.
 //
 // Op sequence MUST match build_moe_ffn's simple SOFTMAX+norm_w
@@ -1366,11 +1366,11 @@ ggml_tensor * llm_build_moe_sentinel_pre_routed(
     // **DO NOT** route this through ``llm_graph_context::cb()`` here
     // or in the caller. ``cb()`` invokes ``ggml_format_name`` which
     // overwrites the name buffer and would rename the sentinel out of
-    // the ``"streamllm.moe_layer_*"`` namespace the dispatch hook
+    // the ``"dp_moe.moe_layer_*"`` namespace the dispatch hook
     // matches on. The cgraph audit catches it; not introducing the
     // rename in the first place is faster.
     char name[64];
-    std::snprintf(name, sizeof(name), "streamllm.moe_layer_%d", il);
+    std::snprintf(name, sizeof(name), "dp_moe.moe_layer_%d", il);
     ggml_set_name(sentinel, name);
 
     return sentinel;
@@ -1482,7 +1482,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // ``llm_build_moe_routing_softmax_topk``. The cgraph op sequence
     // emitted by the helper matches the original inline code below
     // exactly — this branch is a refactor, not a behavioral change.
-    // External callers (the streamllm-ext Qwen3-MoE executor,
+    // External callers (the dp-moe-ext Qwen3-MoE executor,
     // Mode A milestone 1 S5+) call the same helper directly so the
     // router/topk construction has a single source of truth.
     //

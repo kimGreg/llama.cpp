@@ -20,6 +20,9 @@
 #include <thread>
 #include <vector>
 
+extern "C" bool dp_moe_set_prefill_decay_end(
+    unsigned long long n_tokens, int reset_state) __attribute__((weak));
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -1546,6 +1549,10 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
                 }
 
                 llama_memory_clear(llama_get_memory(ctx), true);
+                if (dp_moe_set_prefill_decay_end) {
+                    dp_moe_set_prefill_decay_end(
+                        (unsigned long long) seq.size(), 1);
+                }
                 if (!decode_helper(ctx, batch, batch_logits, n_batch, n_vocab)) {
                     LOG_ERR("%s: llama_decode() failed\n", __func__);
                     llama_batch_free(batch);
@@ -2113,7 +2120,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const char * serial_mc = std::getenv("STREAMLLM_MC_SERIAL_NP1");
+    const char * serial_mc = std::getenv("DP_MOE_MC_SERIAL_NP1");
     const bool serial_mc_np1 =
         serial_mc != nullptr && serial_mc[0] != '\0' && serial_mc[0] != '0';
     if (params.hellaswag || params.winogrande || params.multiple_choice) {

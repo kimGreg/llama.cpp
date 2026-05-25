@@ -45,7 +45,7 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
-// streamllm-ext integration: GGML_OP_MUL_MAT override. Mode A M1
+// dp-moe-ext integration: GGML_OP_MUL_MAT override. Mode A M1
 // uses this *only* as the criterion-10 clear-fail point: if the hook
 // detects a managed canonical surfacing as a dense MUL_MAT (which
 // should never happen in M1), it GGML_ABORTs loudly. There is no
@@ -58,7 +58,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 // the implementation casts to the concrete function-pointer type.
 GGML_BACKEND_API void ggml_cuda_set_mul_mat_hook(void * hook_fn);
 
-// streamllm-ext integration: graph-walk pre/post hooks. Mode A M1
+// dp-moe-ext integration: graph-walk pre/post hooks. Mode A M1
 // scope: **audit + score-snapshot only**. The pre-hook fires at the
 // top of ggml_backend_cuda_graph_compute and is expected to do at
 // most (a) a one-shot cgraph audit (sentinels well-formed, no
@@ -77,12 +77,12 @@ GGML_BACKEND_API void ggml_cuda_set_mul_mat_hook(void * hook_fn);
 GGML_BACKEND_API void ggml_cuda_set_graph_compute_begin_hook(void * hook_fn);
 GGML_BACKEND_API void ggml_cuda_set_graph_compute_end_hook  (void * hook_fn);
 
-// streamllm-ext integration: user-managed-node claim hook. When set, ggml-
+// dp-moe-ext integration: user-managed-node claim hook. When set, ggml-
 // cuda asks this predicate per cgraph node before deciding whether to
 // capture the cgraph into a cuda-graph. If the predicate returns true for
 // ANY node in the cgraph, capture is disabled for this compute call and
 // every node runs eager via its regular dispatch path (where the
-// streamllm per-op hooks above can claim it). Capture stays enabled for
+// dp_moe per-op hooks above can claim it). Capture stays enabled for
 // cgraphs with no claimed nodes (the common dense-only case).
 //
 // Rationale: managed mul_mat_id ops need to run their LOAD walk on every
@@ -95,29 +95,29 @@ GGML_BACKEND_API void ggml_cuda_set_graph_compute_end_hook  (void * hook_fn);
 //
 // Callback signature:
 //   bool fn(const struct ggml_tensor * node);
-// Set to null to unregister. Independent of the other streamllm hooks.
+// Set to null to unregister. Independent of the other dp_moe hooks.
 GGML_BACKEND_API void ggml_cuda_set_user_node_claims_hook(void * hook_fn);
 
-// streamllm-ext integration: score-table version hook. When set,
+// dp-moe-ext integration: score-table version hook. When set,
 // ggml-cuda's per-cgraph "update required?" predicate calls this and
 // compares the returned uint64_t to a per-graph cached version. A
 // version mismatch forces re-capture of the cgraph — used by
-// streamllm-ext to invalidate captured graphs whenever the runtime
-// score-dial swaps (HTTP /streamllm/score_table or a phase-aware
+// dp-moe-ext to invalidate captured graphs whenever the runtime
+// score-dial swaps (HTTP /dp_moe/score_table or a phase-aware
 // reasoning→generation transition). The version is bumped each time
-// streamllm_set_score_table() succeeds.
+// dp_moe_set_score_table() succeeds.
 //
 // Callback signature:
 //   uint64_t fn(void);
 // Set to null to unregister.
-GGML_BACKEND_API void ggml_cuda_set_streamllm_score_version_hook(void * hook_fn);
+GGML_BACKEND_API void ggml_cuda_set_dp_moe_score_version_hook(void * hook_fn);
 
-// streamllm-ext integration: generic pre-op claim hook. Fires at the
+// dp-moe-ext integration: generic pre-op claim hook. Fires at the
 // top of ggml_cuda_compute_forward for EVERY op — the hook inspects
 // dst (op type, name, src[i]) and returns true to indicate "I handled
 // this node; skip the default dispatch." Used by Mode A milestone-1's
 // sentinel-dispatch mechanism (a named GGML_OP_DUP node carries
-// pre-built routing tensors in src[1..3]; the streamllm executor
+// pre-built routing tensors in src[1..3]; the dp_moe executor
 // claims it via this hook and runs the managed MoE block as a host-
 // eager call).
 //
@@ -129,7 +129,7 @@ GGML_BACKEND_API void ggml_cuda_set_streamllm_score_version_hook(void * hook_fn)
 //
 // Callback signature:
 //   bool fn(cudaStream_t stream, struct ggml_tensor * dst);
-// Set to null to unregister. Independent of the other streamllm hooks.
+// Set to null to unregister. Independent of the other dp_moe hooks.
 GGML_BACKEND_API void ggml_cuda_set_pre_op_hook(void * hook_fn);
 
 #ifdef  __cplusplus

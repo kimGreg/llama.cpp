@@ -711,7 +711,7 @@ int main(int argc, char ** argv) {
         embd.clear();
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
-            common_sampler_streamllm_begin_generation(smpl);
+            common_sampler_dp_moe_begin_generation(smpl);
 
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 

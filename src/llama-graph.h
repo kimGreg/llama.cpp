@@ -60,7 +60,7 @@ enum llm_norm_type {
 //
 // Factored out of ``llm_graph_context::build_moe_ffn`` so both the
 // reference MoE construction path and external callers (the
-// streamllm-ext Qwen3-MoE executor in S5+) can share the same router
+// dp-moe-ext Qwen3-MoE executor in S5+) can share the same router
 // implementation without copy-paste divergence.
 //
 // Covers the SIMPLE case: SOFTMAX gating + optional norm_w
@@ -104,10 +104,10 @@ llm_moe_router_output llm_build_moe_routing_softmax_topk(
     int64_t        n_expert_used,
     bool           norm_w);
 
-// StreamLLM Mode A sentinel — single source of truth for the per-layer
+// DP_MoE Mode A sentinel — single source of truth for the per-layer
 // MoE boundary in the cgraph. Emits the router/topk via the helper
 // above, then a ``ggml_dup(cur)`` node renamed to
-// ``"streamllm.moe_layer_<il>"`` with ``src[1..3] = {ids, probs,
+// ``"dp_moe.moe_layer_<il>"`` with ``src[1..3] = {ids, probs,
 // weights}`` manually wired. The runtime's ``pre_op_hook`` matches on
 // that exact name prefix and routes the dst to
 // ``Qwen3MoEAnyBcqExecutor::forward_moe_layer``; the residual + cvec
@@ -119,8 +119,8 @@ llm_moe_router_output llm_build_moe_routing_softmax_topk(
 //
 // **Do not call ``cb()`` on the returned tensor.** ``cb()`` calls
 // ``ggml_format_name`` which would silently rename the sentinel away
-// from the ``"streamllm.moe_layer_*"`` prefix that the dispatch rail
-// matches on. The cgraph audit (``STREAMLLM_CGRAPH_AUDIT=1``) will
+// from the ``"dp_moe.moe_layer_*"`` prefix that the dispatch rail
+// matches on. The cgraph audit (``DP_MOE_CGRAPH_AUDIT=1``) will
 // catch the breakage, but it's faster to avoid the rename in the
 // first place — keep the caller's branch ``cb()``-free for the
 // sentinel.

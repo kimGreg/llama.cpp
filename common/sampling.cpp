@@ -17,28 +17,33 @@
 #include <unordered_map>
 #include <vector>
 
-// Forward declaration of the streamllm-ext KBar setter so this
-// file doesn't take a hard include dependency on the streamllm-ext tree.
+// Forward declaration of the dp-moe-ext KBar setter so this
+// file doesn't take a hard include dependency on the dp-moe-ext tree.
 // Resolved at final link via the `llama` library's private dep on
-// `streamllm_ext` (see src/CMakeLists.txt:63). Returns false if no
-// streamllm runtime is installed — in that case the call is a no-op.
-extern "C" bool streamllm_set_kbar(float kbar, int allocator_mode);
-extern "C" bool streamllm_schedule_active(void);
-namespace streamllm_ext {
-bool streamllm_schedule_get(
+// `dp_moe_ext` when the CUDA extension is enabled. Weak fallbacks keep
+// stock and CPU-only tool builds linkable; a missing runtime is a no-op.
+extern "C" __attribute__((weak)) bool dp_moe_set_kbar(float, int) { return false; }
+extern "C" __attribute__((weak)) bool dp_moe_schedule_active(void) { return false; }
+namespace dp_moe_ext {
+__attribute__((weak)) bool dp_moe_schedule_get(
     std::vector<int> *                out_thresholds,
     std::vector<float> *              out_kbars,
-    int *                             out_allocator_mode);
+    int *                             out_allocator_mode) {
+    if (out_thresholds) out_thresholds->clear();
+    if (out_kbars) out_kbars->clear();
+    if (out_allocator_mode) *out_allocator_mode = 0;
+    return false;
+}
 }
 
-static bool parse_streamllm_float(const char * s, float & out) {
+static bool parse_dp_moe_float(const char * s, float & out) {
     if (!s || !*s) return false;
     char * end = nullptr;
     out = std::strtof(s, &end);
     return end != s && out >= 0.0f;
 }
 
-static bool parse_streamllm_int(const char * s, int & out) {
+static bool parse_dp_moe_int(const char * s, int & out) {
     if (!s || !*s) return false;
     char * end = nullptr;
     const long v = std::strtol(s, &end, 10);
@@ -47,7 +52,7 @@ static bool parse_streamllm_int(const char * s, int & out) {
     return true;
 }
 
-static const char * streamllm_getenv2(const char * primary, const char * fallback) {
+static const char * dp_moe_getenv2(const char * primary, const char * fallback) {
     const char * v = std::getenv(primary);
     if (v && *v) return v;
     v = std::getenv(fallback);
@@ -194,9 +199,9 @@ struct common_sampler {
                 ? schedule_pp_budget
                 : (!schedule_kbars.empty() ? schedule_kbars[0] : -1.0f);
             if (kbar0 >= 0.0f) {
-                const bool ok = streamllm_set_kbar(kbar0, schedule_allocator_mode);
+                const bool ok = dp_moe_set_kbar(kbar0, schedule_allocator_mode);
                 schedule_last_applied_budget = kbar0;
-                LOG_INF("streamllm kbar schedule: reset, primed kbar[0]=%s\n",
+                LOG_INF("dp_moe kbar schedule: reset, primed kbar[0]=%s\n",
                         ok ? "ok" : "no-op (no runtime)");
             }
         }
@@ -364,7 +369,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
-    // StreamLLM phase-aware extension: when the caller (typically a
+    // DP_MoE phase-aware extension: when the caller (typically a
     // non-chat-template path like llama-completion or llama-perplexity)
     // hasn't populated reasoning_budget_start/end from a chat template,
     // honour direct token-id envs so the reasoning-budget sampler can
@@ -382,8 +387,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             }
             return out;
         };
-        const char * open_csv  = std::getenv("STREAMLLM_PHASE_OPEN_TOKEN_IDS");
-        const char * close_csv = std::getenv("STREAMLLM_PHASE_CLOSE_TOKEN_IDS");
+        const char * open_csv  = std::getenv("DP_MOE_PHASE_OPEN_TOKEN_IDS");
+        const char * close_csv = std::getenv("DP_MOE_PHASE_CLOSE_TOKEN_IDS");
         auto open_ids  = parse_token_id_csv(open_csv);
         auto close_ids = parse_token_id_csv(close_csv);
         if (!open_ids.empty() && !close_ids.empty()) {
@@ -392,7 +397,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             if (params.reasoning_budget_tokens < 0) {
                 params.reasoning_budget_tokens = INT_MAX;
             }
-            LOG_INF("streamllm phase-aware: reasoning_budget seeded from env "
+            LOG_INF("dp_moe phase-aware: reasoning_budget seeded from env "
                     "(start_ids=%zu, end_ids=%zu, tokens=%d)\n",
                     params.reasoning_budget_start.size(),
                     params.reasoning_budget_end.size(),
@@ -535,8 +540,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     std::vector<int> sch_api_thr;
     std::vector<float> sch_api_kbars;
     int sch_api_allocator = 0;
-    if (streamllm_schedule_active()) {
-        sch_from_api = streamllm_ext::streamllm_schedule_get(
+    if (dp_moe_schedule_active()) {
+        sch_from_api = dp_moe_ext::dp_moe_schedule_get(
             &sch_api_thr, &sch_api_kbars, &sch_api_allocator);
     }
     if (sch_from_api) {
@@ -546,18 +551,18 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         result->schedule_allocator_mode = sch_api_allocator;
         result->n_tokens_generated  = 0;
         result->schedule_next_idx   = 0;
-        const bool ok = streamllm_set_kbar(
+        const bool ok = dp_moe_set_kbar(
             result->schedule_kbars[0], result->schedule_allocator_mode);
-        LOG_INF("streamllm kbar schedule (HTTP API): %zu transition(s); "
+        LOG_INF("dp_moe kbar schedule (HTTP API): %zu transition(s); "
                 "primed kbar[0]=%s\n",
                 result->schedule_thresholds.size(),
                 ok ? "ok" : "no-op (no runtime)");
     }
-    const char * sch_pp_env        = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_PP_BUDGET", "STREAMLLM_PP_BUDGET") : nullptr;
-    const char * sch_tg_high_env   = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_HIGH_BUDGET", "STREAMLLM_TG_HIGH_BUDGET") : nullptr;
-    const char * sch_tg_low_env    = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_LOW_BUDGET", "STREAMLLM_TG_LOW_BUDGET") : nullptr;
-    const char * sch_decay_start_env = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_DECAY_START", "STREAMLLM_TG_DECAY_START") : nullptr;
-    const char * sch_decay_end_env   = !sch_from_api ? streamllm_getenv2("STREAMLLM_KBAR_TG_DECAY_END", "STREAMLLM_TG_DECAY_END") : nullptr;
+    const char * sch_pp_env        = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_PP_BUDGET", "DP_MOE_PP_BUDGET") : nullptr;
+    const char * sch_tg_high_env   = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_HIGH_BUDGET", "DP_MOE_TG_HIGH_BUDGET") : nullptr;
+    const char * sch_tg_low_env    = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_LOW_BUDGET", "DP_MOE_TG_LOW_BUDGET") : nullptr;
+    const char * sch_decay_start_env = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_DECAY_START", "DP_MOE_TG_DECAY_START") : nullptr;
+    const char * sch_decay_end_env   = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_DECAY_END", "DP_MOE_TG_DECAY_END") : nullptr;
     float sch_pp = 0.0f;
     float sch_tg_high = 0.0f;
     float sch_tg_low = 0.0f;
@@ -568,11 +573,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         sch_decay_start_env || sch_decay_end_env;
     if (!sch_from_api && sch_linear_present) {
         const bool valid =
-            parse_streamllm_float(sch_pp_env,      sch_pp) &&
-            parse_streamllm_float(sch_tg_high_env, sch_tg_high) &&
-            parse_streamllm_float(sch_tg_low_env,  sch_tg_low) &&
-            parse_streamllm_int  (sch_decay_start_env, sch_decay_start) &&
-            parse_streamllm_int  (sch_decay_end_env,   sch_decay_end) &&
+            parse_dp_moe_float(sch_pp_env,      sch_pp) &&
+            parse_dp_moe_float(sch_tg_high_env, sch_tg_high) &&
+            parse_dp_moe_float(sch_tg_low_env,  sch_tg_low) &&
+            parse_dp_moe_int  (sch_decay_start_env, sch_decay_start) &&
+            parse_dp_moe_int  (sch_decay_end_env,   sch_decay_end) &&
             sch_decay_end > sch_decay_start;
         if (valid) {
             result->schedule_enabled          = true;
@@ -584,25 +589,25 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             result->schedule_tg_decay_end     = sch_decay_end;
             result->n_tokens_generated        = 0;
             result->schedule_next_idx         = 0;
-            const bool ok = streamllm_set_kbar(
+            const bool ok = dp_moe_set_kbar(
                 result->schedule_pp_budget, result->schedule_allocator_mode);
             result->schedule_last_applied_budget = result->schedule_pp_budget;
-            LOG_INF("streamllm linear kbar schedule: pp=%.3f, tg_high=%.3f, "
+            LOG_INF("dp_moe linear kbar schedule: pp=%.3f, tg_high=%.3f, "
                     "tg_low=%.3f, decay=[%d,%d] (primed pp=%s)\n",
                     sch_pp, sch_tg_high, sch_tg_low,
                     sch_decay_start, sch_decay_end,
                     ok ? "ok" : "no-op (no runtime)");
         } else {
-            LOG_WRN("streamllm linear kbar schedule: env vars present but "
+            LOG_WRN("dp_moe linear kbar schedule: env vars present but "
                     "malformed — expected PP/TG_HIGH/TG_LOW budgets and "
                     "TG_DECAY_END > TG_DECAY_START — disabled\n");
         }
     }
 
-    const char * sch_prefill_env = (!sch_from_api && !result->schedule_enabled) ? std::getenv("STREAMLLM_KBAR_PREFILL") : nullptr;
-    const char * sch_front_env   = !sch_from_api ? std::getenv("STREAMLLM_KBAR_FRONT") : nullptr;
-    const char * sch_rear_env    = !sch_from_api ? std::getenv("STREAMLLM_KBAR_REAR") : nullptr;
-    const char * sch_front_n_env = !sch_from_api ? std::getenv("STREAMLLM_KBAR_FRONT_TOKENS") : nullptr;
+    const char * sch_prefill_env = (!sch_from_api && !result->schedule_enabled) ? std::getenv("DP_MOE_KBAR_PREFILL") : nullptr;
+    const char * sch_front_env   = !sch_from_api ? std::getenv("DP_MOE_KBAR_FRONT") : nullptr;
+    const char * sch_rear_env    = !sch_from_api ? std::getenv("DP_MOE_KBAR_REAR") : nullptr;
+    const char * sch_front_n_env = !sch_from_api ? std::getenv("DP_MOE_KBAR_FRONT_TOKENS") : nullptr;
     float sch_prefill = 0.0f;
     float sch_front   = 0.0f;
     float sch_rear    = 0.0f;
@@ -611,10 +616,10 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         sch_prefill_env || sch_front_env || sch_rear_env || sch_front_n_env;
     if (!sch_from_api && !result->schedule_enabled && sch_three_present) {
         const bool valid =
-            parse_streamllm_float(sch_prefill_env, sch_prefill) &&
-            parse_streamllm_float(sch_front_env,   sch_front) &&
-            parse_streamllm_float(sch_rear_env,    sch_rear) &&
-            parse_streamllm_int  (sch_front_n_env, sch_front_tokens) &&
+            parse_dp_moe_float(sch_prefill_env, sch_prefill) &&
+            parse_dp_moe_float(sch_front_env,   sch_front) &&
+            parse_dp_moe_float(sch_rear_env,    sch_rear) &&
+            parse_dp_moe_int  (sch_front_n_env, sch_front_tokens) &&
             sch_front_tokens > 0;
         if (valid) {
             result->schedule_enabled    = true;
@@ -622,22 +627,22 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             result->schedule_kbars      = { sch_prefill, sch_front, sch_rear };
             result->n_tokens_generated  = 0;
             result->schedule_next_idx   = 0;
-            const bool ok = streamllm_set_kbar(
+            const bool ok = dp_moe_set_kbar(
                 result->schedule_kbars[0], result->schedule_allocator_mode);
-            LOG_INF("streamllm 3-level kbar schedule: prefill=%.3f, "
+            LOG_INF("dp_moe 3-level kbar schedule: prefill=%.3f, "
                     "front=%.3f for %d generated token(s), rear=%.3f "
                     "(primed prefill=%s)\n",
                     sch_prefill, sch_front, sch_front_tokens, sch_rear,
                     ok ? "ok" : "no-op (no runtime)");
         } else {
-            LOG_WRN("streamllm 3-level kbar schedule: env vars present but "
-                    "malformed — expected STREAMLLM_KBAR_PREFILL, "
-                    "STREAMLLM_KBAR_FRONT, STREAMLLM_KBAR_REAR, and "
-                    "STREAMLLM_KBAR_FRONT_TOKENS>0 — disabled\n");
+            LOG_WRN("dp_moe 3-level kbar schedule: env vars present but "
+                    "malformed — expected DP_MOE_KBAR_PREFILL, "
+                    "DP_MOE_KBAR_FRONT, DP_MOE_KBAR_REAR, and "
+                    "DP_MOE_KBAR_FRONT_TOKENS>0 — disabled\n");
         }
     }
-    const char * sch_thr_csv  = (!sch_from_api && !result->schedule_enabled) ? std::getenv("STREAMLLM_KBAR_SCHEDULE_TOKENS") : nullptr;
-    const char * sch_dial_csv = (!sch_from_api && !result->schedule_enabled) ? std::getenv("STREAMLLM_KBAR_SCHEDULE_VALUES") : nullptr;
+    const char * sch_thr_csv  = (!sch_from_api && !result->schedule_enabled) ? std::getenv("DP_MOE_KBAR_SCHEDULE_TOKENS") : nullptr;
+    const char * sch_dial_csv = (!sch_from_api && !result->schedule_enabled) ? std::getenv("DP_MOE_KBAR_SCHEDULE_VALUES") : nullptr;
     // Treat empty strings as unset — the orchestrator may clear env
     // explicitly when using the HTTP API path.
     if (sch_thr_csv  && !sch_thr_csv[0])  sch_thr_csv  = nullptr;
@@ -680,14 +685,14 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             result->schedule_kbars      = std::move(sch_kbars);
             result->n_tokens_generated  = 0;
             result->schedule_next_idx   = 0;
-            const bool ok = streamllm_set_kbar(
+            const bool ok = dp_moe_set_kbar(
                 result->schedule_kbars[0], result->schedule_allocator_mode);
-            LOG_INF("streamllm kbar schedule: enabled with %zu transition(s); "
+            LOG_INF("dp_moe kbar schedule: enabled with %zu transition(s); "
                     "primed kbar[0]=%s\n",
                     result->schedule_thresholds.size(),
                     ok ? "ok" : "no-op (no runtime)");
         } else {
-            LOG_WRN("streamllm kbar schedule: env vars present but malformed "
+            LOG_WRN("dp_moe kbar schedule: env vars present but malformed "
                     "(thresholds=%zu, kbars=%zu — expected kbars=thresholds+1, "
                     "thresholds strictly ascending) — disabled\n",
                     sch_thr.size(), sch_kbars.size());
@@ -695,22 +700,22 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     if (rbudget && !result->schedule_enabled) {
-        const char * thr_r_csv = std::getenv("STREAMLLM_PHASE_REASONING_KBAR");
-        const char * thr_g_csv = std::getenv("STREAMLLM_PHASE_GENERATION_KBAR");
+        const char * thr_r_csv = std::getenv("DP_MOE_PHASE_REASONING_KBAR");
+        const char * thr_g_csv = std::getenv("DP_MOE_PHASE_GENERATION_KBAR");
         if (thr_r_csv && thr_g_csv) {
             float kbar_r = 0.0f;
             float kbar_g = 0.0f;
-            if (parse_streamllm_float(thr_r_csv, kbar_r) &&
-                parse_streamllm_float(thr_g_csv, kbar_g)) {
+            if (parse_dp_moe_float(thr_r_csv, kbar_r) &&
+                parse_dp_moe_float(thr_g_csv, kbar_g)) {
                 result->phase_aware_enabled = true;
                 result->kbar_reasoning      = kbar_r;
                 result->kbar_generation     = kbar_g;
                 result->prev_rbudget_state  = REASONING_BUDGET_IDLE;
-                const bool ok = streamllm_set_kbar(result->kbar_reasoning, 0);
-                LOG_INF("streamllm phase-aware dial: enabled, primed reasoning=%s\n",
+                const bool ok = dp_moe_set_kbar(result->kbar_reasoning, 0);
+                LOG_INF("dp_moe phase-aware dial: enabled, primed reasoning=%s\n",
                         ok ? "ok" : "no-op (no runtime)");
             } else {
-                LOG_WRN("streamllm phase-aware dial: env vars present but "
+                LOG_WRN("dp_moe phase-aware dial: env vars present but "
                         "KBar values malformed — disabled\n");
             }
         }
@@ -731,7 +736,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
-static float streamllm_linear_budget_for_token(const common_sampler * gsmpl, int token_idx) {
+static float dp_moe_linear_budget_for_token(const common_sampler * gsmpl, int token_idx) {
     if (token_idx <= gsmpl->schedule_tg_decay_start) {
         return gsmpl->schedule_tg_high_budget;
     }
@@ -744,18 +749,18 @@ static float streamllm_linear_budget_for_token(const common_sampler * gsmpl, int
            alpha * (gsmpl->schedule_tg_low_budget - gsmpl->schedule_tg_high_budget);
 }
 
-static bool streamllm_apply_scheduled_kbar(common_sampler * gsmpl, float kbar) {
+static bool dp_moe_apply_scheduled_kbar(common_sampler * gsmpl, float kbar) {
     if (gsmpl->schedule_last_applied_budget >= 0.0f &&
         std::fabs(gsmpl->schedule_last_applied_budget - kbar) < 1.0e-6f)
     {
         return true;
     }
-    const bool ok = streamllm_set_kbar(kbar, gsmpl->schedule_allocator_mode);
+    const bool ok = dp_moe_set_kbar(kbar, gsmpl->schedule_allocator_mode);
     gsmpl->schedule_last_applied_budget = kbar;
     return ok;
 }
 
-void common_sampler_streamllm_begin_generation(struct common_sampler * gsmpl) {
+void common_sampler_dp_moe_begin_generation(struct common_sampler * gsmpl) {
     if (!gsmpl || !gsmpl->schedule_enabled || gsmpl->schedule_generation_started) {
         return;
     }
@@ -764,9 +769,9 @@ void common_sampler_streamllm_begin_generation(struct common_sampler * gsmpl) {
     gsmpl->n_tokens_generated = 0;
 
     if (gsmpl->schedule_linear_decay) {
-        const bool ok = streamllm_apply_scheduled_kbar(
+        const bool ok = dp_moe_apply_scheduled_kbar(
             gsmpl, gsmpl->schedule_tg_high_budget);
-        LOG_INF("streamllm linear kbar schedule: generation begin, "
+        LOG_INF("dp_moe linear kbar schedule: generation begin, "
                 "tg_high=%.3f (set_kbar=%s)\n",
                 gsmpl->schedule_tg_high_budget, ok ? "ok" : "no-op");
         return;
@@ -778,9 +783,9 @@ void common_sampler_streamllm_begin_generation(struct common_sampler * gsmpl) {
     {
         const int next_dial = gsmpl->schedule_next_idx + 1;
         const float kbar = gsmpl->schedule_kbars[next_dial];
-        const bool ok = streamllm_set_kbar(
+        const bool ok = dp_moe_set_kbar(
             kbar, gsmpl->schedule_allocator_mode);
-        LOG_INF("streamllm kbar schedule: generation begin, "
+        LOG_INF("dp_moe kbar schedule: generation begin, "
                 "swap to kbar[%d] (set_kbar=%s)\n",
                 next_dial, ok ? "ok" : "no-op");
         gsmpl->schedule_next_idx++;
@@ -816,7 +821,7 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     llama_sampler_accept(gsmpl->rbudget, token);
 
     if (gsmpl->schedule_enabled && !gsmpl->schedule_generation_started && is_generation_accept) {
-        common_sampler_streamllm_begin_generation(gsmpl);
+        common_sampler_dp_moe_begin_generation(gsmpl);
     }
 
     if (gsmpl->schedule_enabled && gsmpl->schedule_generation_started) {
@@ -824,13 +829,13 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
         if (gsmpl->schedule_linear_decay) {
             const int next_token_idx = gsmpl->n_tokens_generated + 1;
             const float next_kbar =
-                streamllm_linear_budget_for_token(gsmpl, next_token_idx);
-            const bool ok = streamllm_apply_scheduled_kbar(gsmpl, next_kbar);
+                dp_moe_linear_budget_for_token(gsmpl, next_token_idx);
+            const bool ok = dp_moe_apply_scheduled_kbar(gsmpl, next_kbar);
             if (gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_start ||
                 gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_end - 1 ||
                 gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_end)
             {
-                LOG_INF("streamllm linear kbar schedule: at token %d, "
+                LOG_INF("dp_moe linear kbar schedule: at token %d, "
                         "next_token=%d kbar=%.3f (set_kbar=%s)\n",
                         gsmpl->n_tokens_generated, next_token_idx,
                         next_kbar, ok ? "ok" : "no-op");
@@ -843,9 +848,9 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
             {
                 const int next_dial = gsmpl->schedule_next_idx + 1;
                 const float kbar = gsmpl->schedule_kbars[next_dial];
-                const bool ok = streamllm_set_kbar(
+                const bool ok = dp_moe_set_kbar(
                     kbar, gsmpl->schedule_allocator_mode);
-                LOG_INF("streamllm kbar schedule: at token %d, "
+                LOG_INF("dp_moe kbar schedule: at token %d, "
                         "swap to kbar[%d] (set_kbar=%s)\n",
                         gsmpl->n_tokens_generated, next_dial,
                         ok ? "ok" : "no-op");
@@ -855,7 +860,7 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     }
 
     // Phase-aware adaptive dial: observe the reasoning-budget state
-    // *after* the accept above has updated it. Flip the streamllm score
+    // *after* the accept above has updated it. Flip the dp_moe score
     // table on any transition into/out of the reasoning phase.
     if (gsmpl->phase_aware_enabled && gsmpl->rbudget) {
         const auto cur = common_reasoning_budget_get_state(gsmpl->rbudget);
@@ -867,8 +872,8 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
                  cur == REASONING_BUDGET_FORCING);
             const float kbar = in_reasoning ? gsmpl->kbar_reasoning
                                             : gsmpl->kbar_generation;
-            const bool ok = streamllm_set_kbar(kbar, 0);
-            LOG_INF("streamllm phase-aware dial: %s -> %s (set_kbar=%s)\n",
+            const bool ok = dp_moe_set_kbar(kbar, 0);
+            LOG_INF("dp_moe phase-aware dial: %s -> %s (set_kbar=%s)\n",
                     in_reasoning ? "non-reasoning" : "reasoning",
                     in_reasoning ? "reasoning"     : "generation",
                     ok ? "ok" : "no-op");

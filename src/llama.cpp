@@ -15,7 +15,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#if defined(STREAMLLM_EXT_ENABLED)
+#if defined(DP_MOE_EXT_ENABLED)
 #include "runtime_glue.h"
 #endif
 
@@ -382,30 +382,30 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
-#if defined(STREAMLLM_EXT_ENABLED)
-    // Install the streamllm-ext runtime + register the ggml-cuda hook
-    // if this GGUF carries streamllm.* metadata. No-op on stock files.
-    // Failures throw — caught here so a bad streamllm artifact doesn't
+#if defined(DP_MOE_EXT_ENABLED)
+    // Install the dp-moe-ext runtime + register the ggml-cuda hook
+    // if this GGUF carries dp_moe.* metadata. No-op on stock files.
+    // Failures throw — caught here so a bad dp_moe artifact doesn't
     // leave a half-torn-down model behind.
     //
     // Mode A milestone 1, S1: on success, bind the model into the ext's
     // bound-models set and set its model-scoped executor view. The bind
-    // pairs with streamllm_ext::unbind_model in llama_model_free; the
+    // pairs with dp_moe_ext::unbind_model in llama_model_free; the
     // view stays valid for the model's entire lifetime.
     if (!path_model.empty()) {
         try {
-            if (streamllm_ext::install_for_gguf(path_model.c_str())) {
-                // Bind the model's streamllm_executor slot, then write
+            if (dp_moe_ext::install_for_gguf(path_model.c_str())) {
+                // Bind the model's dp_moe_executor slot, then write
                 // the active executor pointer into it. Order matters:
                 // the slot must be registered before the pointer is
                 // written, so a concurrent ext-side clear() can find
                 // and null it.
-                streamllm_ext::bind_model_slot(&model->streamllm_executor);
-                model->streamllm_executor =
-                    (void *) streamllm_ext::current_executor();
+                dp_moe_ext::bind_model_slot(&model->dp_moe_executor);
+                model->dp_moe_executor =
+                    (void *) dp_moe_ext::current_executor();
             }
         } catch (const std::exception & e) {
-            LLAMA_LOG_ERROR("%s: streamllm-ext install failed: %s\n",
+            LLAMA_LOG_ERROR("%s: dp-moe-ext install failed: %s\n",
                 __func__, e.what());
             llama_model_free(model);
             return nullptr;
