@@ -91,6 +91,15 @@ namespace anybcq {
 //   M, K                  : canonical's static shape
 //   group_size            : encoder param (from layout)
 //   shared_x              : routing-fusion flag
+//   routed_chunk_span_hint
+//                         : optional K_max-K_min over routed experts in
+//                           CHUNKS; -1 if unknown. The decoder translates
+//                           this to a plane span for kernel selection.
+//   routed_max_chunk_hint
+//                         : optional K_max over routed experts in CHUNKS;
+//                           -1 if unknown. Used only to size mixed
+//                           flat-kernel plane grids after decoder-side
+//                           chunks->planes conversion.
 //   stream                : caller's compute stream
 //
 // Returns true on success (kernel launched). Returns false if the
@@ -114,6 +123,8 @@ bool moe_chunk_matmul(
     int                      K,
     int                      group_size,
     int                      shared_x,
+    int                      routed_chunk_span_hint,
+    int                      routed_max_chunk_hint,
     StreamHandle             stream);
 
 

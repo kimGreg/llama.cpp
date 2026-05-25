@@ -179,6 +179,16 @@ target_link_libraries(dp_moe-gguf-dump PRIVATE dp_moe_ext ggml)
 add_executable(dp_moe-loader-gate-test test_loader_gate.cpp)
 target_link_libraries(dp_moe-loader-gate-test PRIVATE dp_moe_ext ggml)
 
+if (GGML_CUDA)
+    # dp_moe-schedule-fetch-test: unit test for the runtime-mutable
+    # KBar schedule bulk-fetch API. Verifies inactive fetch, validation
+    # rejection, partial output fetches, copy isolation, overwrite, and
+    # concurrent snapshot consistency.
+    add_executable(dp_moe-schedule-fetch-test test_schedule_fetch.cpp)
+    target_link_libraries(dp_moe-schedule-fetch-test
+        PRIVATE dp_moe_ext ggml CUDA::cudart)
+endif()
+
 # dp_moe-sentinel-compute-poc: reference POC kept under
 # tests/reference/ for re-validating sentinel mechanics against
 # future ggml-cuda hook-surface changes. Builds a synthetic
@@ -242,4 +252,24 @@ if (GGML_CUDA)
     # VramChunkPool::load across representative tensor shapes.
     add_executable(dp_moe-microbench test_microbench.cpp)
     target_link_libraries(dp_moe-microbench PRIVATE dp_moe_ext ggml CUDA::cudart)
+
+    # dp_moe-fused-gemv-microbench: kernel-only timing for the Qwen3
+    # fused MoE GEMV launcher under synthetic per-expert precision mixes.
+    add_executable(dp_moe-fused-gemv-microbench test_fused_gemv_microbench.cpp)
+    target_link_libraries(dp_moe-fused-gemv-microbench
+        PRIVATE dp_moe_ext CUDA::cudart)
+
+    # dp_moe-fused-gemv-mixed-batch-test: correctness check for the
+    # MoE-fused mixed-precision kernel when n_tokens > 1. Intended to
+    # be run both in loop mode and with DP_MOE_OPTIMIZED_BATCH_KERNEL=1.
+    add_executable(dp_moe-fused-gemv-mixed-batch-test test_fused_gemv_mixed_batch.cpp)
+    target_link_libraries(dp_moe-fused-gemv-mixed-batch-test
+        PRIVATE dp_moe_ext CUDA::cudart)
+
+    # dp_moe-kbar-planner-test: validates the runtime GPU KBar exact-DP
+    # planner against a CPU shifted-budget reference. Covers repeated
+    # experts, batched routing, inactive experts, and K_min clamping.
+    add_executable(dp_moe-kbar-planner-test test_kbar_planner.cpp)
+    target_link_libraries(dp_moe-kbar-planner-test
+        PRIVATE dp_moe_ext CUDA::cudart)
 endif()

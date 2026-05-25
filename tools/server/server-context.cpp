@@ -45,6 +45,12 @@ unsigned long long dp_moe_stat_pool_peak_bytes(void);
 unsigned long long dp_moe_stat_pool_cap_bytes(void);
 unsigned long long dp_moe_stat_pool_h2d_bytes(void);
 unsigned long long dp_moe_stat_pool_h2d_calls(void);
+unsigned long long dp_moe_stat_pool_required_chunks(void);
+unsigned long long dp_moe_stat_pool_resident_hits(void);
+unsigned long long dp_moe_stat_pool_prefill_required_chunks(void);
+unsigned long long dp_moe_stat_pool_prefill_resident_hits(void);
+unsigned long long dp_moe_stat_pool_decode_required_chunks(void);
+unsigned long long dp_moe_stat_pool_decode_resident_hits(void);
 unsigned long long dp_moe_stat_host_dram_bytes(void);
 unsigned long long dp_moe_stat_hook_calls(void);
 unsigned long long dp_moe_stat_dispatch_count(void);
@@ -4364,6 +4370,12 @@ void server_routes::init_routes() {
         const auto used  = dp_moe_stat_pool_used_bytes();
         const auto peak  = dp_moe_stat_pool_peak_bytes();
         const auto cap   = dp_moe_stat_pool_cap_bytes();
+        const auto req   = dp_moe_stat_pool_required_chunks();
+        const auto rh    = dp_moe_stat_pool_resident_hits();
+        const auto pre_req = dp_moe_stat_pool_prefill_required_chunks();
+        const auto pre_rh  = dp_moe_stat_pool_prefill_resident_hits();
+        const auto dec_req = dp_moe_stat_pool_decode_required_chunks();
+        const auto dec_rh  = dp_moe_stat_pool_decode_resident_hits();
         const auto attempts = dp_moe_stat_tier_attempts();
         const auto vh = dp_moe_stat_tier_vram_hits();
         const auto dh = dp_moe_stat_tier_dram_hits();
@@ -4377,6 +4389,25 @@ void server_routes::init_routes() {
                 {"h2d_calls",      dp_moe_stat_pool_h2d_calls()},
                 {"make_room_calls",dp_moe_stat_make_room_calls()},
                 {"host_dram_mb",   dp_moe_stat_host_dram_bytes() / (1024.0 * 1024.0)},
+                {"note",           "physical H2D/load counters; not logical cache-hit attempts"},
+            }},
+            {"physical_loads", {
+                {"h2d_mb",         dp_moe_stat_pool_h2d_bytes() / (1024.0 * 1024.0)},
+                {"h2d_calls",      dp_moe_stat_pool_h2d_calls()},
+                {"make_room_calls",dp_moe_stat_make_room_calls()},
+            }},
+            {"residency", {
+                {"required_chunks",          req},
+                {"resident_hits",            rh},
+                {"load_misses",              req > rh ? req - rh : 0},
+                {"hit_pct",                  req ? 100.0 * (double) rh / (double) req : 0.0},
+                {"prefill_required_chunks",  pre_req},
+                {"prefill_resident_hits",    pre_rh},
+                {"prefill_hit_pct",          pre_req ? 100.0 * (double) pre_rh / (double) pre_req : 0.0},
+                {"decode_required_chunks",   dec_req},
+                {"decode_resident_hits",     dec_rh},
+                {"decode_hit_pct",           dec_req ? 100.0 * (double) dec_rh / (double) dec_req : 0.0},
+                {"note",                     "VRAM pool required-set residency; comparable for uniform and dynamic"},
             }},
             {"hook", {
                 {"calls",             dp_moe_stat_hook_calls()},
@@ -4392,6 +4423,17 @@ void server_routes::init_routes() {
                 {"forward_moe_layer_calls", dp_moe_stat_forward_moe_layer_calls()},
             }},
             {"tier_hits", {
+                {"diag_enabled", dp_moe_stat_diag_enabled() != 0},
+                {"attempts",     attempts},
+                {"vram_hits",    vh},
+                {"dram_hits",    dh},
+                {"ssd_misses",   sm},
+                {"vram_pct",  attempts ? 100.0 * (double)vh / (double)attempts : 0.0},
+                {"dram_pct",  attempts ? 100.0 * (double)dh / (double)attempts : 0.0},
+                {"ssd_pct",   attempts ? 100.0 * (double)sm / (double)attempts : 0.0},
+                {"note",      "logical chunk lookup attempts; not byte/load weighted"},
+            }},
+            {"logical_tier_hits", {
                 {"diag_enabled", dp_moe_stat_diag_enabled() != 0},
                 {"attempts",     attempts},
                 {"vram_hits",    vh},

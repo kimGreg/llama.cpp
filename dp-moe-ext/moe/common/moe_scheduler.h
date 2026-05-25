@@ -73,6 +73,10 @@ void scheduler_touch_resident(
     const std::string & wid,
     int                 cid,
     int                 plane);
+void scheduler_touch_host_cache(
+    Scheduler &         sched,
+    const std::string & wid,
+    int                 cid);
 
 // Logical cache clock for MoE residency. Runtime mode calls this once
 // per MoE layer before planning gate/up/down so all chunks touched by
@@ -152,7 +156,8 @@ bool   scheduler_allocate_dispatch_budget(
     const std::vector<float> & gates,
     std::vector<int>         & K_out);
 // Device-side mirror of dynamic_R_, K_min, K_max — populated when
-// residuals are loaded. Read by capture/runtime GPU KBar planners.
+// residuals are loaded. Read by benchmark capture and eager runtime
+// GPU KBar planners.
 const float * scheduler_dynamic_R_device(const Scheduler & sched);
 int           scheduler_dynamic_K_min   (const Scheduler & sched);
 int           scheduler_dynamic_K_max   (const Scheduler & sched);

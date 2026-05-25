@@ -9,6 +9,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -50,7 +52,8 @@ __global__ void nqmv_bias_planes_moe_fused(
     const int     uniform_precision,
     const int * __restrict__ prec_per_eid,
     const int group_size,
-    const int shared_x)
+    const int shared_x,
+    const int target_precision)
 {
     const int tu  = blockIdx.z;
     const int t   = tu / n_used;
@@ -58,6 +61,7 @@ __global__ void nqmv_bias_planes_moe_fused(
     if (eid < 0) return;
     const int precision = prec_per_eid ? prec_per_eid[eid] : uniform_precision;
     if (precision <= 0) return;
+    if (target_precision > 0 && precision != target_precision) return;
 
     // Required-non-null contract (SSOT §6.9 M1).  When precision > 0 and
     // eid >= 0 the scheduler must have reserved + loaded all planes in
@@ -188,6 +192,419 @@ __global__ void nqmv_bias_planes_moe_fused(
 }
 
 
+// Plane-flattened variant for mixed per-expert precision.
+//
+// The loop kernel above assigns one block to one (token, top-k slot,
+// M tile, K tile) and loops over all active bitplanes inside that
+// block.  When experts use different plane counts, blocks have
+// different runtimes and the long-P experts form a tail.  This kernel
+// makes plane id part of the grid:
+//
+//   blockIdx.z = ((token * n_used + slot) * max_precision) + plane
+//
+// Each block handles exactly one plane.  Blocks whose plane is outside
+// that expert's precision return immediately.  β/q_bias is emitted only
+// by plane 0.  This sums the same terms as the loop kernel, but the
+// atomic-add order differs, so bitwise output can drift at normal
+// floating-point reduction-noise scale.
+__global__ void nqmv_bias_planes_moe_fused_flat_planes(
+    const __half * __restrict__ X_fp16,
+    float *        __restrict__ Y_dst_f32,
+    const int32_t * __restrict__ ids,
+    const uint32_t * const * const * __restrict__ qw_planes_per_expert,
+    const __half   * const * const * __restrict__ alpha_planes_per_expert,
+    const __half   *               * __restrict__ q_bias_per_expert,
+    const int M,
+    const int K,
+    const int n_used,
+    const int     max_precision,
+    const int * __restrict__ prec_per_eid,
+    const int group_size,
+    const int shared_x,
+    const int plane_axis_in_y)
+{
+    const int plane = plane_axis_in_y
+        ? (int)blockIdx.y % max_precision
+        : (int)blockIdx.z % max_precision;
+    const int k_tile = plane_axis_in_y
+        ? (int)blockIdx.y / max_precision
+        : (int)blockIdx.y;
+    const int tu = plane_axis_in_y
+        ? (int)blockIdx.z
+        : (int)blockIdx.z / max_precision;
+    const int t     = tu / n_used;
+    const int eid   = ids[tu];
+    if (eid < 0) return;
+
+    const int precision = prec_per_eid ? prec_per_eid[eid] : max_precision;
+    if (precision <= 0 || plane >= precision) return;
+
+    const uint32_t * const * qw     = qw_planes_per_expert   [eid];
+    const __half   * const * alpha  = alpha_planes_per_expert[eid];
+    const __half   *         q_bias = q_bias_per_expert     [eid];
+    if (qw == nullptr || alpha == nullptr || q_bias == nullptr) __trap();
+    if (qw[plane] == nullptr || alpha[plane] == nullptr) __trap();
+
+    const __half * X_t = shared_x
+        ? X_fp16 + (size_t)t  * K
+        : X_fp16 + (size_t)tu * K;
+    float * Y_tu = Y_dst_f32 + (size_t)tu * M;
+
+    __shared__ float lut[K_TILE_SIZE/8][256];
+    const int lut_x_size = blockDim.x / (K_TILE_SIZE/8);
+
+    const int lut_y = threadIdx.x / lut_x_size;
+    const int lut_x = threadIdx.x % lut_x_size;
+
+    const __half * _inp = &X_t[k_tile * K_TILE_SIZE + lut_y * 8];
+    float4 inp_vec = ((float4 *)_inp)[0];
+    const __half2 * inp_half2 = (const __half2 *)&inp_vec;
+    const float inp_f32[8] = {
+        __half2float(inp_half2[0].x), __half2float(inp_half2[0].y),
+        __half2float(inp_half2[1].x), __half2float(inp_half2[1].y),
+        __half2float(inp_half2[2].x), __half2float(inp_half2[2].y),
+        __half2float(inp_half2[3].x), __half2float(inp_half2[3].y),
+    };
+
+    const float sgn[8] = {
+        (float)(2 * ((lut_x >> 0) & 1) - 1),
+        (float)(2 * ((lut_x >> 1) & 1) - 1),
+        (float)(2 * ((lut_x >> 2) & 1) - 1),
+        (float)(2 * ((lut_x >> 3) & 1) - 1),
+        (float)(2 * ((lut_x >> 4) & 1) - 1),
+        (float)(2 * ((lut_x >> 5) & 1) - 1),
+        (float)(2 * ((lut_x >> 6) & 1) - 1),
+        (float)(2 * ((lut_x >> 7) & 1) - 1),
+    };
+    float base = sgn[0]*inp_f32[0] + sgn[1]*inp_f32[1]
+               + sgn[2]*inp_f32[2] + sgn[3]*inp_f32[3]
+               + sgn[4]*inp_f32[4] + sgn[5]*inp_f32[5]
+               + sgn[6]*inp_f32[6] + sgn[7]*inp_f32[7];
+    lut[lut_y][lut_x] = base;
+
+    const int s = (lut_x_size==1)  ?0:
+                  (lut_x_size==2)  ?1:
+                  (lut_x_size==4)  ?2:
+                  (lut_x_size==8)  ?3:
+                  (lut_x_size==16) ?4:
+                  (lut_x_size==32) ?5:
+                  (lut_x_size==64) ?6:
+                  (lut_x_size==128)?7: 8;
+
+    #pragma unroll
+    for (int s_iter = s; s_iter < 8; ++s_iter) {
+        const float iValue = 2.f * inp_f32[s_iter];
+        #pragma unroll
+        for (int i = (1 << s_iter); i < (1 << (s_iter + 1)); i += lut_x_size) {
+            lut[lut_y][i + lut_x] = lut[lut_y][i + lut_x - (1 << s_iter)] + iValue;
+        }
+    }
+    __syncthreads();
+
+    const int m_start = blockIdx.x * M_TILE_SIZE + threadIdx.x * 2;
+    const int m_end   = min((blockIdx.x + 1) * M_TILE_SIZE, M);
+    const int m_step  = blockDim.x * 2;
+
+    const int K_over_32_offset = k_tile * (K_TILE_SIZE / 32);
+    const int group_idx        = (k_tile * K_TILE_SIZE) / group_size;
+
+    for (int m = m_start; m < m_end; m += m_step) {
+        float acc_lo = 0.f;
+        float acc_hi = 0.f;
+
+        if (plane == 0) {
+            const __half2 qb = ((const __half2 *)&q_bias[group_idx*M + m])[0];
+            const float qb_lo = __half2float(qb.x);
+            const float qb_hi = __half2float(qb.y);
+
+            float t_sum = 0.f;
+            #pragma unroll
+            for (int kt = 0; kt < K_TILE_SIZE/32; ++kt) {
+                t_sum += lut[kt*4+0][255] + lut[kt*4+1][255]
+                       + lut[kt*4+2][255] + lut[kt*4+3][255];
+            }
+            acc_lo = fmaf(qb_lo, t_sum, acc_lo);
+            acc_hi = fmaf(qb_hi, t_sum, acc_hi);
+        }
+
+        const uint32_t * __restrict__ bW_p =
+            qw[plane] + (size_t)K_over_32_offset * M;
+        const __half * __restrict__ alpha_p = alpha[plane];
+
+        float t_lo = 0.f;
+        float t_hi = 0.f;
+
+        #pragma unroll
+        for (int kt = 0; kt < K_TILE_SIZE/32; ++kt) {
+            const uint64_t w_pair = ((const uint64_t *)&bW_p[kt*M + m])[0];
+            const uint32_t w0 = (uint32_t)w_pair;
+            const uint32_t w1 = (uint32_t)(w_pair >> 32);
+
+            const uchar4 by0 = *reinterpret_cast<const uchar4 *>(&w0);
+            const uchar4 by1 = *reinterpret_cast<const uchar4 *>(&w1);
+
+            t_lo += lut[kt*4+0][by0.x] + lut[kt*4+1][by0.y]
+                  + lut[kt*4+2][by0.z] + lut[kt*4+3][by0.w];
+            t_hi += lut[kt*4+0][by1.x] + lut[kt*4+1][by1.y]
+                  + lut[kt*4+2][by1.z] + lut[kt*4+3][by1.w];
+        }
+
+        const __half2 a = ((const __half2 *)&alpha_p[group_idx*M + m])[0];
+        acc_lo = fmaf(__half2float(a.x), t_lo, acc_lo);
+        acc_hi = fmaf(__half2float(a.y), t_hi, acc_hi);
+
+        atomicAdd(&Y_tu[m],     acc_lo);
+        atomicAdd(&Y_tu[m + 1], acc_hi);
+    }
+}
+
+
+// Plane-group flattened variant for mixed per-expert precision.
+//
+// Compared with flat_planes, one block handles GROUP_PLANES consecutive
+// planes for the same (token, top-k slot, M tile, K tile).  The LUT is
+// built once per group and the per-plane contributions are accumulated
+// before a single atomicAdd pair.  q_bias is emitted only by the group
+// containing plane 0.
+template <int GROUP_PLANES>
+__global__ void nqmv_bias_planes_moe_fused_flat_plane_groups(
+    const __half * __restrict__ X_fp16,
+    float *        __restrict__ Y_dst_f32,
+    const int32_t * __restrict__ ids,
+    const uint32_t * const * const * __restrict__ qw_planes_per_expert,
+    const __half   * const * const * __restrict__ alpha_planes_per_expert,
+    const __half   *               * __restrict__ q_bias_per_expert,
+    const int M,
+    const int K,
+    const int n_used,
+    const int     max_precision,
+    const int * __restrict__ prec_per_eid,
+    const int group_size,
+    const int shared_x,
+    const int plane_axis_in_y)
+{
+    static_assert(GROUP_PLANES == 2 || GROUP_PLANES == 4,
+                  "flat plane grouping supports GROUP_PLANES=2 or 4");
+
+    const int n_plane_groups = (max_precision + GROUP_PLANES - 1) / GROUP_PLANES;
+    const int plane_group = plane_axis_in_y
+        ? (int)blockIdx.y % n_plane_groups
+        : (int)blockIdx.z % n_plane_groups;
+    const int k_tile = plane_axis_in_y
+        ? (int)blockIdx.y / n_plane_groups
+        : (int)blockIdx.y;
+    const int tu = plane_axis_in_y
+        ? (int)blockIdx.z
+        : (int)blockIdx.z / n_plane_groups;
+    const int p0             = plane_group * GROUP_PLANES;
+    const int t              = tu / n_used;
+    const int eid            = ids[tu];
+    if (eid < 0) return;
+
+    const int precision = prec_per_eid ? prec_per_eid[eid] : max_precision;
+    if (precision <= 0 || p0 >= precision) return;
+
+    const uint32_t * const * qw     = qw_planes_per_expert   [eid];
+    const __half   * const * alpha  = alpha_planes_per_expert[eid];
+    const __half   *         q_bias = q_bias_per_expert     [eid];
+    if (qw == nullptr || alpha == nullptr || q_bias == nullptr) __trap();
+
+    #pragma unroll
+    for (int j = 0; j < GROUP_PLANES; ++j) {
+        const int plane = p0 + j;
+        if (plane < precision && (qw[plane] == nullptr || alpha[plane] == nullptr)) {
+            __trap();
+        }
+    }
+
+    const __half * X_t = shared_x
+        ? X_fp16 + (size_t)t  * K
+        : X_fp16 + (size_t)tu * K;
+    float * Y_tu = Y_dst_f32 + (size_t)tu * M;
+
+    __shared__ float lut[K_TILE_SIZE/8][256];
+    const int lut_x_size = blockDim.x / (K_TILE_SIZE/8);
+
+    const int lut_y = threadIdx.x / lut_x_size;
+    const int lut_x = threadIdx.x % lut_x_size;
+
+    const __half * _inp = &X_t[k_tile * K_TILE_SIZE + lut_y * 8];
+    float4 inp_vec = ((float4 *)_inp)[0];
+    const __half2 * inp_half2 = (const __half2 *)&inp_vec;
+    const float inp_f32[8] = {
+        __half2float(inp_half2[0].x), __half2float(inp_half2[0].y),
+        __half2float(inp_half2[1].x), __half2float(inp_half2[1].y),
+        __half2float(inp_half2[2].x), __half2float(inp_half2[2].y),
+        __half2float(inp_half2[3].x), __half2float(inp_half2[3].y),
+    };
+
+    const float sgn[8] = {
+        (float)(2 * ((lut_x >> 0) & 1) - 1),
+        (float)(2 * ((lut_x >> 1) & 1) - 1),
+        (float)(2 * ((lut_x >> 2) & 1) - 1),
+        (float)(2 * ((lut_x >> 3) & 1) - 1),
+        (float)(2 * ((lut_x >> 4) & 1) - 1),
+        (float)(2 * ((lut_x >> 5) & 1) - 1),
+        (float)(2 * ((lut_x >> 6) & 1) - 1),
+        (float)(2 * ((lut_x >> 7) & 1) - 1),
+    };
+    float base = sgn[0]*inp_f32[0] + sgn[1]*inp_f32[1]
+               + sgn[2]*inp_f32[2] + sgn[3]*inp_f32[3]
+               + sgn[4]*inp_f32[4] + sgn[5]*inp_f32[5]
+               + sgn[6]*inp_f32[6] + sgn[7]*inp_f32[7];
+    lut[lut_y][lut_x] = base;
+
+    const int s = (lut_x_size==1)  ?0:
+                  (lut_x_size==2)  ?1:
+                  (lut_x_size==4)  ?2:
+                  (lut_x_size==8)  ?3:
+                  (lut_x_size==16) ?4:
+                  (lut_x_size==32) ?5:
+                  (lut_x_size==64) ?6:
+                  (lut_x_size==128)?7: 8;
+
+    #pragma unroll
+    for (int s_iter = s; s_iter < 8; ++s_iter) {
+        const float iValue = 2.f * inp_f32[s_iter];
+        #pragma unroll
+        for (int i = (1 << s_iter); i < (1 << (s_iter + 1)); i += lut_x_size) {
+            lut[lut_y][i + lut_x] = lut[lut_y][i + lut_x - (1 << s_iter)] + iValue;
+        }
+    }
+    __syncthreads();
+
+    const int m_start = blockIdx.x * M_TILE_SIZE + threadIdx.x * 2;
+    const int m_end   = min((blockIdx.x + 1) * M_TILE_SIZE, M);
+    const int m_step  = blockDim.x * 2;
+
+    const int K_over_32_offset = k_tile * (K_TILE_SIZE / 32);
+    const int group_idx        = (k_tile * K_TILE_SIZE) / group_size;
+
+    for (int m = m_start; m < m_end; m += m_step) {
+        float acc_lo = 0.f;
+        float acc_hi = 0.f;
+
+        if (p0 == 0) {
+            const __half2 qb = ((const __half2 *)&q_bias[group_idx*M + m])[0];
+            const float qb_lo = __half2float(qb.x);
+            const float qb_hi = __half2float(qb.y);
+
+            float t_sum = 0.f;
+            #pragma unroll
+            for (int kt = 0; kt < K_TILE_SIZE/32; ++kt) {
+                t_sum += lut[kt*4+0][255] + lut[kt*4+1][255]
+                       + lut[kt*4+2][255] + lut[kt*4+3][255];
+            }
+            acc_lo = fmaf(qb_lo, t_sum, acc_lo);
+            acc_hi = fmaf(qb_hi, t_sum, acc_hi);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < GROUP_PLANES; ++j) {
+            const int plane = p0 + j;
+            if (plane >= precision) break;
+
+            const uint32_t * __restrict__ bW_p =
+                qw[plane] + (size_t)K_over_32_offset * M;
+            const __half * __restrict__ alpha_p = alpha[plane];
+
+            float t_lo = 0.f;
+            float t_hi = 0.f;
+
+            #pragma unroll
+            for (int kt = 0; kt < K_TILE_SIZE/32; ++kt) {
+                const uint64_t w_pair = ((const uint64_t *)&bW_p[kt*M + m])[0];
+                const uint32_t w0 = (uint32_t)w_pair;
+                const uint32_t w1 = (uint32_t)(w_pair >> 32);
+
+                const uchar4 by0 = *reinterpret_cast<const uchar4 *>(&w0);
+                const uchar4 by1 = *reinterpret_cast<const uchar4 *>(&w1);
+
+                t_lo += lut[kt*4+0][by0.x] + lut[kt*4+1][by0.y]
+                      + lut[kt*4+2][by0.z] + lut[kt*4+3][by0.w];
+                t_hi += lut[kt*4+0][by1.x] + lut[kt*4+1][by1.y]
+                      + lut[kt*4+2][by1.z] + lut[kt*4+3][by1.w];
+            }
+
+            const __half2 a = ((const __half2 *)&alpha_p[group_idx*M + m])[0];
+            acc_lo = fmaf(__half2float(a.x), t_lo, acc_lo);
+            acc_hi = fmaf(__half2float(a.y), t_hi, acc_hi);
+        }
+
+        atomicAdd(&Y_tu[m],     acc_lo);
+        atomicAdd(&Y_tu[m + 1], acc_hi);
+    }
+}
+
+
+enum class MixedKernelMode {
+    Auto,
+    Loop,
+    Flat,
+    Bucket,
+    Optimized,
+};
+
+MixedKernelMode configured_mixed_kernel_mode() {
+    static const MixedKernelMode mode = [] {
+        const char * mode_v = std::getenv("DP_MOE_FUSED_MIXED_MODE");
+        if (mode_v != nullptr) {
+            if (std::strcmp(mode_v, "loop") == 0)   return MixedKernelMode::Loop;
+            if (std::strcmp(mode_v, "flat") == 0)   return MixedKernelMode::Flat;
+            if (std::strcmp(mode_v, "bucket") == 0) return MixedKernelMode::Bucket;
+            if (std::strcmp(mode_v, "optimized") == 0) return MixedKernelMode::Optimized;
+            if (std::strcmp(mode_v, "auto") == 0)   return MixedKernelMode::Auto;
+        }
+
+        const char * v = std::getenv("DP_MOE_FUSED_FLAT_PLANES");
+        if (v != nullptr) {
+            return std::strcmp(v, "0") == 0
+                ? MixedKernelMode::Loop
+                : MixedKernelMode::Flat;
+        }
+
+        return MixedKernelMode::Auto;
+    }();
+    return mode;
+}
+
+int env_int_or(const char * name, int fallback) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    char * end = nullptr;
+    const long x = std::strtol(v, &end, 10);
+    return end != v ? x : fallback;
+}
+
+bool env_enabled(const char * name) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return false;
+    return std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0;
+}
+
+int configured_flat_group_planes() {
+    const int group_planes = env_int_or("DP_MOE_FUSED_PLANE_GROUP", 2);
+    if (group_planes >= 4) return 4;
+    if (group_planes >= 2) return 2;
+    return 1;
+}
+
+MixedKernelMode auto_mixed_kernel_mode(int n_tokens) {
+    const bool optimized = env_enabled("DP_MOE_KERNEL_OPTIMIZED");
+    const bool optimized_batch =
+        env_enabled("DP_MOE_OPTIMIZED_BATCH_KERNEL") ||
+        env_enabled("DP_MOE_KERNEL_OPTIMIZED_BATCH");
+    if ((n_tokens == 1 && optimized) ||
+        (n_tokens > 1 && optimized_batch)) {
+        return MixedKernelMode::Optimized;
+    }
+    return MixedKernelMode::Loop;
+}
+
 
 void naver_gemv_moe_launch(
     const void *           X_fp16,
@@ -202,6 +619,7 @@ void naver_gemv_moe_launch(
     const int *            prec_per_eid_d,
     int                    group_size,
     int                    shared_x,
+    int                    routed_precision_span_hint,
     StreamHandle           stream_opaque)
 {
     if (prec_per_eid_d == nullptr) {
@@ -227,15 +645,106 @@ void naver_gemv_moe_launch(
         n_tokens * n_used);
     dim3 block(NUM_THREADS);
 
-    nqmv_bias_planes_moe_fused<<<grid, block, 0, stream>>>(
-        (const __half *)   X_fp16,
-        (float *)          Y_dst_f32,
-        ids_d,
-        (const uint32_t * const * const *) table.d_qw_planes_per_expert,
-        (const __half   * const * const *) table.d_alpha_planes_per_expert,
-        (const __half   *               *) table.d_q_bias_per_expert,
-        M, K, n_used, uniform_precision, prec_per_eid_d,
-        group_size, shared_x);
+    MixedKernelMode mixed_mode = prec_per_eid_d != nullptr
+        ? configured_mixed_kernel_mode()
+        : MixedKernelMode::Loop;
+    const int optimized_span_threshold =
+        env_int_or("DP_MOE_KERNEL_OPTIMIZED_SPAN", 3);
+    if (mixed_mode == MixedKernelMode::Auto) {
+        mixed_mode = auto_mixed_kernel_mode(n_tokens);
+    }
+    if (mixed_mode == MixedKernelMode::Optimized &&
+        routed_precision_span_hint >= 0) {
+        mixed_mode = routed_precision_span_hint >= optimized_span_threshold
+            ? MixedKernelMode::Flat
+            : MixedKernelMode::Loop;
+    } else if (mixed_mode == MixedKernelMode::Optimized) {
+        mixed_mode = MixedKernelMode::Loop;
+    }
+
+    if (mixed_mode == MixedKernelMode::Flat) {
+        const int group_planes = configured_flat_group_planes();
+        const bool plane_axis_in_y = n_tokens > 1;
+        if (group_planes <= 1) {
+            dim3 flat_grid = plane_axis_in_y
+                ? dim3(
+                    grid.x,
+                    (unsigned int)((size_t)grid.y * (size_t)uniform_precision),
+                    grid.z)
+                : dim3(
+                    grid.x,
+                    grid.y,
+                    (unsigned int)((size_t)n_tokens * (size_t)n_used *
+                                   (size_t)uniform_precision));
+            nqmv_bias_planes_moe_fused_flat_planes<<<flat_grid, block, 0, stream>>>(
+                (const __half *)   X_fp16,
+                (float *)          Y_dst_f32,
+                ids_d,
+                (const uint32_t * const * const *) table.d_qw_planes_per_expert,
+                (const __half   * const * const *) table.d_alpha_planes_per_expert,
+                (const __half   *               *) table.d_q_bias_per_expert,
+                M, K, n_used, uniform_precision, prec_per_eid_d,
+                group_size, shared_x, plane_axis_in_y ? 1 : 0);
+        } else {
+            const int n_plane_groups =
+                (uniform_precision + group_planes - 1) / group_planes;
+            dim3 flat_grid = plane_axis_in_y
+                ? dim3(
+                    grid.x,
+                    (unsigned int)((size_t)grid.y * (size_t)n_plane_groups),
+                    grid.z)
+                : dim3(
+                    grid.x,
+                    grid.y,
+                    (unsigned int)((size_t)n_tokens * (size_t)n_used *
+                                   (size_t)n_plane_groups));
+            if (group_planes >= 4) {
+                nqmv_bias_planes_moe_fused_flat_plane_groups<4><<<flat_grid, block, 0, stream>>>(
+                    (const __half *)   X_fp16,
+                    (float *)          Y_dst_f32,
+                    ids_d,
+                    (const uint32_t * const * const *) table.d_qw_planes_per_expert,
+                    (const __half   * const * const *) table.d_alpha_planes_per_expert,
+                    (const __half   *               *) table.d_q_bias_per_expert,
+                    M, K, n_used, uniform_precision, prec_per_eid_d,
+                    group_size, shared_x, plane_axis_in_y ? 1 : 0);
+            } else {
+                nqmv_bias_planes_moe_fused_flat_plane_groups<2><<<flat_grid, block, 0, stream>>>(
+                    (const __half *)   X_fp16,
+                    (float *)          Y_dst_f32,
+                    ids_d,
+                    (const uint32_t * const * const *) table.d_qw_planes_per_expert,
+                    (const __half   * const * const *) table.d_alpha_planes_per_expert,
+                    (const __half   *               *) table.d_q_bias_per_expert,
+                    M, K, n_used, uniform_precision, prec_per_eid_d,
+                    group_size, shared_x, plane_axis_in_y ? 1 : 0);
+            }
+        }
+    } else if (mixed_mode == MixedKernelMode::Bucket) {
+        for (int p = 1; p <= uniform_precision; ++p) {
+            nqmv_bias_planes_moe_fused<<<grid, block, 0, stream>>>(
+                (const __half *)   X_fp16,
+                (float *)          Y_dst_f32,
+                ids_d,
+                (const uint32_t * const * const *) table.d_qw_planes_per_expert,
+                (const __half   * const * const *) table.d_alpha_planes_per_expert,
+                (const __half   *               *) table.d_q_bias_per_expert,
+                M, K, n_used, uniform_precision, prec_per_eid_d,
+                group_size, shared_x,
+                /*target_precision=*/p);
+        }
+    } else {
+        nqmv_bias_planes_moe_fused<<<grid, block, 0, stream>>>(
+            (const __half *)   X_fp16,
+            (float *)          Y_dst_f32,
+            ids_d,
+            (const uint32_t * const * const *) table.d_qw_planes_per_expert,
+            (const __half   * const * const *) table.d_alpha_planes_per_expert,
+            (const __half   *               *) table.d_q_bias_per_expert,
+            M, K, n_used, uniform_precision, prec_per_eid_d,
+            group_size, shared_x,
+            /*target_precision=*/0);
+    }
 
     cudaError_t last = cudaGetLastError();
     if (last != cudaSuccess) {
@@ -764,6 +1273,11 @@ __global__ void k_plan_per_expert_kbar(
     __shared__ int   s_active[K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_K     [K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_eids  [K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_n_active;
+    __shared__ int   s_target;
+    __shared__ int   s_target_extra;
+    __shared__ int   s_trace_stride;
+    extern __shared__ float s_dp[];
 
     const int tid = (int) threadIdx.x;
     // Init.
@@ -771,6 +1285,12 @@ __global__ void k_plan_per_expert_kbar(
         s_sum_g2[e] = 0.0f;
         s_active[e] = 0;
         s_K     [e] = 0;
+    }
+    if (tid == 0) {
+        s_n_active = 0;
+        s_target = 0;
+        s_target_extra = 0;
+        s_trace_stride = 1;
     }
     __syncthreads();
 
@@ -796,9 +1316,10 @@ __global__ void k_plan_per_expert_kbar(
     }
     __syncthreads();
 
-    // Phase 2: exact dynamic program.  Matches the eager runtime
-    // planner, including first-routed active expert order for
-    // deterministic tie-breaking.
+    // Phase 2: exact dynamic program.  Matches the eager runtime planner,
+    // including first-routed active expert order for deterministic
+    // tie-breaking.  Every active expert starts at K_min; the DP is
+    // parallelized across the remaining extra-budget states.
     if (tid == 0) {
         int n_active = 0;
         for (int idx = 0; idx < total; ++idx) {
@@ -815,58 +1336,91 @@ __global__ void k_plan_per_expert_kbar(
         }
 
         if (n_active > 0) {
+            s_n_active = n_active;
             int target = (int) lrintf((float) n_active * kbar);
             const int B_lo = n_active * K_min;
             const int B_hi = n_active * K_max;
             if (target < B_lo) target = B_lo;
             if (target > B_hi) target = B_hi;
-
-            const float INF = 1.0e30f;
-            for (int b = 0; b <= target; ++b) {
-                dp_prev[b] = INF;
-                dp_cur[b] = INF;
-            }
-            dp_prev[0] = 0.0f;
-
-            float * prev = dp_prev;
-            float * cur  = dp_cur;
-            const int B1 = n_expert * K_max + 1;
+            s_target = target;
+            s_target_extra = target - B_lo;
+            s_trace_stride = s_target_extra + 1;
             for (int i = 0; i < n_active; ++i) {
-                for (int b = 0; b <= target; ++b) cur[b] = INF;
-                const int e = s_eids[i];
-                const float g2 = s_sum_g2[e];
-                for (int prev_b = 0; prev_b <= target; ++prev_b) {
+                s_K[s_eids[i]] = K_min;
+            }
+        }
+    }
+    __syncthreads();
+
+    const int n_active = s_n_active;
+    const int target_extra = s_target_extra;
+    const int extra_max = K_max - K_min;
+    const int trace_stride = s_trace_stride;
+    const int dp_stride = n_expert * extra_max + 1;
+    if (n_active > 0) {
+        const float INF = 1.0e30f;
+        float * dp_prev_s = s_dp;
+        float * dp_cur_s  = s_dp + dp_stride;
+        for (int b = tid; b <= target_extra; b += (int) blockDim.x) {
+            dp_prev_s[b] = INF;
+            dp_cur_s[b] = INF;
+        }
+        if (tid == 0) {
+            dp_prev_s[0] = 0.0f;
+        }
+        __syncthreads();
+
+        float * prev = dp_prev_s;
+        float * cur  = dp_cur_s;
+        for (int i = 0; i < n_active; ++i) {
+            const int e = s_eids[i];
+            const float g2 = s_sum_g2[e];
+            for (int nb = tid; nb <= target_extra; nb += (int) blockDim.x) {
+                float best = INF;
+                int best_x = 0;
+                const int x_hi = extra_max < nb ? extra_max : nb;
+                // Match the old naive DP tie-break exactly: it scanned
+                // prev_b ascending, which is equivalent to x descending
+                // for a fixed new budget state.
+                for (int x = x_hi; x >= 0; --x) {
+                    const int prev_b = nb - x;
                     const float base = prev[prev_b];
                     if (base >= INF * 0.5f) continue;
-                    for (int K = K_min; K <= K_max; ++K) {
-                        const int nb = prev_b + K;
-                        if (nb > target) break;
-                        const float cost =
-                            base + g2 * R[e * n_K + (K - K_min)];
-                        if (cost < cur[nb]) {
-                            cur[nb] = cost;
-                            trace[(size_t) i * (size_t) B1 + (size_t) nb] =
-                                (uint8_t) K;
-                        }
+                    const float cost = base + g2 * R[e * n_K + x];
+                    if (cost < best) {
+                        best = cost;
+                        best_x = x;
                     }
                 }
-                float * tmp = prev;
-                prev = cur;
-                cur = tmp;
+                cur[nb] = best;
+                trace[(size_t) i * (size_t) trace_stride + (size_t) nb] =
+                    (uint8_t) best_x;
             }
+            __syncthreads();
+            float * tmp = prev;
+            prev = cur;
+            cur = tmp;
+        }
 
-            int b = target;
+        if (tid == 0) {
+            int b = target_extra;
             for (int i = n_active - 1; i >= 0; --i) {
                 const int e = s_eids[i];
-                int K = (int) trace[(size_t) i * (size_t) B1 + (size_t) b];
+                int x = (int) trace[(size_t) i * (size_t) trace_stride +
+                                    (size_t) b];
+                if (x < 0 || x > extra_max) x = 0;
+                int K = K_min + x;
                 if (K < K_min || K > K_max) K = K_min;
                 if (K > n_chunks_max) K = n_chunks_max;
                 s_K[e] = K;
-                b -= K;
+                b -= x;
                 if (b < 0) b = 0;
             }
         }
+    }
+    __syncthreads();
 
+    if (tid == 0) {
         // ── Runtime sanity check — PROBLEM.md §10 invariants.
         // GPU side mirrors the CPU allocator's asserts.  On violation
         // we trap; the host-side launcher detects via cudaGetLastError
@@ -883,17 +1437,11 @@ __global__ void k_plan_per_expert_kbar(
             }
             check_sum += K_i;
         }
-        long expected = n_active > 0
-            ? (long) lrintf((float) n_active * kbar)
-            : 0;
-        const long B_lo = (long) n_active * (long) K_min;
-        const long B_hi = (long) n_active * (long) K_max;
-        if (expected < B_lo) expected = B_lo;
-        if (expected > B_hi) expected = B_hi;
+        long expected = s_target;
         if (check_sum != expected) {
             printf("dp_moe-allocator[gpu]: Σ K[e]=%ld != "
                     "expected=%ld (n_active=%d kbar=%g)\n",
-                    check_sum, expected, n_active,
+                    check_sum, expected, s_n_active,
                     (double) kbar);
             __trap();
         }
@@ -940,14 +1488,19 @@ void launch_plan_per_expert_kbar(
     if (ids_d == nullptr || R_d == nullptr)            return;
     if (dp_prev_d == nullptr || dp_cur_d == nullptr || trace_d == nullptr) return;
     if (n_tokens <= 0 || n_used <= 0)                  return;
-    if (K_max <= K_min)                                 return;
+    if (K_min < 0 || K_max < K_min)                     return;
     if (!(kbar > 0.0f))                                 return;
     if (n_expert > K_KBAR_N_EXPERT_MAX)                 return;
     const int n_K = K_max - K_min + 1;
     if (n_K > K_KBAR_N_K_MAX)                           return;
     // R_d points at the full table; slice to layer_index.
     const float * R_layer = R_d + (size_t) layer_index * n_expert * n_K;
-    k_plan_per_expert_kbar<<<1, 256, 0, (cudaStream_t) stream>>>(
+    const int extra_max = K_max - K_min;
+    const int dp_stride = n_expert * extra_max + 1;
+    const size_t shared_dp_bytes = 2 * (size_t) dp_stride * sizeof(float);
+    dp_moe_ext::launch_diag::note_launch(
+        dp_moe_ext::launch_diag::Kind::PlannerKernel);
+    k_plan_per_expert_kbar<<<1, 256, shared_dp_bytes, (cudaStream_t) stream>>>(
         ids_d, weights_d, probs_d, R_layer,
         n_tokens, n_used, n_expert, n_K,
         K_min, K_max, kbar,
@@ -1000,9 +1553,106 @@ void launch_plan_per_expert_uniform(
     if (n_tokens <= 0 || n_used <= 0 || n_expert <= 0) return;
     const int block = 128;
     const int grid = (n_expert + block - 1) / block;
+    dp_moe_ext::launch_diag::note_launch(
+        dp_moe_ext::launch_diag::Kind::PlannerKernel);
     k_plan_per_expert_uniform<<<grid, block, 0, (cudaStream_t) stream>>>(
         ids_d, n_tokens, n_used, n_expert, uniform_k, n_chunks_max,
         base_p, any_precision ? 1 : 0, planes_per_eid_d);
+}
+
+__device__ __forceinline__ int32_t load_i32_strided(
+    const int32_t * base, size_t row_stride, int t, int u);
+
+namespace {
+__global__ void k_plan_chunks_uniform_strided(
+    const int32_t * __restrict__ ids,
+    size_t ids_row_stride,
+    int n_tokens,
+    int n_used,
+    int n_expert,
+    int uniform_k,
+    int n_chunks_max,
+    int * __restrict__ chunks_per_eid,
+    int * __restrict__ expert_order,
+    int * __restrict__ n_active_out)
+{
+    __shared__ int s_active[K_KBAR_N_EXPERT_MAX];
+    __shared__ int s_eids[K_KBAR_N_EXPERT_MAX];
+
+    const int tid = (int) threadIdx.x;
+    for (int e = tid; e < n_expert; e += (int) blockDim.x) {
+        s_active[e] = 0;
+        chunks_per_eid[e] = 0;
+    }
+    __syncthreads();
+
+    const int total = n_tokens * n_used;
+    for (int idx = tid; idx < total; idx += (int) blockDim.x) {
+        const int t = idx / n_used;
+        const int u = idx - t * n_used;
+        const int e = (int) load_i32_strided(ids, ids_row_stride, t, u);
+        if (e >= 0 && e < n_expert) {
+            s_active[e] = 1;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int n_active = 0;
+        for (int idx = 0; idx < total; ++idx) {
+            const int t = idx / n_used;
+            const int u = idx - t * n_used;
+            const int e = (int) load_i32_strided(ids, ids_row_stride, t, u);
+            if (e < 0 || e >= n_expert || !s_active[e]) continue;
+            bool seen = false;
+            for (int j = 0; j < n_active; ++j) {
+                if (s_eids[j] == e) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) s_eids[n_active++] = e;
+        }
+        int chunks = uniform_k;
+        if (chunks < 1) chunks = 1;
+        if (chunks > n_chunks_max) chunks = n_chunks_max;
+        for (int i = 0; i < n_active; ++i) {
+            const int e = s_eids[i];
+            chunks_per_eid[e] = chunks;
+            if (expert_order != nullptr) {
+                expert_order[i] = e;
+            }
+        }
+        if (n_active_out != nullptr) {
+            *n_active_out = n_active;
+        }
+    }
+}
+} // anon
+
+void launch_plan_chunks_uniform_strided(
+    const int32_t * ids_d,
+    size_t          ids_row_stride,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             uniform_k,
+    int             n_chunks_max,
+    int *           chunks_per_eid_d,
+    int *           expert_order_d,
+    int *           n_active_d,
+    StreamHandle    stream)
+{
+    if (ids_d == nullptr || chunks_per_eid_d == nullptr) return;
+    if (n_tokens <= 0 || n_used <= 0 || n_expert <= 0) return;
+    if (n_expert > K_KBAR_N_EXPERT_MAX) return;
+    dp_moe_ext::launch_diag::note_launch(
+        dp_moe_ext::launch_diag::Kind::PlannerKernel);
+    k_plan_chunks_uniform_strided<<<1, 256, 0, (cudaStream_t) stream>>>(
+        ids_d, ids_row_stride,
+        n_tokens, n_used, n_expert,
+        uniform_k, n_chunks_max,
+        chunks_per_eid_d, expert_order_d, n_active_d);
 }
 
 __device__ __forceinline__ int32_t load_i32_strided(
@@ -1044,13 +1694,26 @@ __global__ void k_plan_chunks_kbar_exact_strided(
 {
     __shared__ float s_sum_g2[K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_active[K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_K[K_KBAR_N_EXPERT_MAX];
     __shared__ int   s_eids[K_KBAR_N_EXPERT_MAX];
+    __shared__ int   s_n_active;
+    __shared__ int   s_target;
+    __shared__ int   s_target_extra;
+    __shared__ int   s_trace_stride;
+    extern __shared__ float s_dp[];
 
     const int tid = (int) threadIdx.x;
     for (int e = tid; e < n_expert; e += (int) blockDim.x) {
         s_sum_g2[e] = 0.0f;
         s_active[e] = 0;
+        s_K[e] = 0;
         chunks_per_eid[e] = 0;
+    }
+    if (tid == 0) {
+        s_n_active = 0;
+        s_target = 0;
+        s_target_extra = 0;
+        s_trace_stride = 1;
     }
     __syncthreads();
 
@@ -1108,58 +1771,115 @@ __global__ void k_plan_chunks_kbar_exact_strided(
             *n_active_out = n_active;
         }
         if (n_active > 0) {
+            s_n_active = n_active;
             int target = (int) lrintf((float) n_active * kbar);
             const int B_lo = n_active * K_min;
             const int B_hi = n_active * K_max;
             if (target < B_lo) target = B_lo;
             if (target > B_hi) target = B_hi;
-
-            const float INF = 1.0e30f;
-            for (int b = 0; b <= target; ++b) {
-                dp_prev[b] = INF;
-                dp_cur[b] = INF;
-            }
-            dp_prev[0] = 0.0f;
-
-            float * prev = dp_prev;
-            float * cur  = dp_cur;
-            const int B1 = n_expert * K_max + 1;
+            s_target = target;
+            s_target_extra = target - B_lo;
+            s_trace_stride = s_target_extra + 1;
             for (int i = 0; i < n_active; ++i) {
-                for (int b = 0; b <= target; ++b) cur[b] = INF;
-                const int e = s_eids[i];
-                const float g2 = s_sum_g2[e];
-                for (int prev_b = 0; prev_b <= target; ++prev_b) {
+                s_K[s_eids[i]] = K_min;
+            }
+        }
+    }
+    __syncthreads();
+
+    const int n_active = s_n_active;
+    const int target_extra = s_target_extra;
+    const int extra_max = K_max - K_min;
+    const int trace_stride = s_trace_stride;
+    const int dp_stride = n_expert * extra_max + 1;
+    if (n_active > 0) {
+        const float INF = 1.0e30f;
+        float * dp_prev_s = s_dp;
+        float * dp_cur_s  = s_dp + dp_stride;
+        for (int b = tid; b <= target_extra; b += (int) blockDim.x) {
+            dp_prev_s[b] = INF;
+            dp_cur_s[b] = INF;
+        }
+        if (tid == 0) {
+            dp_prev_s[0] = 0.0f;
+        }
+        __syncthreads();
+
+        float * prev = dp_prev_s;
+        float * cur  = dp_cur_s;
+        for (int i = 0; i < n_active; ++i) {
+            const int e = s_eids[i];
+            const float g2 = s_sum_g2[e];
+            for (int nb = tid; nb <= target_extra; nb += (int) blockDim.x) {
+                float best = INF;
+                int best_x = 0;
+                const int x_hi = extra_max < nb ? extra_max : nb;
+                // Match the old naive DP tie-break exactly: it scanned
+                // prev_b ascending, which is equivalent to x descending
+                // for a fixed new budget state.
+                for (int x = x_hi; x >= 0; --x) {
+                    const int prev_b = nb - x;
                     const float base = prev[prev_b];
                     if (base >= INF * 0.5f) continue;
-                    for (int K = K_min; K <= K_max; ++K) {
-                        const int nb = prev_b + K;
-                        if (nb > target) break;
-                        const float cost =
-                            base + g2 * R[e * n_K + (K - K_min)];
-                        if (cost < cur[nb]) {
-                            cur[nb] = cost;
-                            trace[(size_t) i * (size_t) B1 + (size_t) nb] =
-                                (uint8_t) K;
-                        }
+                    const float cost = base + g2 * R[e * n_K + x];
+                    if (cost < best) {
+                        best = cost;
+                        best_x = x;
                     }
                 }
-                float * tmp = prev;
-                prev = cur;
-                cur = tmp;
+                cur[nb] = best;
+                trace[(size_t) i * (size_t) trace_stride + (size_t) nb] =
+                    (uint8_t) best_x;
             }
+            __syncthreads();
+            float * tmp = prev;
+            prev = cur;
+            cur = tmp;
+        }
 
-            int b = target;
+        if (tid == 0) {
+            int b = target_extra;
             for (int i = n_active - 1; i >= 0; --i) {
                 const int e = s_eids[i];
-                const int B1 = n_expert * K_max + 1;
-                int K = (int) trace[(size_t) i * (size_t) B1 + (size_t) b];
+                int x = (int) trace[(size_t) i * (size_t) trace_stride +
+                                    (size_t) b];
+                if (x < 0 || x > extra_max) x = 0;
+                int K = K_min + x;
                 if (K < K_min || K > K_max) K = K_min;
                 if (K > n_chunks_max) K = n_chunks_max;
-                chunks_per_eid[e] = K;
-                b -= K;
+                s_K[e] = K;
+                b -= x;
                 if (b < 0) b = 0;
             }
         }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        long check_sum = 0;
+        for (int i = 0; i < n_active; ++i) {
+            const int e = s_eids[i];
+            const int K_i = s_K[e];
+            if (K_i < K_min || K_i > K_max) {
+                printf("dp_moe-allocator[gpu-runtime]: K[%d]=%d outside "
+                       "[%d, %d] at layer (kbar=%g)\n",
+                       e, K_i, K_min, K_max, (double) kbar);
+                __trap();
+            }
+            check_sum += K_i;
+        }
+        if (check_sum != (long) s_target) {
+            printf("dp_moe-allocator[gpu-runtime]: sum K[e]=%ld != "
+                   "expected=%d (n_active=%d kbar=%g)\n",
+                   check_sum, s_target, n_active, (double) kbar);
+            __trap();
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i < n_active; i += (int) blockDim.x) {
+        const int e = s_eids[i];
+        chunks_per_eid[e] = s_K[e];
     }
 }
 
@@ -1196,7 +1916,12 @@ void launch_plan_chunks_kbar_exact_strided(
     const int n_K = K_max - K_min + 1;
     if (n_K <= 0 || n_K > K_KBAR_N_K_MAX) return;
     const float * R_layer = R_d + (size_t) layer_index * n_expert * n_K;
-    k_plan_chunks_kbar_exact_strided<<<1, 256, 0, (cudaStream_t) stream>>>(
+    const int extra_max = K_max - K_min;
+    const int dp_stride = n_expert * extra_max + 1;
+    const size_t shared_dp_bytes = 2 * (size_t) dp_stride * sizeof(float);
+    dp_moe_ext::launch_diag::note_launch(
+        dp_moe_ext::launch_diag::Kind::PlannerKernel);
+    k_plan_chunks_kbar_exact_strided<<<1, 256, shared_dp_bytes, (cudaStream_t) stream>>>(
         ids_d, ids_row_stride,
         weights_d, weights_row_stride,
         probs_d, probs_row_stride,

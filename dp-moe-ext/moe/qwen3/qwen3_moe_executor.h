@@ -53,6 +53,7 @@ private:
         const void * ids_data = nullptr;
         int n_used = 0;
         int n_tokens = 0;
+        uint64_t prepared_graph_epoch = 0;
         std::vector<int> active_experts;
         size_t slice_bytes[3] = {0, 0, 0};
     };

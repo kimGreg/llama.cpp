@@ -5,6 +5,8 @@
 #include "executor.h"        // register_executor
 #include "moe_scheduler.h"
 #include "runtime.h"
+#include "runtime_diag.h"
+#include "runtime_glue.h"
 #include "stream_reader.h"
 #include "launch_diag.h"
 
@@ -61,9 +63,9 @@ std::string staging_wid(int kind) {
     return names[kind];
 }
 
-bool direct_refresh_decode_every_call() {
+bool direct_refresh_every_graph() {
     const char * env = std::getenv("DP_MOE_DIRECT_REFRESH_EVERY_DECODE");
-    return env != nullptr && std::strcmp(env, "0") != 0;
+    return env == nullptr || env[0] == '\0' || std::strcmp(env, "0") != 0;
 }
 
 } // namespace
@@ -181,14 +183,14 @@ bool Qwen3BaselineExecutor::prepare_moe_mul_mat_id(
 
     LayerState & st = layers_[layer];
     const bool direct_decode_phase = (int) ids->ne[1] == 1;
-    const bool force_decode_refresh =
-        direct_decode_phase && direct_refresh_decode_every_call();
-    const bool need_prepare =
-        force_decode_refresh ||
-        st.ids_data != ids->data ||
-        st.n_used != (int) ids->ne[0] ||
-        st.n_tokens != (int) ids->ne[1] ||
-        st.active_experts.empty();
+    const bool refresh_by_graph = direct_refresh_every_graph();
+    const uint64_t graph_epoch = dp_moe_ext::dp_moe_graph_epoch();
+    const bool need_prepare = refresh_by_graph
+        ? (st.prepared_graph_epoch != graph_epoch || st.active_experts.empty())
+        : (st.ids_data != ids->data ||
+           st.n_used != (int) ids->ne[0] ||
+           st.n_tokens != (int) ids->ne[1] ||
+           st.active_experts.empty());
 
     cudaStream_t stream = (cudaStream_t) stream_h;
 
@@ -198,6 +200,7 @@ bool Qwen3BaselineExecutor::prepare_moe_mul_mat_id(
         st.ids_data = ids->data;
         st.n_used = (int) ids->ne[0];
         st.n_tokens = (int) ids->ne[1];
+        st.prepared_graph_epoch = graph_epoch;
         st.active_experts.clear();
         if (st.n_used <= 0 || st.n_tokens <= 0) return false;
 
@@ -254,10 +257,14 @@ bool Qwen3BaselineExecutor::prepare_moe_mul_mat_id(
                         launch_diag::set_current_decode_phase(prev);
                     }
                 } _decode_phase(direct_decode_phase);
-                for (int eid : st.active_experts) {
+                for (size_t active_i = 0; active_i < st.active_experts.size(); ++active_i) {
+                    const int eid = st.active_experts[active_i];
                     const std::string wid = expert_wid(layer, eid);
+                    diag::record_chunk(*rt_, wid, (int)active_i, 0, expert_cid);
                     rt_->move_chunk(wid, expert_cid, Tier::RAM, Tier::VRAM, stream_h);
                     rt_->pool().wait_on_stream(wid, expert_cid, stream_h);
+                    qwen3::scheduler_touch_host_cache(
+                        rt_->scheduler(), wid, expert_cid);
                     qwen3::scheduler_touch_resident(
                         rt_->scheduler(), wid, expert_cid, 0);
                 }

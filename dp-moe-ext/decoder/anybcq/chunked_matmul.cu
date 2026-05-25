@@ -85,6 +85,8 @@ bool moe_chunk_matmul(
     int                      K,
     int                      group_size,
     int                      shared_x,
+    int                      routed_chunk_span_hint,
+    int                      routed_max_chunk_hint,
     StreamHandle             stream)
 {
     g_chunk_matmul_calls.fetch_add(1, std::memory_order_relaxed);
@@ -223,6 +225,28 @@ bool moe_chunk_matmul(
     //    when prec_per_eid_d is null; here we always pass a valid
     //    per-expert table, so uniform_precision just needs to lie in
     //    the kernel's [1, kMaxChunksPerTensor] range check.
+    int routed_precision_span_hint = -1;
+    if (routed_chunk_span_hint >= 0) {
+        // For both direct and any-precision encoders, adding one chunk
+        // adds exactly one kernel plane.  The base precision offset only
+        // affects the absolute max below.
+        routed_precision_span_hint = routed_chunk_span_hint;
+    }
+    int routed_max_precision_hint = -1;
+    if (routed_max_chunk_hint > 0 && routed_max_chunk_hint <= n_chunks_max) {
+        routed_max_precision_hint =
+            planes_for_chunks(routed_max_chunk_hint, n_chunks_max,
+                              base_p, any_precision);
+    }
+
+    int launch_max_planes = max_planes_seen;
+    if (routed_max_precision_hint > 0 &&
+        routed_max_precision_hint <= kMaxChunksPerTensor) {
+        launch_max_planes = routed_max_precision_hint;
+    }
+    if (launch_max_planes < 1) launch_max_planes = 1;
+    if (launch_max_planes > max_planes_seen) launch_max_planes = max_planes_seen;
+
     g_kernel_launch_calls.fetch_add(1, std::memory_order_relaxed);
     ::dp_moe_ext::launch_diag::note_launch(
         ::dp_moe_ext::launch_diag::Kind::MoeMatmul);
@@ -230,10 +254,11 @@ bool moe_chunk_matmul(
         X_fp16, Y_slot_f32, ids_d,
         table,
         M, K, n_tokens, n_used,
-        /*uniform_precision=*/max_planes_seen,
+        /*uniform_precision=*/launch_max_planes,
         /*prec_per_eid_d=*/prec_per_eid_d,
         group_size,
         shared_x,
+        routed_precision_span_hint,
         stream);
 
     return true;

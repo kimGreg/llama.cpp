@@ -73,6 +73,11 @@ std::vector<MoveOp> all_moves_for(const std::string & wid, int P) {
     return out;
 }
 
+bool env_flag_enabled(const char * name) {
+    const char * s = std::getenv(name);
+    return s != nullptr && s[0] != '\0' && s[0] != '0';
+}
+
 // Read [offset, offset+nbytes) from path into a host buffer.
 //
 // Uses pread(2) directly + posix_fadvise(DONTNEED) so the kernel
@@ -212,14 +217,8 @@ public:
                     const StreamReader & reader,
                     const std::string & gguf_path) override {
         rt_ = &rt;
-        // Benchmark/score-mode opt-in: when set, claims_node() returns
-        // false so ggml-cuda is free to capture the cgraph. Safe only
-        // when every chunk is pinned in VRAM (no SSD streaming, no
-        // eviction). The fully-pinned check at the end of on_install
-        // aborts loudly if pool capacity is too small.
-        if (const char * s = std::getenv("DP_MOE_ALLOW_CAPTURE")) {
-            if (s[0] && s[0] != '0') allow_capture_ = true;
-        }
+        allow_capture_ = env_flag_enabled("DP_MOE_ALLOW_CAPTURE");
+        pin_all_ = env_flag_enabled("DP_MOE_PIN_ALL") || allow_capture_;
         // Snapshot every managed name (chunked synthetic wids AND
         // placeholder-only canonicals).  claims_tensor / claims_node /
         // dispatch_node consult this set.  Used to live as
@@ -278,24 +277,35 @@ public:
             register_chunk_io_from_layout(rt, reader, name);
 
             if (direct_matrix) {
+                direct_matrix_wids_.insert(name);
                 // Direct-matrix baseline: one native GGML expert matrix
                 // per chunk, no q_bias/fixed-meta upload. The active expert
                 // chunk streams on demand through the same pool path.
-                base_plans_.emplace(name, Plan{
-                    /*chunks=*/{},
-                    /*moves =*/{}
-                });
+                if (pin_all_) {
+                    std::vector<int> all_chunks;
+                    all_chunks.reserve(P);
+                    for (int p = 0; p < P; ++p) {
+                        rt.move_chunk(name, cid_chunk(p), Tier::RAM, Tier::VRAM);
+                        all_chunks.push_back(cid_chunk(p));
+                    }
+                    base_plans_.emplace(name, Plan{ all_chunks, {} });
+                    total_pinned += (size_t)P;
+                } else {
+                    base_plans_.emplace(name, Plan{
+                        /*chunks=*/{},
+                        /*moves =*/{}
+                    });
+                }
             } else if (!any_prec) {
                 // SsAnybcq layout: upload q_bias once at install (small,
                 // hot — every kernel call reads it). Plane chunks load on
                 // demand. Plan = q_bias only at steady state.
                 //
-                // Benchmark/capture mode (DP_MOE_ALLOW_CAPTURE=1):
-                // pre-pin every chunk at install — the load_set is
-                // permanently empty and the dispatch's residency checks
-                // all short-circuit on first probe.
+                // Full-pin mode preloads every chunk at install. It can
+                // run either as eager runtime mode (DP_MOE_PIN_ALL=1)
+                // or benchmark capture mode (DP_MOE_ALLOW_CAPTURE=1).
                 rt.move_chunk(name, kCidQBias, Tier::RAM, Tier::VRAM);
-                if (allow_capture_) {
+                if (pin_all_) {
                     for (int p = 0; p < P; ++p) {
                         rt.move_chunk(name, cid_chunk(p), Tier::RAM, Tier::VRAM);
                     }
@@ -319,9 +329,9 @@ public:
                 // ss_anybcq path uses, with the precision tier driven by
                 // the score policy at dispatch time.
                 //
-                // Benchmark/capture mode pins every plane chunk eagerly
-                // for the same reason as ss_anybcq above.
-                if (allow_capture_) {
+                // Full-pin mode pins every plane chunk eagerly for the
+                // same reason as ss_anybcq above.
+                if (pin_all_) {
                     for (int p = 0; p < P; ++p) {
                         rt.move_chunk(name, cid_chunk(p), Tier::RAM, Tier::VRAM);
                     }
@@ -347,7 +357,9 @@ public:
                     std::move(per_chunk_bytes_anyprec);
             }
 
-            total_on_demand += (size_t)P;
+            if (!pin_all_) {
+                total_on_demand += (size_t)P;
+            }
             n_total         += 1;
 
             // Default: drop host chunk buffers — on-demand chunks
@@ -494,13 +506,11 @@ public:
             "dp_moe-scheduler[moe]: built %zu MoEMatMulComp instances\n",
             comps_built);
 
-        // Fully-pinned guard for the capture opt-in (benchmark/score
-        // mode). Sum every managed chunk's on-disk byte size and
-        // compare to the VRAM pool capacity. If the pool can't hold
-        // the whole model, capture is unsafe (eviction would
-        // invalidate captured chunk pointers mid-replay) — abort
-        // rather than silently corrupt graphs.
-        if (allow_capture_) {
+        // Fully-pinned guard. Sum every managed chunk's byte size and
+        // compare to the VRAM pool capacity. Capture always requires
+        // full pin, and eager DP_MOE_PIN_ALL has the same residency
+        // requirement.
+        if (pin_all_) {
             size_t total_managed_bytes = 0;
             for (const auto & kv : P_of_) {
                 const auto & nm = kv.first;
@@ -511,30 +521,32 @@ public:
                 } else {
                     auto it_b = bytes_per_chunk_of_.find(nm);
                     if (it_b != bytes_per_chunk_of_.end()) {
-                        // ss_anybcq: q_bias + P plane chunks all
-                        // share bytes_per_chunk.
-                        total_managed_bytes += it_b->second * (size_t)(P + 1);
+                        const bool direct =
+                            direct_matrix_wids_.count(nm) != 0;
+                        total_managed_bytes += it_b->second *
+                            (direct ? (size_t)P : (size_t)(P + 1));
                     }
                 }
             }
             const size_t cap = rt.pool().capacity_bytes();
             if (cap < total_managed_bytes) {
                 std::fprintf(stderr,
-                    "dp_moe-scheduler[moe]: DP_MOE_ALLOW_CAPTURE=1 but "
+                    "dp_moe-scheduler[moe]: full pin requested but "
                     "pool capacity %.2f GB < total managed %.2f GB. "
-                    "Capture mode requires fully-pinned VRAM. Set "
-                    "DP_MOE_VRAM_CAP_MB high enough to fit the whole "
-                    "model, or unset DP_MOE_ALLOW_CAPTURE.\n",
+                    "Set DP_MOE_VRAM_CAP_MB high enough to fit the "
+                    "whole model, or unset DP_MOE_PIN_ALL/"
+                    "DP_MOE_ALLOW_CAPTURE.\n",
                     (double)cap / 1e9, (double)total_managed_bytes / 1e9);
-                GGML_ABORT("dp_moe-scheduler: capture mode misconfigured");
+                GGML_ABORT("dp_moe-scheduler: full pin misconfigured");
             }
             std::fprintf(stderr,
-                "dp_moe-scheduler[moe]: capture mode ENABLED — "
-                "pool %.2f GB >= managed %.2f GB (version-keyed graph cache)\n",
-                (double)cap / 1e9, (double)total_managed_bytes / 1e9);
+                "dp_moe-scheduler[moe]: full pin ENABLED — "
+                "pool %.2f GB >= managed %.2f GB%s\n",
+                (double)cap / 1e9, (double)total_managed_bytes / 1e9,
+                allow_capture_ ? " (benchmark capture enabled)" : "");
 
             // Device-side mirror of the dynamic-residuals table — used
-            // by the K̄-knapsack plan kernel (capture-mode rung 2).
+            // by the KBar planner kernels.
             // Allocated lazily here; the H2D in set_dynamic_residuals
             // does the actual upload when the residuals first arrive.
             // If residuals are already loaded by this point (env-var
@@ -796,6 +808,36 @@ public:
     void touch_resident(const std::string & wid, int cid, int plane) {
         tracker_.touch(wid, cid, plane);
     }
+    void touch_host_cache(const std::string & wid, int cid) {
+        if (!host_cache_enabled_ || host_max_bytes_ == 0) return;
+        if (!cid_is_chunk(cid)) return;
+
+        std::vector<HostKey> to_evict;
+        {
+            std::lock_guard<std::mutex> lk(host_lru_mu_);
+            HostKey k{wid, cid};
+            auto pos_it = host_pos_.find(k);
+            if (pos_it != host_pos_.end()) {
+                host_lru_.splice(host_lru_.begin(), host_lru_, pos_it->second);
+            } else {
+                host_lru_.push_front(k);
+                host_pos_.emplace(k, host_lru_.begin());
+                host_used_bytes_ += bytes_for_chunk(wid, cid);
+            }
+            while (host_used_bytes_ > host_max_bytes_ && !host_lru_.empty()) {
+                HostKey victim = host_lru_.back();
+                host_lru_.pop_back();
+                host_pos_.erase(victim);
+                const size_t vb = bytes_for_chunk(victim.wid, victim.cid);
+                host_used_bytes_ = (vb > host_used_bytes_)
+                                   ? 0 : host_used_bytes_ - vb;
+                to_evict.push_back(victim);
+            }
+        }
+        for (const auto & v : to_evict) {
+            rt_->release_chunk_host(v.wid, v.cid);
+        }
+    }
 
     void note_moe_layer(bool decode_phase, int layer_idx) {
         if (!logical_cache_age_) return;
@@ -923,11 +965,9 @@ public:
         // cuda consults this predicate per cgraph node and disables
         // capture for any cgraph where it returns true.
         //
-        // Benchmark/score-mode opt-in (DP_MOE_ALLOW_CAPTURE=1):
-        // operator has guaranteed full VRAM pin → LOAD is a no-op,
-        // capture is safe.  The score-table version hook
-        // (qwen3_runtime_glue) invalidates the captured graph when
-        // the dial swaps, so phase-aware C_phase works too.
+        // Benchmark capture (DP_MOE_ALLOW_CAPTURE=1): full pin makes
+        // LOAD a no-op, so graph capture is safe. The score-version
+        // hook invalidates cached graphs when the dial changes.
         if (allow_capture_) return false;
         if (node == nullptr) return false;
         if (node->op != GGML_OP_MUL_MAT &&
@@ -1241,10 +1281,9 @@ public:
     //   over       Kᵢ ∈ {K_min, …, K_max}    for i = 1..n
     //   s.t.       Σᵢ Kᵢ  =  B_local                (hard equality)
     //
-    // via O(n × B × K_range) dynamic programming.  Optimal regardless
-    // of whether R[L, e, K] is monotone-non-increasing in K (greedy
-    // would lose on non-monotone curves — see commit msg / PROBLEM.md
-    // §3.2 caveat).
+    // Uses an exact O(n x B_extra x K_range) dynamic program.  Every
+    // active expert is assigned K_min first; the DP spends only the
+    // remaining extra chunks.
     //
     // Implementation: two rolling float buffers (dp_prev, dp_cur) +
     // a (n × (B+1)) trace table of int8 K-choices.  All thread-local
@@ -1283,13 +1322,13 @@ public:
         const int n_K   = K_max - K_min + 1;
         if (n_K <= 1) return true;
 
-        const int Bhi = n * K_max;
-        const int B1  = Bhi + 1;
-
         long t = (long) std::lrint((double) n * (double) kbar);
         if (t < (long) n * K_min) t = (long) n * K_min;
         if (t > (long) n * K_max) t = (long) n * K_max;
         const int target = (int) t;
+        const int target_b = target;
+        const int extra_max = K_max - K_min;
+        const int target_extra = target - n * K_min;
 
         // Pre-compute the cost table  C[i, K] = Sᵢ · R[L, eᵢ, K],
         // where Sᵢ is the batch-aggregated sum of squared gate scores for
@@ -1321,50 +1360,56 @@ public:
             }
         }
 
-        // DP.  dp[b] = min Σ g²·R over first i experts spending b chunks.
-        // We use INF = 1e30f as "unreachable".
+        const int B1 = target_extra + 1;
+
+        // DP.  dp[b] = min Σ g²·R over first i experts spending b extra
+        // chunks above K_min.  We use INF = 1e30f as "unreachable".
         constexpr float INF = 1e30f;
         thread_local std::vector<float>   dp_prev, dp_cur;
-        thread_local std::vector<uint8_t> trace;   // K choice per (i, b)
+        thread_local std::vector<uint8_t> trace;   // extra choice per (i, b)
         dp_prev.assign((size_t) B1, INF);
         dp_cur .resize((size_t) B1);
         trace  .assign((size_t) n * B1, 0);
         dp_prev[0] = 0.0f;
 
         for (int i = 0; i < n; ++i) {
-            std::fill(dp_cur.begin(), dp_cur.end(), INF);
             const float * Ci = &tls_C[(size_t) i * n_K];
             uint8_t * trace_i = &trace[(size_t) i * B1];
-            for (int b_prev = 0; b_prev < B1; ++b_prev) {
-                const float dp_p = dp_prev[b_prev];
-                if (dp_p >= INF) continue;
-                for (int k = 0; k < n_K; ++k) {
-                    const int K_val = K_min + k;
-                    const int b_new = b_prev + K_val;
-                    if (b_new >= B1) break;
-                    const float cost = dp_p + Ci[k];
-                    if (cost < dp_cur[b_new]) {
-                        dp_cur[b_new] = cost;
-                        trace_i[b_new] = (uint8_t) K_val;
+            for (int b_new = 0; b_new <= target_extra; ++b_new) {
+                float best = INF;
+                int best_x = 0;
+                const int x_hi = std::min(extra_max, b_new);
+                // Match the old naive DP tie-break exactly: it scanned
+                // previous budget ascending, equivalent to extra chunks
+                // descending for a fixed new budget.
+                for (int x = x_hi; x >= 0; --x) {
+                    const int b_prev = b_new - x;
+                    const float base = dp_prev[(size_t) b_prev];
+                    if (base >= INF * 0.5f) continue;
+                    const float cost = base + Ci[x];
+                    if (cost < best) {
+                        best = cost;
+                        best_x = x;
                     }
                 }
+                dp_cur[(size_t) b_new] = best;
+                trace_i[(size_t) b_new] = (uint8_t) best_x;
             }
             dp_prev.swap(dp_cur);
         }
 
-        const int target_b = target;
-
-        // Backtrack from dp_prev[target_b].
-        if (dp_prev[target_b] < INF) {
-            int b = target_b;
+        // Backtrack from dp_prev[target_extra].
+        if (dp_prev[(size_t) target_extra] < INF) {
+            int b = target_extra;
             for (int i = n - 1; i >= 0; --i) {
-                const int K_i = (int) trace[(size_t) i * B1 + (size_t) b];
-                K_out[i] = K_i;
-                b -= K_i;
+                const int x =
+                    (int) trace[(size_t) i * B1 + (size_t) b];
+                K_out[i] = K_min + x;
+                b -= x;
             }
         }
         // else: DP couldn't reach target (shouldn't happen given the
-        // [n·K_min, n·K_max] clamp). Sanity check below catches it.
+        // [n*K_min, n*K_max] clamp). Sanity check below catches it.
 
         // ── Runtime sanity check — PROBLEM.md §10 invariants ──
         // Hard-enforced because the rest of the dispatch pipeline
@@ -1400,9 +1445,9 @@ public:
         // ── Optional per-layer first-dispatch dump for diagnosis.
         // DP_MOE_LOG_ALLOC=1 emits one log line per (layer × first
         // dispatch encountered) with the gate distribution, the
-        // chosen K[], the greedy total cost Σ g²·R[K], and the
+        // chosen K[], the dynamic total cost Σ g²·R[K], and the
         // uniform-baseline cost Σ g²·R[K̄] for comparison.  Used to
-        // pinpoint where greedy diverges from uniform.
+        // pinpoint where dynamic allocation diverges from uniform.
         static std::atomic<bool> alloc_log_layer_seen[256] = {};
         const char * log_env = std::getenv("DP_MOE_LOG_ALLOC");
         if (log_env && log_env[0] && log_env[0] != '0' &&
@@ -1627,17 +1672,18 @@ private:
     bool phase_schedule_enabled_ = false;
     float schedule_last_kbar_ = 0.0f;
 
-    // DP_MOE_ALLOW_CAPTURE=1: opt-in to CUDA-graph capture for the
-    // managed cgraph. Only legal when the operator has set
-    // DP_MOE_VRAM_CAP_MB large enough to keep every chunk pinned.
-    // The fully-pinned check at the end of on_install aborts loudly
-    // when the assumption is broken.
+    // DP_MOE_PIN_ALL=1: preload every managed chunk into the VRAM pool.
+    // DP_MOE_ALLOW_CAPTURE=1: benchmark-only CUDA graph capture; this
+    // implies full pin because captured kernels cannot tolerate chunk
+    // eviction or pointer-table mutation from SSD streaming.
     bool allow_capture_ = false;
+    bool pin_all_ = false;
     // Device mirror of dynamic_R_ for KBar planners.
     float *               dynamic_R_d_ = nullptr;
     size_t                dynamic_R_d_count_ = 0;
 
     std::unordered_map<std::string, int> P_of_;
+    std::unordered_set<std::string> direct_matrix_wids_;
     // Synthetic wids whose host layout flag had any_precision=true.
     // Used by plan_for_expert / plan_for_expert_with_precision to route
     // through the any-prec planning path (planes ↔ chunks translation +
@@ -1811,6 +1857,7 @@ namespace {
 inline MoEScheduler & as_moe(Scheduler & s) {
     return static_cast<MoEScheduler &>(s);
 }
+
 }  // anon
 
 const Plan * scheduler_plan_dense(
@@ -1862,6 +1909,14 @@ void scheduler_touch_resident(
     int                 plane)
 {
     as_moe(sched).touch_resident(wid, cid, plane);
+}
+
+void scheduler_touch_host_cache(
+    Scheduler &         sched,
+    const std::string & wid,
+    int                 cid)
+{
+    as_moe(sched).touch_host_cache(wid, cid);
 }
 
 void scheduler_note_moe_layer(

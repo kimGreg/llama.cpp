@@ -64,14 +64,11 @@ bool                                  g_required_runtime_was_true = false;
 // MUL_MAT_ID/MUL_MAT leaked" invariant.
 std::atomic<uint64_t>                 g_sentinel_claims{0};
 std::atomic<uint64_t>                 g_forward_moe_layer_calls{0};
+std::atomic<uint64_t>                 g_graph_compute_epoch{0};
 
-// Benchmark/score-mode capture opt-in.  Mirrors MoEScheduler::
-// allow_capture_ so the cgraph-level claim hook can short-circuit
-// without locking g_runtime_mu on every node — install_for_gguf
-// reads DP_MOE_ALLOW_CAPTURE once and writes here, the scheduler
-// reads the same env var in its own on_install.  clear() resets to
-// false so a subsequent install (e.g. server reload) re-reads the
-// env.
+// Benchmark capture opt-in. Runtime/TPS mode is eager; benchmark mode
+// sets DP_MOE_ALLOW_CAPTURE=1, pins all managed chunks, and lets
+// ggml-cuda capture the sentinel graph.
 std::atomic<bool>                     g_dp_moe_allow_capture{false};
 
 // Mode A milestone 1, S1 — bound model-slot set. Records every
@@ -199,10 +196,10 @@ bool install_for_gguf(const char * gguf_path) {
             "' is not registered; re-encode or re-materialize this artifact");
     }
 
-    // Benchmark/score-mode capture opt-in. Read here so the hook
-    // short-circuit below sees the right value the first time it
-    // fires (sentinel-bearing cgraphs land on the very first
-    // graph_compute, before any HTTP handler can touch the runtime).
+    // Benchmark capture opt-in. Read here so the hook short-circuit
+    // below sees the right value the first time it fires
+    // (sentinel-bearing cgraphs land on the very first graph_compute,
+    // before any HTTP handler can touch the runtime).
     if (const char * s = getenv("DP_MOE_ALLOW_CAPTURE")) {
         g_dp_moe_allow_capture.store(
             s[0] && s[0] != '0', std::memory_order_relaxed);
@@ -348,14 +345,14 @@ extern "C" bool dp_moe_user_node_claims(const struct ggml_tensor * node) {
     // missing capture speedup doesn't matter for dp_moe's use
     // case.
     if (node == nullptr) return false;
-    // Benchmark/score-mode opt-in: operator has set
-    // DP_MOE_ALLOW_CAPTURE=1 AND DP_MOE_VRAM_CAP_MB large
-    // enough to fit every chunk (verified by the scheduler's
-    // on_install assert). Skip the per-node claim so ggml-cuda can
-    // capture the cgraph; dial swaps are picked up by the score-
-    // version hook, which invalidates the cached graph.
     const bool allow_capture =
         g_dp_moe_allow_capture.load(std::memory_order_relaxed);
+    // Benchmark capture: the scheduler has already pinned every
+    // managed chunk and verified the pool cap, so skip all claims and
+    // let ggml-cuda capture the graph. Dial swaps are picked up by
+    // the score-version hook, which invalidates the cached graph.
+    if (allow_capture) return false;
+
     // Sentinel nodes (Mode A S5) are unambiguously claimed by name
     // and don't need a scheduler hop. Recognising them here keeps
     // the user-node-claims contract tight even if the scheduler's
@@ -371,7 +368,6 @@ extern "C" bool dp_moe_user_node_claims(const struct ggml_tensor * node) {
             return g_runtime->scheduler().claims_tensor(node->src[0]);
         }
     }
-    if (allow_capture) return false;
     return g_runtime->scheduler().claims_node(node);
 }
 
@@ -487,6 +483,36 @@ unsigned long long dp_moe_stat_pool_h2d_calls(void) {
     DPMoERuntime * rt = nullptr;
     { std::lock_guard<std::mutex> lk(g_runtime_mu); rt = g_runtime.get(); }
     return rt ? (unsigned long long) rt->pool().total_h2d_calls() : 0ull;
+}
+unsigned long long dp_moe_stat_pool_required_chunks(void) {
+    DPMoERuntime * rt = nullptr;
+    { std::lock_guard<std::mutex> lk(g_runtime_mu); rt = g_runtime.get(); }
+    return rt ? (unsigned long long) rt->pool().required_chunks() : 0ull;
+}
+unsigned long long dp_moe_stat_pool_resident_hits(void) {
+    DPMoERuntime * rt = nullptr;
+    { std::lock_guard<std::mutex> lk(g_runtime_mu); rt = g_runtime.get(); }
+    return rt ? (unsigned long long) rt->pool().resident_hits() : 0ull;
+}
+unsigned long long dp_moe_stat_pool_prefill_required_chunks(void) {
+    DPMoERuntime * rt = nullptr;
+    { std::lock_guard<std::mutex> lk(g_runtime_mu); rt = g_runtime.get(); }
+    return rt ? (unsigned long long) rt->pool().prefill_required_chunks() : 0ull;
+}
+unsigned long long dp_moe_stat_pool_prefill_resident_hits(void) {
+    DPMoERuntime * rt = nullptr;
+    { std::lock_guard<std::mutex> lk(g_runtime_mu); rt = g_runtime.get(); }
+    return rt ? (unsigned long long) rt->pool().prefill_resident_hits() : 0ull;
+}
+unsigned long long dp_moe_stat_pool_decode_required_chunks(void) {
+    DPMoERuntime * rt = nullptr;
+    { std::lock_guard<std::mutex> lk(g_runtime_mu); rt = g_runtime.get(); }
+    return rt ? (unsigned long long) rt->pool().decode_required_chunks() : 0ull;
+}
+unsigned long long dp_moe_stat_pool_decode_resident_hits(void) {
+    DPMoERuntime * rt = nullptr;
+    { std::lock_guard<std::mutex> lk(g_runtime_mu); rt = g_runtime.get(); }
+    return rt ? (unsigned long long) rt->pool().decode_resident_hits() : 0ull;
 }
 
 // Mode A Milestone 1, Step 6: cumulative count of chunks that
@@ -676,6 +702,7 @@ void clear() {
     g_required_runtime_was_true = false;
     g_sentinel_claims.store(0, std::memory_order_relaxed);
     g_forward_moe_layer_calls.store(0, std::memory_order_relaxed);
+    g_graph_compute_epoch.store(0, std::memory_order_relaxed);
     anybcq::reset_counters();
     MoEResidencyTracker::reset_eviction_counters();
     moe_dispatch::free_scratch();
@@ -721,6 +748,17 @@ extern "C" bool dp_moe_try_cuda_mul_mat(
     if (rt == nullptr) return false;
 
     if (rt->scheduler().claims_tensor(src0)) {
+        // Direct expert baselines intentionally reuse llama.cpp's stock
+        // MoE graph. Their MUL_MAT_ID nodes are prepared in dp_moe_pre_op,
+        // which hydrates the selected expert slices into staging tensors and
+        // points the managed canonical at that staging storage. ggml-cuda's
+        // MUL_MAT_ID implementation then reaches this dense helper
+        // internally. That is valid for the stock-graph executor; the hard
+        // fail remains for sentinel-only AnyBCQ mode where a managed dense
+        // op would mean the cgraph bypassed the DP-MoE rail.
+        if (g_executor && g_executor->uses_stock_moe_graph()) {
+            return false;
+        }
         GGML_ABORT(
             "DPMoE: criterion 10 violation — managed canonical "
             "'%s' surfaced as GGML_OP_MUL_MAT. Mode A reserves managed "
@@ -825,6 +863,7 @@ extern "C" void dp_moe_on_graph_audit_and_score_snapshot(
     cudaStream_t                stream,
     const struct ggml_cgraph *  cgraph)
 {
+    g_graph_compute_epoch.fetch_add(1, std::memory_order_relaxed);
     DPMoERuntime * rt = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_runtime_mu);
@@ -832,6 +871,10 @@ extern "C" void dp_moe_on_graph_audit_and_score_snapshot(
     }
     if (rt == nullptr) return;
     rt->scheduler().on_graph_compute_begin((StreamHandle) stream, cgraph);
+}
+
+extern "C" uint64_t dp_moe_graph_epoch(void) {
+    return g_graph_compute_epoch.load(std::memory_order_relaxed);
 }
 
 // End-of-cgraph callback — drops replay-scoped chunk reservations.

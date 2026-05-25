@@ -776,10 +776,19 @@ llama_model_loader::llama_model_loader(
             // weights_map keys are tensor names; meta lives in contexts.
             ggml_tensor * t = get_tensor_meta(name.c_str());
             if (t == nullptr) continue;
+            const std::string type_key =
+                std::string("dp_moe.tensor.") + name + ".canonical_ggml_type";
+            const int64_t type_id = gguf_find_key(metadata, type_key.c_str());
+            if (type_id >= 0) {
+                t->type = (enum ggml_type) gguf_get_val_u32(metadata, type_id);
+            }
             for (size_t d = 0; d < GGML_MAX_DIMS; ++d) {
                 t->ne[d] = new_ne[d];
-                t->nb[d] = (d == 0) ? ggml_type_size(t->type)
-                                    : t->nb[d-1] * t->ne[d-1];
+            }
+            t->nb[0] = ggml_type_size(t->type);
+            t->nb[1] = t->nb[0] * (t->ne[0] / ggml_blck_size(t->type));
+            for (size_t d = 2; d < GGML_MAX_DIMS; ++d) {
+                t->nb[d] = t->nb[d-1] * t->ne[d-1];
             }
             ++n_patched;
         }

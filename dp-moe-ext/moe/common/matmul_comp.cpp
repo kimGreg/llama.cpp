@@ -240,6 +240,8 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     if (sched_ == nullptr || rt_ == nullptr || any_layout_ == nullptr) {
         return out_plan;
     }
+    routed_chunk_span_hint_ = -1;
+    routed_max_chunk_hint_  = -1;
 
     const int n_tokens   = cur_n_tokens_;
     const int n_used     = cur_n_used_;
@@ -366,6 +368,27 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
     // dynamic dispatcher's CPU overhead vs static / threshold paths.
     const auto _decision_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - _decision_t0).count();
+
+    if (!unique_experts.empty()) {
+        int k_min = n_chunks_max;
+        int k_max = 1;
+        bool have_span = false;
+        for (int eid : unique_experts) {
+            auto it = chunks_by_expert.find(eid);
+            if (it == chunks_by_expert.end()) continue;
+            int n_c = it->second;
+            if (n_c < 1) n_c = 1;
+            if (n_c > n_chunks_max) n_c = n_chunks_max;
+            if (n_c < k_min) k_min = n_c;
+            if (n_c > k_max) k_max = n_c;
+            have_span = true;
+        }
+        if (have_span) {
+            routed_chunk_span_hint_ = k_max - k_min;
+            routed_max_chunk_hint_  = k_max;
+        }
+    }
+
     // Per-layer running-total of decision time so the final dump reports
     // average ns/decision-call.
     static std::atomic<uint64_t> decision_ns_per_layer[256] = {};
@@ -411,7 +434,26 @@ ChunkPlan MoEMatMulComp::plan(const ComputationInput & /*in_base*/) {
             }
         }
     }
-    if (external_chunks_per_expert_ == nullptr) {
+    if (external_chunks_per_expert_ != nullptr) {
+        // The shared layer-level dynamic/profile planner supplies the
+        // per-expert K array directly, so this computation does not walk
+        // token/rank gates.  Still record tier residency for every chunk
+        // the generated plan will require; otherwise /dp_moe/stats reports
+        // zero hit-rate attempts for the dynamic path even while H2D loads
+        // are happening.
+        for (size_t i = 0; i < unique_experts.size(); ++i) {
+            const int eid = unique_experts[i];
+            const int n_c = chunks_by_expert[eid];
+            const int rank_bucket = (int) std::min<size_t>(
+                i, (size_t) std::max(0, n_used - 1));
+            const std::string synthetic =
+                canonical_ + ":e" + std::to_string(eid);
+            for (int c = 0; c < n_c; ++c) {
+                diag::record_chunk(*rt_, synthetic, rank_bucket, c,
+                                   cid_chunk(c));
+            }
+        }
+    } else {
         for (int t = 0; t < n_tokens; ++t) {
             for (int u = 0; u < n_used; ++u) {
                 const int eid = ids_pinned_[(size_t) t * n_used + u];
@@ -641,6 +683,8 @@ void MoEMatMulComp::execute(const ComputationInput & in_base,
         M, K,
         group_size_,
         shared_x ? 1 : 0,
+        capture_path ? -1 : routed_chunk_span_hint_,
+        capture_path ? -1 : routed_max_chunk_hint_,
         stream_h);
 
     rt_->pool().record_compute_event(stream_h);

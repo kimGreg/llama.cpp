@@ -46,6 +46,31 @@
 
 namespace dp_moe_ext { namespace qwen3 {
 
+namespace {
+
+bool planner_profile_enabled()
+{
+    static const bool enabled = [] {
+        const char * s = std::getenv("DP_MOE_PROFILE_PLANNER");
+        if (s == nullptr || s[0] == '\0') return false;
+        return std::strcmp(s, "0") != 0 &&
+               std::strcmp(s, "false") != 0 &&
+               std::strcmp(s, "FALSE") != 0 &&
+               std::strcmp(s, "off") != 0 &&
+               std::strcmp(s, "OFF") != 0;
+    }();
+    return enabled;
+}
+
+uint64_t elapsed_ns(std::chrono::steady_clock::time_point t0,
+                    std::chrono::steady_clock::time_point t1)
+{
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        t1 - t0).count();
+}
+
+} // namespace
+
 std::atomic<std::uint64_t> MoEAnyBcqExecutor::required_set_misses_{0};
 
 MoEAnyBcqExecutor::~MoEAnyBcqExecutor()
@@ -400,6 +425,11 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
     // launch_plan_per_expert_planes — no D2H, no cudaStreamSynchronize,
     // no host plan, no reservation. Phase 0a-0f collapse into one
     // kernel launch per canonical.
+    //
+    // Runtime validation, including DP_MOE_PIN_ALL=1 full-resident
+    // validation, intentionally does NOT take this path. Uniform and
+    // dynamic both keep the GPU-plan -> CPU residency/load roundtrip so
+    // their validation semantics match streaming runtime mode.
     const bool capture_path =
         qwen3::scheduler_allow_capture(rt_->scheduler());
 
@@ -439,23 +469,34 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
         const int K_min_dyn  = qwen3::scheduler_dynamic_K_min(rt_->scheduler());
         const int K_max_dyn  = qwen3::scheduler_dynamic_K_max(rt_->scheduler());
         const float * R_d    = qwen3::scheduler_dynamic_R_device(rt_->scheduler());
-        const bool can_gpu_plan =
+        const auto allocator_mode =
+            qwen3::scheduler_kbar_allocator_mode(rt_->scheduler());
+        const bool can_gpu_common =
             !gpu_plan_disabled &&
-            R_d != nullptr &&
             dyn_kbar > 0.0f &&
-            qwen3::scheduler_kbar_allocator_mode(rt_->scheduler()) ==
-                qwen3::KBarAllocatorMode::Profile &&
             ids != nullptr && ids->data != nullptr &&
             n_expert_in_probs > 0 &&
-            K_min_dyn >= 0 && K_max_dyn >= K_min_dyn &&
             layer_idx >= 0;
+        const bool use_profile_gpu_plan =
+            can_gpu_common &&
+            allocator_mode == qwen3::KBarAllocatorMode::Profile &&
+            R_d != nullptr &&
+            K_min_dyn >= 0 && K_max_dyn >= K_min_dyn;
+        const bool use_uniform_gpu_plan =
+            can_gpu_common &&
+            allocator_mode == qwen3::KBarAllocatorMode::Uniform;
+        const bool can_gpu_plan =
+            use_profile_gpu_plan || use_uniform_gpu_plan;
 
         if (can_gpu_plan) {
             for (auto & c : canon) {
                 (void) c.comp->pre_inputs(*c.in);
             }
 
-            const int B1 = n_expert_in_probs * K_max_dyn + 1;
+            const int plan_extra_max = use_profile_gpu_plan
+                ? std::max(0, K_max_dyn - K_min_dyn)
+                : 0;
+            const int B1 = n_expert_in_probs * plan_extra_max + 1;
             if (ensure_dynamic_plan_(n_expert_in_probs, B1)) {
                 const size_t ids_row_stride = (size_t) ids->nb[1];
                 size_t weights_row_stride = 0;
@@ -468,29 +509,78 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                 const size_t probs_row_stride =
                     probs != nullptr ? (size_t) probs->nb[1] : 0;
 
-                qwen3::launch_plan_chunks_kbar_exact_strided(
-                    (const int32_t *) ids->data,
-                    ids_row_stride,
-                    weights != nullptr ? (const float *) weights->data : nullptr,
-                    weights_row_stride,
-                    probs != nullptr ? (const float *) probs->data : nullptr,
-                    probs_row_stride,
-                    R_d,
-                    K_min_dyn,
-                    K_max_dyn,
-                    layer_idx,
-                    dyn_kbar,
-                    n_tokens,
-                    n_used,
-                    n_expert_in_probs,
-                    gate_comp.n_chunks_max(),
-                    dynamic_plan_.chunks_d,
-                    dynamic_plan_.expert_order_d,
-                    dynamic_plan_.n_active_d,
-                    dynamic_plan_.dp_prev_d,
-                    dynamic_plan_.dp_cur_d,
-                    dynamic_plan_.trace_d,
-                    stream_h);
+                const bool profile_planner = planner_profile_enabled();
+                cudaEvent_t planner_ev_start = nullptr;
+                cudaEvent_t planner_ev_stop  = nullptr;
+                bool planner_events_ready = false;
+                if (profile_planner) {
+                    planner_events_ready =
+                        cudaEventCreate(&planner_ev_start) == cudaSuccess &&
+                        cudaEventCreate(&planner_ev_stop) == cudaSuccess;
+                    if (!planner_events_ready) {
+                        if (planner_ev_start != nullptr) cudaEventDestroy(planner_ev_start);
+                        if (planner_ev_stop  != nullptr) cudaEventDestroy(planner_ev_stop);
+                        planner_ev_start = nullptr;
+                        planner_ev_stop  = nullptr;
+                    }
+                }
+                const auto planner_roundtrip_t0 = std::chrono::steady_clock::now();
+                if (planner_events_ready) {
+                    cudaEventRecord(planner_ev_start, stream);
+                }
+                const auto planner_launch_t0 = std::chrono::steady_clock::now();
+                if (use_profile_gpu_plan) {
+                    qwen3::launch_plan_chunks_kbar_exact_strided(
+                        (const int32_t *) ids->data,
+                        ids_row_stride,
+                        weights != nullptr ? (const float *) weights->data : nullptr,
+                        weights_row_stride,
+                        probs != nullptr ? (const float *) probs->data : nullptr,
+                        probs_row_stride,
+                        R_d,
+                        K_min_dyn,
+                        K_max_dyn,
+                        layer_idx,
+                        dyn_kbar,
+                        n_tokens,
+                        n_used,
+                        n_expert_in_probs,
+                        gate_comp.n_chunks_max(),
+                        dynamic_plan_.chunks_d,
+                        dynamic_plan_.expert_order_d,
+                        dynamic_plan_.n_active_d,
+                        dynamic_plan_.dp_prev_d,
+                        dynamic_plan_.dp_cur_d,
+                        dynamic_plan_.trace_d,
+                        stream_h);
+                } else {
+                    int uniform_k = (int) std::lrint((double) dyn_kbar);
+                    if (uniform_k < 1) uniform_k = 1;
+                    if (uniform_k > gate_comp.n_chunks_max()) {
+                        uniform_k = gate_comp.n_chunks_max();
+                    }
+                    qwen3::launch_plan_chunks_uniform_strided(
+                        (const int32_t *) ids->data,
+                        ids_row_stride,
+                        n_tokens,
+                        n_used,
+                        n_expert_in_probs,
+                        uniform_k,
+                        gate_comp.n_chunks_max(),
+                        dynamic_plan_.chunks_d,
+                        dynamic_plan_.expert_order_d,
+                        dynamic_plan_.n_active_d,
+                        stream_h);
+                }
+                const auto planner_launch_t1 = std::chrono::steady_clock::now();
+                if (profile_planner) {
+                    launch_diag::note_planner_launch_host(
+                        decode_phase,
+                        elapsed_ns(planner_launch_t0, planner_launch_t1));
+                }
+                if (planner_events_ready) {
+                    cudaEventRecord(planner_ev_stop, stream);
+                }
                 launch_diag::note_launch(launch_diag::Kind::MemcpyAsync);
                 cudaMemcpyAsync(dynamic_plan_.chunks_h,
                                 dynamic_plan_.chunks_d,
@@ -511,6 +601,24 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                                 stream);
                 launch_diag::note_stream_sync();
                 const cudaError_t sync_err = cudaStreamSynchronize(stream);
+                const auto planner_roundtrip_t1 = std::chrono::steady_clock::now();
+                if (profile_planner) {
+                    launch_diag::note_planner_roundtrip_host(
+                        decode_phase,
+                        elapsed_ns(planner_roundtrip_t0, planner_roundtrip_t1));
+                    if (planner_events_ready && sync_err == cudaSuccess) {
+                        float planner_ms = 0.0f;
+                        if (cudaEventElapsedTime(&planner_ms,
+                                                 planner_ev_start,
+                                                 planner_ev_stop) == cudaSuccess) {
+                            launch_diag::note_planner_kernel_event(
+                                decode_phase,
+                                (uint64_t) (planner_ms * 1000000.0f));
+                        }
+                    }
+                }
+                if (planner_ev_start != nullptr) cudaEventDestroy(planner_ev_start);
+                if (planner_ev_stop  != nullptr) cudaEventDestroy(planner_ev_stop);
                 if (sync_err == cudaSuccess) {
                     int n_external_order =
                         dynamic_plan_.n_active_h != nullptr ?
@@ -520,7 +628,9 @@ bool MoEAnyBcqExecutor::dispatch_three_canonicals_(
                         n_external_order = n_expert_in_probs;
                     }
                     if (const char * cmp_env =
-                            std::getenv("DP_MOE_COMPARE_GPU_CPU_PLANNER")) {
+                            use_profile_gpu_plan
+                                ? std::getenv("DP_MOE_COMPARE_GPU_CPU_PLANNER")
+                                : nullptr) {
                         if (cmp_env[0] && cmp_env[0] != '0') {
                             std::vector<int32_t> ids_h(
                                 (size_t) n_tokens * (size_t) n_used);

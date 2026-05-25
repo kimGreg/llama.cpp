@@ -1073,16 +1073,18 @@ EventHandle DPMoERuntime::move_chunks_batch(
         std::string bundle;
     };
 
-    size_t max_batch_bytes = 4ull * 1024ull * 1024ull;
+    bool scatter_batch_alloc = true;
+    if (const char * env = std::getenv("DP_MOE_BATCH_SCATTER_ALLOC")) {
+        scatter_batch_alloc = !(env[0] == '0');
+    }
+    size_t max_batch_bytes = scatter_batch_alloc
+        ? 32ull * 1024ull * 1024ull
+        : 4ull * 1024ull * 1024ull;
     if (const char * env = std::getenv("DP_MOE_BATCH_CHUNK_MAX_MB")) {
         const long mb = std::strtol(env, nullptr, 10);
         if (mb > 0) {
             max_batch_bytes = (size_t)mb * 1024ull * 1024ull;
         }
-    }
-    bool scatter_batch_alloc = true;
-    if (const char * env = std::getenv("DP_MOE_BATCH_SCATTER_ALLOC")) {
-        scatter_batch_alloc = !(env[0] == '0');
     }
 
     auto make_room_for_batch = [&](size_t nbytes) -> bool {
@@ -1249,26 +1251,86 @@ EventHandle DPMoERuntime::move_chunks_batch(
             pread_span_(packed + dst_off, src_start, span_size);
         };
 
+        auto try_fill_ref_from_host_cache =
+            [&](const BundleBatchRef & ref, uint8_t * packed) -> bool {
+            if (!host_chunk_cache_enabled()) return false;
+            UpstreamLayoutHost & host = ref.entry->tensor->host();
+            std::lock_guard<std::mutex> lk(*ref.entry->host_mu);
+            auto & chunks = host.chunks;
+            if (ref.p < 0 || ref.p >= (int)chunks.size() ||
+                chunks[ref.p].empty()) {
+                return false;
+            }
+            if (chunks[ref.p].size() != ref.nbytes) {
+                throw std::runtime_error(
+                    "DPMoERuntime::move_chunks_batch: host cache chunk "
+                    "size mismatch for " + ref.key.wid);
+            }
+            {
+                DiagSpan _t(diag::MoveSite::HostCacheSnapshot);
+                std::memcpy(packed + ref.packed_off,
+                            chunks[ref.p].data(), ref.nbytes);
+            }
+            diag::record_move_event(diag::MoveEvent::DramHit);
+            diag::record_move_event(diag::MoveEvent::CacheSnapshot);
+            return true;
+        };
+
+        auto insert_ref_into_host_cache =
+            [&](const BundleBatchRef & ref, const uint8_t * packed) {
+            if (!host_chunk_cache_enabled()) return;
+            DiagSpan _t(diag::MoveSite::HostCacheInsert);
+            UpstreamLayoutHost & host = ref.entry->tensor->host();
+            std::lock_guard<std::mutex> lk(*ref.entry->host_mu);
+            if (ref.p >= (int)host.chunks.size()) {
+                host.chunks.resize(ref.p + 1);
+            }
+            const size_t prev_bytes = host.chunks[ref.p].size();
+            host.chunks[ref.p].assign(packed + ref.packed_off,
+                                      packed + ref.packed_off + ref.nbytes);
+            const size_t new_bytes = host.chunks[ref.p].size();
+            if (new_bytes > prev_bytes) {
+                g_host_dram_bytes.fetch_add(new_bytes - prev_bytes,
+                                            std::memory_order_relaxed);
+            } else if (prev_bytes > new_bytes) {
+                g_host_dram_bytes.fetch_sub(prev_bytes - new_bytes,
+                                            std::memory_order_relaxed);
+            }
+            diag::record_move_event(diag::MoveEvent::CacheInsert);
+        };
+
         auto run_ref_batch = [&](size_t first, size_t last,
                                  size_t nbytes) -> bool {
             ensure_batch_staging(nbytes);
             uint8_t * packed = reinterpret_cast<uint8_t *>(batch_staging_);
 
+            std::vector<uint8_t> cache_hit(last - first, 0);
             size_t cursor = 0;
             for (size_t i = first; i < last; ++i) {
                 refs[i].packed_off = cursor;
                 cursor += refs[i].nbytes;
             }
+            for (size_t i = first; i < last; ++i) {
+                if (try_fill_ref_from_host_cache(refs[i], packed)) {
+                    cache_hit[i - first] = 1;
+                }
+            }
 
+            size_t logical_miss_bytes = 0;
             size_t physical_bytes = 0;
             size_t span_count = 0;
             size_t i = first;
             while (i < last) {
+                if (cache_hit[i - first]) {
+                    ++i;
+                    continue;
+                }
                 const size_t packed_start = refs[i].packed_off;
                 const int64_t src_start = refs[i].off;
                 int64_t src_end = refs[i].off + (int64_t)refs[i].nbytes;
                 size_t j = i + 1;
                 while (j < last &&
+                       !cache_hit[j - first] &&
                        refs[j].bundle == refs[i].bundle &&
                        refs[j].off == src_end) {
                     src_end += (int64_t)refs[j].nbytes;
@@ -1276,6 +1338,9 @@ EventHandle DPMoERuntime::move_chunks_batch(
                 }
 
                 const size_t span_size = (size_t)(src_end - src_start);
+                for (size_t k = i; k < j; ++k) {
+                    logical_miss_bytes += refs[k].nbytes;
+                }
                 physical_bytes += span_size;
                 ++span_count;
                 {
@@ -1285,18 +1350,29 @@ EventHandle DPMoERuntime::move_chunks_batch(
                     DiagSpan _t(diag::MoveSite::Pread);
                     pread_span(packed, packed_start, src_start, span_size);
                 }
-                diag::record_move_event(diag::MoveEvent::SsdMiss);
+                for (size_t k = i; k < j; ++k) {
+                    diag::record_move_event(diag::MoveEvent::SsdMiss);
+                    insert_ref_into_host_cache(refs[k], packed);
+                }
                 i = j;
             }
-            launch_diag::note_pread_io(
-                launch_diag::current_decode_phase(),
-                nbytes, physical_bytes, span_count);
+            if (span_count > 0) {
+                launch_diag::note_pread_io(
+                    launch_diag::current_decode_phase(),
+                    logical_miss_bytes, physical_bytes, span_count);
+            }
 
             return run_preloaded_ref_batch(first, last, nbytes);
         };
 
         auto try_decode_pread_ahead = [&]() -> bool {
             if (!launch_diag::current_decode_phase()) return false;
+            // The pread-ahead shortcut assumes every ref is an SSD miss.
+            // When the host DRAM cache is enabled, run_ref_batch() must
+            // classify/fill DRAM hits first and pread only the remaining
+            // misses; otherwise AnyBCQ reports 0% DRAM hit and rereads
+            // cached chunks from SSD.
+            if (host_chunk_cache_enabled()) return false;
 
             long pread_threads = 4;
             if (const char * env =

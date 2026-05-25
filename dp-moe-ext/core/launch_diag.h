@@ -37,6 +37,7 @@ enum class Kind : int {
     Memcpy2DAsync,         // cudaMemcpy2DAsync issued from the dispatch path
     MemcpyAsync,           // cudaMemcpyAsync issued from the dispatch path
     MemsetAsync,           // cudaMemsetAsync issued from the dispatch path
+    PlannerKernel,         // dynamic/profile KBar planner kernel
     _COUNT
 };
 
@@ -51,6 +52,7 @@ inline const char * kind_name(Kind k) {
         case Kind::Memcpy2DAsync:     return "memcpy_2d_async";
         case Kind::MemcpyAsync:       return "memcpy_async";
         case Kind::MemsetAsync:       return "memset_async";
+        case Kind::PlannerKernel:     return "planner_kernel";
         default:                       return "?";
     }
 }
@@ -124,6 +126,12 @@ inline std::atomic<uint64_t> g_required_by_chunk[2][8] = {};
 inline std::atomic<uint64_t> g_resident_by_chunk[2][8] = {};
 inline std::atomic<uint64_t> g_unique_load_by_chunk[2][8] = {};
 inline std::atomic<uint64_t> g_evicted_by_chunk[8] = {};
+inline std::atomic<uint64_t> g_planner_kernel_event_ns[2] = {};
+inline std::atomic<uint64_t> g_planner_kernel_event_calls[2] = {};
+inline std::atomic<uint64_t> g_planner_launch_host_ns[2] = {};
+inline std::atomic<uint64_t> g_planner_launch_host_calls[2] = {};
+inline std::atomic<uint64_t> g_planner_roundtrip_host_ns[2] = {};
+inline std::atomic<uint64_t> g_planner_roundtrip_host_calls[2] = {};
 inline thread_local bool g_current_decode_phase = false;
 
 inline void set_current_decode_phase(bool decode) {
@@ -205,6 +213,24 @@ inline void note_evicted_chunk(int cid) {
     g_evicted_by_chunk[p].fetch_add(1, std::memory_order_relaxed);
 }
 
+inline void note_planner_kernel_event(bool decode, uint64_t ns) {
+    const int ph = decode ? 1 : 0;
+    g_planner_kernel_event_ns[ph].fetch_add(ns, std::memory_order_relaxed);
+    g_planner_kernel_event_calls[ph].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void note_planner_launch_host(bool decode, uint64_t ns) {
+    const int ph = decode ? 1 : 0;
+    g_planner_launch_host_ns[ph].fetch_add(ns, std::memory_order_relaxed);
+    g_planner_launch_host_calls[ph].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void note_planner_roundtrip_host(bool decode, uint64_t ns) {
+    const int ph = decode ? 1 : 0;
+    g_planner_roundtrip_host_ns[ph].fetch_add(ns, std::memory_order_relaxed);
+    g_planner_roundtrip_host_calls[ph].fetch_add(1, std::memory_order_relaxed);
+}
+
 class PhaseTimer {
 public:
     PhaseTimer(Phase p, bool decode)
@@ -247,6 +273,12 @@ inline void reset() {
             g_resident_by_chunk[ph][p].store(0, std::memory_order_relaxed);
             g_unique_load_by_chunk[ph][p].store(0, std::memory_order_relaxed);
         }
+        g_planner_kernel_event_ns[ph].store(0, std::memory_order_relaxed);
+        g_planner_kernel_event_calls[ph].store(0, std::memory_order_relaxed);
+        g_planner_launch_host_ns[ph].store(0, std::memory_order_relaxed);
+        g_planner_launch_host_calls[ph].store(0, std::memory_order_relaxed);
+        g_planner_roundtrip_host_ns[ph].store(0, std::memory_order_relaxed);
+        g_planner_roundtrip_host_calls[ph].store(0, std::memory_order_relaxed);
     }
     for (int p = 0; p < 8; ++p) {
         g_evicted_by_chunk[p].store(0, std::memory_order_relaxed);
@@ -295,6 +327,46 @@ inline void dump_to_stderr() {
         std::fprintf(stderr,
             "    %-22s = %10lu  (%.2f / forward_moe_layer)\n",
             kind_name((Kind) i), (unsigned long) v, per_fwd);
+    }
+
+    bool any_planner_profile = false;
+    for (int ph = 0; ph < 2; ++ph) {
+        any_planner_profile =
+            any_planner_profile ||
+            g_planner_kernel_event_calls[ph].load(std::memory_order_relaxed) ||
+            g_planner_launch_host_calls[ph].load(std::memory_order_relaxed) ||
+            g_planner_roundtrip_host_calls[ph].load(std::memory_order_relaxed);
+    }
+    if (any_planner_profile) {
+        std::fprintf(stderr,
+            "  planner profile (DP_MOE_PROFILE_PLANNER=1):\n");
+        for (int ph = 0; ph < 2; ++ph) {
+            const char * ph_name = ph ? "decode" : "prefill";
+            const uint64_t a_calls =
+                g_planner_kernel_event_calls[ph].load(std::memory_order_relaxed);
+            const uint64_t a_ns =
+                g_planner_kernel_event_ns[ph].load(std::memory_order_relaxed);
+            const uint64_t b_calls =
+                g_planner_launch_host_calls[ph].load(std::memory_order_relaxed);
+            const uint64_t b_ns =
+                g_planner_launch_host_ns[ph].load(std::memory_order_relaxed);
+            const uint64_t c_calls =
+                g_planner_roundtrip_host_calls[ph].load(std::memory_order_relaxed);
+            const uint64_t c_ns =
+                g_planner_roundtrip_host_ns[ph].load(std::memory_order_relaxed);
+            if (!a_calls && !b_calls && !c_calls) continue;
+            std::fprintf(stderr,
+                "    [%s] A_kernel_event calls=%lu total=%.3f ms avg=%.2f us\n"
+                "           B_launch_host calls=%lu total=%.3f ms avg=%.2f us\n"
+                "           C_roundtrip   calls=%lu total=%.3f ms avg=%.2f us\n",
+                ph_name,
+                (unsigned long) a_calls, a_ns / 1.0e6,
+                a_calls ? (double) a_ns / (double) a_calls / 1.0e3 : 0.0,
+                (unsigned long) b_calls, b_ns / 1.0e6,
+                b_calls ? (double) b_ns / (double) b_calls / 1.0e3 : 0.0,
+                (unsigned long) c_calls, c_ns / 1.0e6,
+                c_calls ? (double) c_ns / (double) c_calls / 1.0e3 : 0.0);
+        }
     }
 
     std::fprintf(stderr, "  phase timings by phase:\n");

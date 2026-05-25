@@ -184,6 +184,8 @@ private:
     int  cur_n_expert_       = 0;
     bool have_real_scores_   = false;
     bool have_renorm_weights_ = false;
+    int  routed_chunk_span_hint_ = -1;
+    int  routed_max_chunk_hint_  = -1;
 
     const int * external_chunks_per_expert_ = nullptr;
     const int * external_expert_order_ = nullptr;

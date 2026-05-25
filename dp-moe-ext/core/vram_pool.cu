@@ -11,8 +11,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace dp_moe_ext {
 
@@ -23,6 +26,47 @@ inline void check_cuda(cudaError_t e, const char * what) {
         throw std::runtime_error(
             std::string("vram_pool: CUDA error in ") + what + ": " +
             cudaGetErrorString(e));
+    }
+}
+
+struct BatchScatterMeta {
+    uint8_t * dst;
+    size_t    src_offset;
+    size_t    nbytes;
+};
+
+__global__ void scatter_packed_batch_kernel(
+    const uint8_t * __restrict__ src,
+    const BatchScatterMeta * __restrict__ meta,
+    int nitems)
+{
+    const int item = blockIdx.x;
+    if (item >= nitems) return;
+
+    __shared__ BatchScatterMeta block_meta;
+    if (threadIdx.x == 0) {
+        block_meta = meta[item];
+    }
+    __syncthreads();
+
+    const BatchScatterMeta m = block_meta;
+    const uint8_t * item_src = src + m.src_offset;
+    uint8_t * item_dst = m.dst;
+    if ((((uintptr_t)item_src | (uintptr_t)item_dst) & 0x0f) == 0) {
+        const size_t n4 = m.nbytes / sizeof(uint4);
+        const uint4 * src4 = (const uint4 *)item_src;
+        uint4 * dst4 = (uint4 *)item_dst;
+        for (size_t i = threadIdx.x; i < n4; i += blockDim.x) {
+            dst4[i] = src4[i];
+        }
+        const size_t tail = n4 * sizeof(uint4);
+        for (size_t i = tail + threadIdx.x; i < m.nbytes; i += blockDim.x) {
+            item_dst[i] = item_src[i];
+        }
+        return;
+    }
+    for (size_t i = threadIdx.x; i < m.nbytes; i += blockDim.x) {
+        item_dst[i] = item_src[i];
     }
 }
 
@@ -91,6 +135,14 @@ VramChunkPool::~VramChunkPool() {
     for (auto h : event_free_list_) {
         cudaEventDestroy((cudaEvent_t)h);
     }
+    if (batch_scatter_meta_host_) {
+        cudaFreeHost(batch_scatter_meta_host_);
+    } else if (batch_scatter_meta_dev_) {
+        cudaFree(batch_scatter_meta_dev_);
+    }
+    if (batch_stage_dev_) {
+        cudaFree(batch_stage_dev_);
+    }
     if (copy_stream_) {
         cudaStreamDestroy((cudaStream_t)copy_stream_);
     }
@@ -143,6 +195,62 @@ void VramChunkPool::free_(size_t offset, size_t nbytes) {
             free_list_.erase(it);
         }
     }
+}
+
+
+void VramChunkPool::ensure_batch_stage_(size_t nbytes) {
+    if (nbytes <= batch_stage_bytes_) return;
+    if (batch_stage_dev_) {
+        check_cuda(cudaFree(batch_stage_dev_), "cudaFree(batch stage)");
+        batch_stage_dev_ = nullptr;
+        batch_stage_bytes_ = 0;
+    }
+    check_cuda(cudaMalloc(&batch_stage_dev_, nbytes),
+               "cudaMalloc(batch stage)");
+    batch_stage_bytes_ = nbytes;
+}
+
+void VramChunkPool::ensure_batch_scatter_meta_(size_t nitems) {
+    if (nitems <= batch_scatter_meta_capacity_) return;
+    if (batch_scatter_meta_host_) {
+        check_cuda(cudaFreeHost(batch_scatter_meta_host_),
+                   "cudaFreeHost(batch scatter meta)");
+        batch_scatter_meta_host_ = nullptr;
+        batch_scatter_meta_dev_ = nullptr;
+        batch_scatter_meta_capacity_ = 0;
+        batch_scatter_meta_mapped_ = false;
+    } else if (batch_scatter_meta_dev_) {
+        check_cuda(cudaFree(batch_scatter_meta_dev_),
+                   "cudaFree(batch scatter meta)");
+        batch_scatter_meta_dev_ = nullptr;
+        batch_scatter_meta_capacity_ = 0;
+        batch_scatter_meta_mapped_ = false;
+    }
+
+    const size_t nbytes = nitems * sizeof(BatchScatterMeta);
+    cudaError_t err = cudaHostAlloc(&batch_scatter_meta_host_, nbytes,
+                                    cudaHostAllocMapped);
+    if (err == cudaSuccess) {
+        err = cudaHostGetDevicePointer(&batch_scatter_meta_dev_,
+                                       batch_scatter_meta_host_, 0);
+        if (err == cudaSuccess) {
+            batch_scatter_meta_capacity_ = nitems;
+            batch_scatter_meta_mapped_ = true;
+            return;
+        }
+        check_cuda(cudaFreeHost(batch_scatter_meta_host_),
+                   "cudaFreeHost(batch scatter meta fallback)");
+        batch_scatter_meta_host_ = nullptr;
+        batch_scatter_meta_dev_ = nullptr;
+        batch_scatter_meta_mapped_ = false;
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    check_cuda(cudaMalloc(&batch_scatter_meta_dev_, nbytes),
+               "cudaMalloc(batch scatter meta)");
+    batch_scatter_meta_capacity_ = nitems;
+    batch_scatter_meta_mapped_ = false;
 }
 
 
@@ -459,9 +567,39 @@ std::vector<ChunkHandle> VramChunkPool::load_batch_scattered_sync(
         ? (cudaStream_t)0
         : (cudaStream_t)copy_stream_;
     size_t copy_calls = 0;
+    size_t accounted_h2d_bytes = total_bytes;
+    bool staged_scatter = true;
+    if (const char * env = std::getenv("DP_MOE_BATCH_SCATTER_STAGE")) {
+        staged_scatter = env[0] != '0';
+    }
+
+    bool host_contiguous = true;
+    bool dst_contiguous = true;
+    size_t cursor = 0;
+    std::vector<BatchScatterMeta> scatter_meta;
+    scatter_meta.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i > 0 &&
+            (const char *)items[i - 1].host_ptr + items[i - 1].nbytes !=
+                (const char *)items[i].host_ptr) {
+            host_contiguous = false;
+        }
+        if (i > 0 &&
+            slots[i - 1].offset + slots[i - 1].nbytes != slots[i].offset) {
+            dst_contiguous = false;
+        }
+        scatter_meta.push_back(BatchScatterMeta{
+            (uint8_t *)arena_ + slots[i].offset,
+            cursor,
+            items[i].nbytes,
+        });
+        cursor += items[i].nbytes;
+    }
 
     try {
-        if (copy_stream_ != nullptr && !force_sync_h2d_) {
+        const bool async_copy_stream =
+            copy_stream_ != nullptr && !force_sync_h2d_;
+        if (async_copy_stream) {
             bool in_capture = false;
             if (compute_stream != nullptr) {
                 auto cs = (cudaStream_t) compute_stream;
@@ -489,29 +627,55 @@ std::vector<ChunkHandle> VramChunkPool::load_batch_scattered_sync(
                     cudaStreamWaitEvent(stream, (cudaEvent_t)latest_compute_event_, 0),
                     "cudaStreamWaitEvent(compute)");
             }
+        }
 
-            size_t i = 0;
-            while (i < items.size()) {
-                size_t nbytes = items[i].nbytes;
-                size_t j = i + 1;
-                while (j < items.size() &&
-                       slots[j - 1].offset + slots[j - 1].nbytes ==
-                           slots[j].offset &&
-                       (const char *)items[j - 1].host_ptr + items[j - 1].nbytes ==
-                           (const char *)items[j].host_ptr) {
-                    nbytes += items[j].nbytes;
-                    ++j;
-                }
+        if (host_contiguous && dst_contiguous) {
+            if (async_copy_stream) {
                 check_cuda(
-                    cudaMemcpyAsync((char *)arena_ + slots[i].offset,
-                                    items[i].host_ptr, nbytes,
+                    cudaMemcpyAsync((char *)arena_ + slots[0].offset,
+                                    items[0].host_ptr, total_bytes,
                                     cudaMemcpyHostToDevice, stream),
-                    "cudaMemcpyAsync(H2D batch scattered)");
-                ++copy_calls;
-                i = j;
+                    "cudaMemcpyAsync(H2D batch scattered contiguous)");
+                check_cuda(
+                    cudaStreamSynchronize(stream),
+                    "cudaStreamSynchronize(H2D batch scattered contiguous)");
+            } else {
+                check_cuda(
+                    cudaMemcpy((char *)arena_ + slots[0].offset,
+                               items[0].host_ptr, total_bytes,
+                               cudaMemcpyHostToDevice),
+                    "cudaMemcpy(H2D batch scattered contiguous sync)");
             }
+            copy_calls = 1;
+        } else if (staged_scatter && host_contiguous) {
+            ensure_batch_stage_(total_bytes);
+            ensure_batch_scatter_meta_(items.size());
+            const size_t meta_bytes =
+                scatter_meta.size() * sizeof(BatchScatterMeta);
+            check_cuda(
+                cudaMemcpyAsync(batch_stage_dev_, items[0].host_ptr,
+                                total_bytes, cudaMemcpyHostToDevice, stream),
+                "cudaMemcpyAsync(H2D batch stage)");
+            if (batch_scatter_meta_mapped_) {
+                std::memcpy(batch_scatter_meta_host_, scatter_meta.data(),
+                            meta_bytes);
+            } else {
+                check_cuda(
+                    cudaMemcpyAsync(batch_scatter_meta_dev_, scatter_meta.data(),
+                                    meta_bytes,
+                                    cudaMemcpyHostToDevice, stream),
+                    "cudaMemcpyAsync(H2D batch scatter meta)");
+                accounted_h2d_bytes += meta_bytes;
+            }
+            scatter_packed_batch_kernel<<<
+                (unsigned)items.size(), 256, 0, stream>>>(
+                    (const uint8_t *)batch_stage_dev_,
+                    (const BatchScatterMeta *)batch_scatter_meta_dev_,
+                    (int)items.size());
+            check_cuda(cudaGetLastError(), "scatter_packed_batch_kernel");
             check_cuda(cudaStreamSynchronize(stream),
-                       "cudaStreamSynchronize(H2D batch scattered)");
+                       "cudaStreamSynchronize(H2D batch scatter stage)");
+            copy_calls = batch_scatter_meta_mapped_ ? 1 : 2;
         } else {
             size_t i = 0;
             while (i < items.size()) {
@@ -525,13 +689,25 @@ std::vector<ChunkHandle> VramChunkPool::load_batch_scattered_sync(
                     nbytes += items[j].nbytes;
                     ++j;
                 }
-                check_cuda(
-                    cudaMemcpy((char *)arena_ + slots[i].offset,
-                               items[i].host_ptr, nbytes,
-                               cudaMemcpyHostToDevice),
-                    "cudaMemcpy(H2D batch scattered sync)");
+                if (async_copy_stream) {
+                    check_cuda(
+                        cudaMemcpyAsync((char *)arena_ + slots[i].offset,
+                                        items[i].host_ptr, nbytes,
+                                        cudaMemcpyHostToDevice, stream),
+                        "cudaMemcpyAsync(H2D batch scattered)");
+                } else {
+                    check_cuda(
+                        cudaMemcpy((char *)arena_ + slots[i].offset,
+                                   items[i].host_ptr, nbytes,
+                                   cudaMemcpyHostToDevice),
+                        "cudaMemcpy(H2D batch scattered sync)");
+                }
                 ++copy_calls;
                 i = j;
+            }
+            if (async_copy_stream) {
+                check_cuda(cudaStreamSynchronize(stream),
+                           "cudaStreamSynchronize(H2D batch scattered)");
             }
         }
     } catch (...) {
@@ -551,9 +727,9 @@ std::vector<ChunkHandle> VramChunkPool::load_batch_scattered_sync(
             nullptr,
         });
     }
-    total_h2d_bytes_ += total_bytes;
+    total_h2d_bytes_ += accounted_h2d_bytes;
     total_h2d_calls_ += copy_calls;
-    batch_h2d_bytes_ += total_bytes;
+    batch_h2d_bytes_ += accounted_h2d_bytes;
     batch_h2d_calls_ += copy_calls;
     if (used_bytes_ > peak_used_bytes_) peak_used_bytes_ = used_bytes_;
     return out;

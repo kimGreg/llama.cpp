@@ -3245,18 +3245,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     const bool dp_moe_hook =
         (g_cuda_mul_mat_hook != nullptr) || (g_cuda_pre_op_hook != nullptr);
     if (dp_moe_hook) {
-        const char * enable = std::getenv("DP_MOE_ENABLE_CUDA_GRAPHS");
-        const bool allow_legacy =
-            enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
-        // DP_MOE_ALLOW_CAPTURE (benchmark/score mode) also implies
-        // "the operator has verified dp_moe is safe to capture" —
-        // qwen3_moe_scheduler asserts full VRAM pin at install when
-        // it is set. Honour both env vars here so the user-facing knob
-        // is just DP_MOE_ALLOW_CAPTURE for benchmark mode.
+        // DP_MOE_ALLOW_CAPTURE is the only DPMoE graph-capture escape
+        // hatch. Runtime/TPS mode stays eager; benchmark mode sets this
+        // after requesting full pin through DP_MOE_PIN_ALL.
         const char * allow_capture_env = std::getenv("DP_MOE_ALLOW_CAPTURE");
         const bool allow_capture =
             allow_capture_env && allow_capture_env[0] && allow_capture_env[0] != '0';
-        if (!allow_legacy && !allow_capture) return false;
+        if (!allow_capture) return false;
     }
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph

@@ -122,6 +122,7 @@ void naver_gemv_moe_launch(
     const int *            prec_per_eid_d,
     int                    group_size,
     int                    shared_x,
+    int                    routed_precision_span_hint,
     StreamHandle           stream);
 // Mode A milestone 1, S6 — element-wise gated activation * up.
 //
@@ -293,6 +294,23 @@ void launch_plan_chunks_kbar_exact_strided(
     float *         dp_prev_d,
     float *         dp_cur_d,
     uint8_t *       trace_d,
+    StreamHandle    stream);
+
+// Eager-mode uniform K planner. Emits CHUNK counts and active expert
+// order through the same interface as launch_plan_chunks_kbar_exact_strided
+// so runtime mode always lets the GPU decide chunk counts before CPU
+// residency/load orchestration.
+void launch_plan_chunks_uniform_strided(
+    const int32_t * ids_d,
+    size_t          ids_row_stride,
+    int             n_tokens,
+    int             n_used,
+    int             n_expert,
+    int             uniform_k,
+    int             n_chunks_max,
+    int *           chunks_per_eid_d,
+    int *           expert_order_d,
+    int *           n_active_d,
     StreamHandle    stream);
 
 }  // namespace qwen3

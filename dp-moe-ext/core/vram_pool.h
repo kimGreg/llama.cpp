@@ -140,9 +140,12 @@ public:
         StreamHandle compute_stream = nullptr);
 
     // Upload a batch while preserving chunk-sized cache slots. This
-    // allocates one slot per item and coalesces H2D only for adjacent
-    // destination/source runs. It returns empty on capacity failure
-    // without requiring a contiguous span for the whole batch.
+    // allocates one slot per item, then stages a packed host payload
+    // through a bounded device scratch buffer and scatters it into those
+    // slots on the copy stream. The cache allocator/eviction semantics
+    // stay identical to per-chunk loads; only the transfer boundary is
+    // batched. It returns empty on capacity failure without requiring a
+    // contiguous arena span for the whole batch.
     std::vector<ChunkHandle> load_batch_scattered_sync(
         const std::vector<BatchLoadItem> & items,
         StreamHandle compute_stream = nullptr);
@@ -296,6 +299,8 @@ private:
     void launch_copy_(size_t dst_offset, const void * src, size_t nbytes,
                       EventHandle & out_event,
                       StreamHandle compute_stream = nullptr);
+    void ensure_batch_stage_(size_t nbytes);
+    void ensure_batch_scatter_meta_(size_t nitems);
 
     // --- state -----------------------------------------------------------
     size_t       capacity_bytes_;
@@ -307,6 +312,12 @@ private:
     EventHandle  capture_fork_event_;    // persistent; used to fork copy_stream into a CUDA graph capture
     std::vector<EventHandle> pending_event_destroys_;  // events deferred for destroy until after capture
     std::vector<EventHandle> event_free_list_;  // recycled per-chunk ready events — avoids cudaEventCreate/Destroy on every move
+    void *       batch_stage_dev_ = nullptr;  // transient packed-payload scratch, not cache residency
+    size_t       batch_stage_bytes_ = 0;
+    void *       batch_scatter_meta_host_ = nullptr;
+    void *       batch_scatter_meta_dev_ = nullptr;
+    size_t       batch_scatter_meta_capacity_ = 0;
+    bool         batch_scatter_meta_mapped_ = false;
 
     // Free-list: ordered (offset, length). We keep it sorted and coalesce.
     struct FreeSpan { size_t offset; size_t nbytes; };

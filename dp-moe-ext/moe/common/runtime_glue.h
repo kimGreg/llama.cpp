@@ -142,6 +142,11 @@ extern "C" void dp_moe_on_graph_audit_and_score_snapshot_end(
     cudaStream_t                stream,
     const struct ggml_cgraph *  cgraph);
 
+// Monotonic graph-compute epoch.  Direct-stock MoE executors use this
+// to refresh routed expert staging once per cgraph even when ggml
+// reuses the same ids tensor storage across decode/prefill chunks.
+extern "C" uint64_t dp_moe_graph_epoch(void);
+
 // User-managed-node claim predicate. Registered with
 // ``ggml_cuda_set_user_node_claims_hook``; ggml-cuda calls this per
 // cgraph node to decide whether to disable cuda-graph capture for
