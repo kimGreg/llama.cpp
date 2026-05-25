@@ -54,6 +54,8 @@ unsigned long long dp_moe_stat_async_load_issued(void);
 unsigned long long dp_moe_stat_make_room_calls(void);
 unsigned long long dp_moe_stat_mc_calls(void);
 unsigned long long dp_moe_stat_mc_pread_ns(void);
+unsigned long long dp_moe_stat_sentinel_claims(void);
+unsigned long long dp_moe_stat_forward_moe_layer_calls(void);
 unsigned long long dp_moe_stat_tier_attempts(void);
 unsigned long long dp_moe_stat_tier_vram_hits(void);
 unsigned long long dp_moe_stat_tier_dram_hits(void);
@@ -4384,6 +4386,10 @@ void server_routes::init_routes() {
                 {"async_load_issued",   dp_moe_stat_async_load_issued()},
                 {"mc_calls",          dp_moe_stat_mc_calls()},
                 {"mc_pread_ns",       dp_moe_stat_mc_pread_ns()},
+            }},
+            {"routing", {
+                {"sentinel_claims", dp_moe_stat_sentinel_claims()},
+                {"forward_moe_layer_calls", dp_moe_stat_forward_moe_layer_calls()},
             }},
             {"tier_hits", {
                 {"diag_enabled", dp_moe_stat_diag_enabled() != 0},

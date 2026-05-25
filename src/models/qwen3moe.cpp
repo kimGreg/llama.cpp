@@ -80,13 +80,21 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         cb(cur, "ffn_norm", il);
 
         ggml_tensor * moe_out = nullptr;
+        void * dp_moe_executor =
+#if defined(DP_MOE_EXT_ENABLED)
+            model.dp_moe_executor != nullptr
+                ? model.dp_moe_executor
+                : (void *) dp_moe_ext::current_executor();
+#else
+            nullptr;
+#endif
         const bool dp_moe_stock_moe =
 #if defined(DP_MOE_EXT_ENABLED)
-            dp_moe_ext::executor_uses_stock_moe_graph(model.dp_moe_executor);
+            dp_moe_ext::executor_uses_stock_moe_graph(dp_moe_executor);
 #else
             false;
 #endif
-        if (model.dp_moe_executor != nullptr && !dp_moe_stock_moe) {
+        if (dp_moe_executor != nullptr && !dp_moe_stock_moe) {
             // Mode A (DP_MoE M1) — emit a single per-layer sentinel
             // via the shared helper; runtime's pre_op_hook routes it to
             // forward_moe_layer. Managed Qwen3-MoE no longer surfaces

@@ -10,7 +10,7 @@
 //
 // Build target: dp_moe-router-equiv-test
 //
-// Run: CUDA_VISIBLE_DEVICES=7 dp_moe-router-equiv-test
+// Run: CUDA_VISIBLE_DEVICES=0 dp_moe-router-equiv-test
 //
 // Exits 0 on PASS, 1 on first mismatch.
 

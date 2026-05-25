@@ -26,7 +26,7 @@
 // Build target: dp_moe-loader-gate-test
 //
 // Run:
-//   CUDA_VISIBLE_DEVICES=7 dp_moe-loader-gate-test
+//   CUDA_VISIBLE_DEVICES=0 dp_moe-loader-gate-test
 //
 // Exits 0 on all-pass, 1 on any mismatch.
 

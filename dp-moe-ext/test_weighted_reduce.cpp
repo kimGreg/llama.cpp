@@ -13,7 +13,7 @@
 //
 // Build target: dp_moe-weighted-reduce-test
 //
-// Run: CUDA_VISIBLE_DEVICES=7 dp_moe-weighted-reduce-test
+// Run: CUDA_VISIBLE_DEVICES=0 dp_moe-weighted-reduce-test
 //
 // Exits 0 on success, 1 on first mismatch.
 

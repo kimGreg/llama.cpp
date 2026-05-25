@@ -92,6 +92,9 @@ std::vector<void **>                  g_bound_model_slots_;
 
 namespace {
 
+static constexpr char   kSentinelPrefix[]    = "dp_moe.moe_layer_";
+static constexpr size_t kSentinelPrefixLen    = sizeof(kSentinelPrefix) - 1;
+
 std::string resolve_executor_name(const GlobalMeta & g) {
     return g.executor;
 }
@@ -358,7 +361,7 @@ extern "C" bool dp_moe_user_node_claims(const struct ggml_tensor * node) {
     // the user-node-claims contract tight even if the scheduler's
     // claim set lags behind the cgraph (e.g. a brand-new layer
     // not yet seen by the scheduler).
-    if (std::strncmp(node->name, "dp_moe.moe_layer_", 20) == 0) {
+    if (std::strncmp(node->name, kSentinelPrefix, kSentinelPrefixLen) == 0) {
         return true;
     }
     std::lock_guard<std::mutex> lk(g_runtime_mu);
@@ -763,8 +766,6 @@ extern "C" bool dp_moe_pre_op(
         }
     }
 
-    static constexpr const char * kSentinelPrefix = "dp_moe.moe_layer_";
-    constexpr size_t kSentinelPrefixLen = 20; // strlen("dp_moe.moe_layer_")
     if (std::strncmp(dst->name, kSentinelPrefix, kSentinelPrefixLen) != 0) {
         return false;
     }

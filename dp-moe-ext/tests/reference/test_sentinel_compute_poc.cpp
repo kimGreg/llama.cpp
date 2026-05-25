@@ -42,7 +42,7 @@
 //
 // Build target: dp_moe-sentinel-compute-poc
 //
-// Run: CUDA_VISIBLE_DEVICES=7 dp_moe-sentinel-compute-poc
+// Run: CUDA_VISIBLE_DEVICES=0 dp_moe-sentinel-compute-poc
 //
 // Exits 0 on all-pass, 1 on any failure.
 
@@ -118,8 +118,10 @@ bool tensor_near(const std::vector<float> & got,
 extern "C" bool sentinel_compute_pre_op_hook(
     cudaStream_t stream, struct ggml_tensor * dst)
 {
+    static constexpr char   kSentinelPrefix[] = "dp_moe.moe_layer_";
+    static constexpr size_t kSentinelPrefixLen = sizeof(kSentinelPrefix) - 1;
     if (dst == nullptr || dst->name[0] == '\0') return false;
-    if (std::strncmp(dst->name, "dp_moe.moe_layer_", 20) != 0) {
+    if (std::strncmp(dst->name, kSentinelPrefix, kSentinelPrefixLen) != 0) {
         // Property 6 indicator — the hook is being asked about
         // every op on the CUDA stream, not just the sentinel.
         ++g_state.n_default_ops_observed;
@@ -176,8 +178,10 @@ extern "C" bool sentinel_compute_pre_op_hook(
 // any cgraph containing a sentinel node. This is what keeps
 // property 5 true.
 extern "C" bool sentinel_compute_user_node_claims(const ggml_tensor * node) {
+    static constexpr char   kSentinelPrefix[] = "dp_moe.moe_layer_";
+    static constexpr size_t kSentinelPrefixLen = sizeof(kSentinelPrefix) - 1;
     if (node == nullptr || node->name[0] == '\0') return false;
-    return std::strncmp(node->name, "dp_moe.moe_layer_", 20) == 0;
+    return std::strncmp(node->name, kSentinelPrefix, kSentinelPrefixLen) == 0;
 }
 
 void fail(const char * prop, const char * detail) {

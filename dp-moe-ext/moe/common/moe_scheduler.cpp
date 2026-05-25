@@ -50,6 +50,9 @@ namespace dp_moe_ext {
 
 namespace {
 
+static constexpr char   kSentinelPrefix[] = "dp_moe.moe_layer_";
+static constexpr size_t kSentinelPrefixLen = sizeof(kSentinelPrefix) - 1;
+
 // Helpers to build the "all chunks of a tensor" list. Each managed
 // tensor is 1 q_bias chunk + P data chunks (a data chunk holds signs
 // + α for that plane, packed into one VRAM slot).
@@ -1023,7 +1026,8 @@ public:
                         const_cast<ggml_cgraph *>(cgraph), i);
                     if (node == nullptr) continue;
                     const bool is_sentinel = (std::strncmp(
-                        node->name, "dp_moe.moe_layer_", 20) == 0);
+                        node->name, kSentinelPrefix,
+                        kSentinelPrefixLen) == 0);
                     if (is_sentinel) {
                         ++n_sentinels;
                         if (node->src[0] == nullptr ||
@@ -1542,7 +1546,8 @@ private:
             const ggml_tensor * node =
                 ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i);
             if (node == nullptr) continue;
-            if (std::strncmp(node->name, "dp_moe.moe_layer_", 20) != 0) {
+            if (std::strncmp(node->name, kSentinelPrefix,
+                             kSentinelPrefixLen) != 0) {
                 continue;
             }
             const ggml_tensor * cur = node->src[0];
