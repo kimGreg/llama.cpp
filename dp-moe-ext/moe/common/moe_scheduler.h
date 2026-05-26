@@ -131,7 +131,7 @@ bool                scheduler_allow_capture         (const Scheduler & sched);
 // the per-(L, e, K) expert-output residual profile baked into the
 // GGUF as ``dp_moe.expert_residuals.{R, K_min, K_max}``.
 //
-// Decision rule (see experiments/3_layout_sweep/PROBLEM.md rung 2):
+// Decision rule (see experiments/3_dynamic_precision/PROBLEM.md):
 //   K_chosen[L, e]  =  largest K ∈ [K_min, K_max]
 //                       s.t.   g² · (R[L, e, K-1] - R[L, e, K])  >  τ
 //                       else   K_min

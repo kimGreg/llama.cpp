@@ -1,15 +1,13 @@
-// DPMoE / decoder / anybcq — single source of truth for the
+// DPA-MoE / decoder / anybcq — single source of truth for the
 // AnyBCQ byte stream layout.
 //
 // **MIRROR THIS FILE IN PYTHON**:
-//   src/dp_moe/encoders/format/anybcq_format.py
+//   src/chunked_encoder/format.py
 //
-// Every constant / struct here has an identical counterpart in the
-// Python file. The cross-language test
-//   src/dp_moe/encoders/tests/test_anybcq_format_parity.py
-// asserts byte-for-byte equivalence by encoding a tensor in Python and
-// parsing the bytes via these C++ structs. A drift in either file fails
-// the test.
+// Every constant / struct here has a matching counterpart in the Python
+// file. The encoding notes in
+//   experiments/2_encode/ENCODING_ALGORITHM.md
+// describe how the Python writer and runtime decoder stay aligned.
 //
 // Layout summary (v2):
 //
