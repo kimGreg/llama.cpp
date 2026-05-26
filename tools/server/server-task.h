@@ -381,6 +381,9 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
+        if (res_type == TASK_RESPONSE_TYPE_NONE) {
+            return;
+        }
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
 
         oai_resp_id = state.oai_resp_id;

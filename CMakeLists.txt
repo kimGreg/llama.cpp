@@ -190,13 +190,13 @@ endif()
 # build the library
 #
 
-# StreamLLM extension (opt-in, OFF by default). Built BEFORE src so
-# libllama can link against it when STREAMLLM_EXT=ON. When OFF, this
+# DP_MoE extension (opt-in, OFF by default). Built BEFORE src so
+# libllama can link against it when DP_MOE_EXT=ON. When OFF, this
 # branch's build is bit-identical to upstream ggml-org/llama.cpp at the
-# pinned commit cd03ec76. See streamllm-ext/CMakeLists.txt.
-option(STREAMLLM_EXT "Build StreamLLM chunked-weight extension" OFF)
-if (STREAMLLM_EXT)
-    add_subdirectory(streamllm-ext)
+# pinned commit cd03ec76. See dp-moe-ext/CMakeLists.txt.
+option(DP_MOE_EXT "Build DP_MoE chunked-weight extension" OFF)
+if (DP_MOE_EXT)
+    add_subdirectory(dp-moe-ext)
 endif()
 
 add_subdirectory(src)

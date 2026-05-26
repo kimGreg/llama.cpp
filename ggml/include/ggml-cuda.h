@@ -45,48 +45,92 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
-// streamllm-ext integration: register an override for GGML_OP_MUL_MAT.
-// The hook is called before the default dispatch inside ggml_cuda_mul_mat;
-// returning true signals "op handled", false falls through. Stream is the
-// current CUDA compute stream; src0/src1/dst are the op's operands (src0
-// is the weight, src1 the activations). Set to null to unregister.
+// dp-moe-ext integration: GGML_OP_MUL_MAT override. Mode A M1
+// uses this *only* as the criterion-10 clear-fail point: if the hook
+// detects a managed canonical surfacing as a dense MUL_MAT (which
+// should never happen in M1), it GGML_ABORTs loudly. There is no
+// dense-managed streaming in M1; future DenseExecutor work would
+// replace this entry. Returning true would signal "op handled" (and
+// short-circuit stock dispatch); the M1 body never returns true,
+// only aborts or returns false.
 //
 // Declared as a raw ``void *`` to keep this header CUDA-runtime-clean;
 // the implementation casts to the concrete function-pointer type.
 GGML_BACKEND_API void ggml_cuda_set_mul_mat_hook(void * hook_fn);
 
-// streamllm-ext integration: fusion-skip query. When set, ggml-cuda calls
-// this before fusing a mul_mat into a larger subgraph (ffn_up + ffn_gate
-// + glu, mul_mat_vec + glu, etc.). If it returns true for the candidate
-// weight tensor, fusion is disabled and the mul_mat is dispatched via the
-// normal path where the streamllm hook can claim it. Callback signature:
-//   bool fn(const struct ggml_tensor * weight_tensor);
-// Set to null to unregister. Independent of the mul_mat hook.
-GGML_BACKEND_API void ggml_cuda_set_fusion_skip_hook(void * hook_fn);
+// dp-moe-ext integration: graph-walk pre/post hooks. Mode A M1
+// scope: **audit + score-snapshot only**. The pre-hook fires at the
+// top of ggml_backend_cuda_graph_compute and is expected to do at
+// most (a) a one-shot cgraph audit (sentinels well-formed, no
+// managed MUL_MAT_ID/MUL_MAT leaked) and (b) a snapshot of the
+// score-table for the score-dial side channel. It must NOT plan
+// routing, reserve chunks, submit loads, dispatch managed nodes, or
+// use prior-token routing — all scheduling lives at the per-sentinel
+// dispatch site in pre_op_hook. The post-hook does end-of-replay
+// cleanup (replay-reservation drop).
+//
+// Callback signatures:
+//   void begin(cudaStream_t, const struct ggml_cgraph *);
+//   void end  (cudaStream_t, const struct ggml_cgraph *);
+// Either may be null. The cgraph pointer is read-only — modifying
+// nodes from inside these hooks is unsupported.
+GGML_BACKEND_API void ggml_cuda_set_graph_compute_begin_hook(void * hook_fn);
+GGML_BACKEND_API void ggml_cuda_set_graph_compute_end_hook  (void * hook_fn);
 
-// streamllm-ext integration: parallel hook for GGML_OP_MUL_MAT_ID
-// (MoE expert dispatch). Called at the top of ggml_cuda_mul_mat_id;
-// returning true means the hook handled the op, false falls through.
-// Stream is the current CUDA compute stream; src0 is the stacked expert
-// weight tensor [K, M, n_experts]; src1 is the routed activations;
-// ids is the int32 expert-id tensor selected by the router. Set to
-// null to unregister. Independent of the dense mul_mat hook.
-GGML_BACKEND_API void ggml_cuda_set_mul_mat_id_hook(void * hook_fn);
+// dp-moe-ext integration: user-managed-node claim hook. When set, ggml-
+// cuda asks this predicate per cgraph node before deciding whether to
+// capture the cgraph into a cuda-graph. If the predicate returns true for
+// ANY node in the cgraph, capture is disabled for this compute call and
+// every node runs eager via its regular dispatch path (where the
+// dp_moe per-op hooks above can claim it). Capture stays enabled for
+// cgraphs with no claimed nodes (the common dense-only case).
+//
+// Rationale: managed mul_mat_id ops need to run their LOAD walk on every
+// invocation, which is incompatible with whole-cgraph cuda-graph capture
+// (the captured replay would skip the host-side decision-making). Partial
+// per-segment capture is the right long-term answer (see plan
+// vigilant-stitching-heron P1+); disabling capture entirely for the
+// affected cgraph is the correct interim behaviour that matches what
+// llama.cpp does today for MoE models.
+//
+// Callback signature:
+//   bool fn(const struct ggml_tensor * node);
+// Set to null to unregister. Independent of the other dp_moe hooks.
+GGML_BACKEND_API void ggml_cuda_set_user_node_claims_hook(void * hook_fn);
 
-// streamllm-ext integration: notification hook fired just before
-// ggml_cuda_op_topk_moe (the fused softmax+argsort+(optional)norm
-// kernel that some MoE configurations dispatch instead of the
-// separate ops). Lets the streamllm hook capture the (logits,
-// weights, ids) tensor triple so it can later recover the
-// renormalized routing weights at mul_mat_id dispatch time —
-// without that side-channel, the buffer reachable via
-// ids->src[0]->src[0] is stale (the fused kernel never writes a
-// softmax output, so reading it returns whatever last lived in
-// that buffer). Callback signature:
-//   void fn(cudaStream_t, const ggml_tensor * logits,
-//           ggml_tensor * weights, ggml_tensor * ids);
+// dp-moe-ext integration: score-table version hook. When set,
+// ggml-cuda's per-cgraph "update required?" predicate calls this and
+// compares the returned uint64_t to a per-graph cached version. A
+// version mismatch forces re-capture of the cgraph — used by
+// dp-moe-ext to invalidate captured graphs whenever the runtime
+// score-dial swaps (HTTP /dp_moe/score_table or a phase-aware
+// reasoning→generation transition). The version is bumped each time
+// dp_moe_set_score_table() succeeds.
+//
+// Callback signature:
+//   uint64_t fn(void);
 // Set to null to unregister.
-GGML_BACKEND_API void ggml_cuda_set_topk_moe_hook(void * hook_fn);
+GGML_BACKEND_API void ggml_cuda_set_dp_moe_score_version_hook(void * hook_fn);
+
+// dp-moe-ext integration: generic pre-op claim hook. Fires at the
+// top of ggml_cuda_compute_forward for EVERY op — the hook inspects
+// dst (op type, name, src[i]) and returns true to indicate "I handled
+// this node; skip the default dispatch." Used by Mode A milestone-1's
+// sentinel-dispatch mechanism (a named GGML_OP_DUP node carries
+// pre-built routing tensors in src[1..3]; the dp_moe executor
+// claims it via this hook and runs the managed MoE block as a host-
+// eager call).
+//
+// Pre-op semantics are critical: the hook MUST be consulted BEFORE
+// the default kernel executes. ggml-cuda's existing per-op hooks
+// (mul_mat / mul_mat_id) live inside their respective ops' dispatch
+// functions and only protect those single ops. The pre-op hook is
+// generic — it sees every node and decides per-node.
+//
+// Callback signature:
+//   bool fn(cudaStream_t stream, struct ggml_tensor * dst);
+// Set to null to unregister. Independent of the other dp_moe hooks.
+GGML_BACKEND_API void ggml_cuda_set_pre_op_hook(void * hook_fn);
 
 #ifdef  __cplusplus
 }

@@ -1,5 +1,9 @@
 #include "models.h"
 
+#if defined(DP_MOE_EXT_ENABLED)
+#include "runtime_glue.h"
+#endif
+
 llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -75,8 +79,48 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * moe_out =
-            build_moe_ffn(cur,
+        ggml_tensor * moe_out = nullptr;
+        void * dp_moe_executor =
+#if defined(DP_MOE_EXT_ENABLED)
+            model.dp_moe_executor != nullptr
+                ? model.dp_moe_executor
+                : (void *) dp_moe_ext::current_executor();
+#else
+            nullptr;
+#endif
+        const bool dp_moe_stock_moe =
+#if defined(DP_MOE_EXT_ENABLED)
+            dp_moe_ext::executor_uses_stock_moe_graph(dp_moe_executor);
+#else
+            false;
+#endif
+        if (dp_moe_executor != nullptr && !dp_moe_stock_moe) {
+            // Mode A (DP_MoE M1) — emit a single per-layer sentinel
+            // via the shared helper; runtime's pre_op_hook routes it to
+            // forward_moe_layer. Managed Qwen3-MoE no longer surfaces
+            // as MUL_MAT_ID in the cgraph for these layers.
+            //
+            // Per-expert scale tensors (`_s` siblings) aren't honoured
+            // by forward_moe_layer in M1. Refuse loudly so a variant
+            // artifact that carries them doesn't silently drop the
+            // scale.
+            if (model.layers[il].ffn_up_exps_s   != nullptr ||
+                model.layers[il].ffn_gate_exps_s != nullptr ||
+                model.layers[il].ffn_down_exps_s != nullptr) {
+                GGML_ABORT(
+                    "dp-moe-ext / Qwen3-MoE Mode A (L=%d): per-expert "
+                    "scale tensors unsupported in M1.", il);
+            }
+            ggml_tensor * logits =
+                build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+            cb(logits, "ffn_moe_logits", il);
+            // Sentinel construction is intentionally `cb()`-free; see
+            // the helper's banner for the rename-regression rationale.
+            moe_out = llm_build_moe_sentinel(
+                ctx0, cur, logits,
+                (int64_t) n_expert, (int64_t) n_expert_used, il);
+        } else {
+            moe_out = build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,
                     model.layers[il].ffn_gate_exps,
@@ -91,7 +135,8 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
                     model.layers[il].ffn_down_exps_s);
-        cb(moe_out, "ffn_moe_out", il);
+            cb(moe_out, "ffn_moe_out", il);
+        }
         cur = moe_out;
 
         cur = ggml_add(ctx0, cur, ffn_inp);

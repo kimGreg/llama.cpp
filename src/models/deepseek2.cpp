@@ -242,19 +242,51 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il,
-                nullptr,
-                model.layers[il].ffn_gate_up_exps);
+            ggml_tensor * moe_out = nullptr;
+            if (model.dp_moe_executor != nullptr) {
+                // dp-moe-ext Mode A: route the routed-expert FFN through
+                // the per-layer sentinel; shared experts stay on the normal
+                // build_ffn path (added below).  Requires the simple
+                // softmax-topk routing — DeepSeek-MoE-16B-chat satisfies
+                // this (norm_topk_prob=false, expert_gating_func=SOFTMAX,
+                // no exp_probs_b bias).  Refuse loudly if the deployed
+                // variant exceeds those assumptions.
+                if (model.layers[il].ffn_exp_probs_b != nullptr) {
+                    GGML_ABORT(
+                        "dp-moe-ext / DeepSeek-MoE (L=%d): "
+                        "ffn_exp_probs_b bias is not supported by the simple "
+                        "sentinel router. Disable dp-moe-ext or extend "
+                        "llm_build_moe_sentinel_pre_routed.", il);
+                }
+                if ((int) hparams.expert_gating_func != 0 /* SOFTMAX */) {
+                    GGML_ABORT(
+                        "dp-moe-ext / DeepSeek-MoE (L=%d): "
+                        "expert_gating_func=%d unsupported (expected SOFTMAX=0). "
+                        "Disable dp-moe-ext or extend the sentinel.",
+                        il, (int) hparams.expert_gating_func);
+                }
+                ggml_tensor * logits =
+                    build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+                cb(logits, "ffn_moe_logits", il);
+                moe_out = llm_build_moe_sentinel(
+                    ctx0, cur, logits,
+                    (int64_t) n_expert, (int64_t) n_expert_used, il,
+                    /*norm_w=*/hparams.expert_weights_norm);
+            } else {
+                moe_out = build_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps);
+            }
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert

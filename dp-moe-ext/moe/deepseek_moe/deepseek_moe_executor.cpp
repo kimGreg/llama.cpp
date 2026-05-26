@@ -1,0 +1,21 @@
+// DPMoE / moe / deepseek_moe — registration.
+
+#include "deepseek_moe_executor.h"
+#include "executor.h"
+
+#include <memory>
+
+namespace dp_moe_ext { namespace deepseek_moe {
+
+void register_deepseek_moe_executor() {
+    static bool once = false;
+    if (once) return;
+    once = true;
+    register_executor(
+        "deepseek_anybcq_v1",
+        []() -> std::unique_ptr<ModelExecutor> {
+            return std::unique_ptr<ModelExecutor>(new DeepSeekMoEExecutor());
+        });
+}
+
+}}  // namespace dp_moe_ext::deepseek_moe

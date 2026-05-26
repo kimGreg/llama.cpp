@@ -573,11 +573,12 @@ llama_model_loader::llama_model_loader(
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
-            // streamllm-ext byte-blob tensors (named ``streamllm.bytes.*``)
-            // are consumed out-of-band by StreamllmRuntime — they never
+            // dp-moe-ext byte-blob and physical bundle tensors are
+            // consumed out-of-band by DPMoERuntime — they never
             // correspond to an arch-level ``create_tensor()`` call, so
             // skip them here to keep ``n_tensors`` matched to the arch.
-            if (tensor_name.rfind("streamllm.bytes.", 0) == 0) {
+            if (tensor_name.rfind("dp_moe.bytes.", 0) == 0 ||
+                tensor_name.rfind("dp_moe.bundle.", 0) == 0) {
                 continue;
             }
             // make sure there is no duplicated tensor names
@@ -690,11 +691,12 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset info of the main file.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
-            // streamllm-ext byte-blob tensors (named ``streamllm.bytes.*``)
-            // are consumed out-of-band by StreamllmRuntime — they never
+            // dp-moe-ext byte-blob and physical bundle tensors are
+            // consumed out-of-band by DPMoERuntime — they never
             // correspond to an arch-level ``create_tensor()`` call, so
             // skip them here to keep ``n_tensors`` matched to the arch.
-            if (tensor_name.rfind("streamllm.bytes.", 0) == 0) {
+            if (tensor_name.rfind("dp_moe.bytes.", 0) == 0 ||
+                tensor_name.rfind("dp_moe.bundle.", 0) == 0) {
                 continue;
             }
             // make sure there is no duplicated tensor names
@@ -715,31 +717,31 @@ llama_model_loader::llama_model_loader(
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
-    // streamllm-ext: read the managed-tensor name list once. Their F16
+    // dp-moe-ext: read the managed-tensor name list once. Their F16
     // placeholders in the GGUF are never read by any backend — the
     // runtime's mul_mat hook resolves them by name, so we skip both
     // the backend-buffer allocation and the disk copy for those
-    // tensors. If the file has no ``streamllm.version`` KV this is a
+    // tensors. If the file has no ``dp_moe.version`` KV this is a
     // stock GGUF and the set stays empty.
-    if (gguf_find_key(metadata, "streamllm.version") >= 0) {
-        const int64_t mid = gguf_find_key(metadata, "streamllm.managed_tensors");
+    if (gguf_find_key(metadata, "dp_moe.version") >= 0) {
+        const int64_t mid = gguf_find_key(metadata, "dp_moe.managed_tensors");
         if (mid >= 0) {
             const size_t n = gguf_get_arr_n(metadata, mid);
-            streamllm_managed.reserve(n);
+            dp_moe_managed.reserve(n);
             for (size_t i = 0; i < n; ++i) {
                 const char * s = gguf_get_arr_str(metadata, mid, i);
-                if (s && s[0]) streamllm_managed.emplace(s);
+                if (s && s[0]) dp_moe_managed.emplace(s);
             }
-            LLAMA_LOG_INFO("%s: streamllm-ext: %zu tensors will be skipped "
+            LLAMA_LOG_INFO("%s: dp-moe-ext: %zu tensors will be skipped "
                 "from the backend buffer (owned by runtime)\n",
-                __func__, streamllm_managed.size());
+                __func__, dp_moe_managed.size());
         }
 
-        // streamllm-ext: slim canonical placeholder support. The encoder
+        // dp-moe-ext: slim canonical placeholder support. The encoder
         // may write a stack-of-experts canonical (e.g.
         // ``blk.<N>.ffn_<kind>_exps.weight``) as a 1-element fp16 stub
         // and record the real shape under
-        // ``streamllm.tensor.<canonical>.canonical_shape = [n_experts,
+        // ``dp_moe.tensor.<canonical>.canonical_shape = [n_experts,
         // M, K]``. The runtime never reads the bytes anyway (mul_mat_id
         // hook resolves expert chunks by name), so the slim form drops
         // ~55 GB of zeros from a Qwen3-30B-A3B encode without runtime
@@ -749,9 +751,9 @@ llama_model_loader::llama_model_loader(
         // that wrote the full zero stack lack the key and pass through
         // unchanged.
         size_t n_patched = 0;
-        for (const std::string & name : streamllm_managed) {
+        for (const std::string & name : dp_moe_managed) {
             const std::string key =
-                std::string("streamllm.tensor.") + name + ".canonical_shape";
+                std::string("dp_moe.tensor.") + name + ".canonical_shape";
             const int64_t kid = gguf_find_key(metadata, key.c_str());
             if (kid < 0) continue;
             const size_t ndim = gguf_get_arr_n(metadata, kid);
@@ -774,15 +776,24 @@ llama_model_loader::llama_model_loader(
             // weights_map keys are tensor names; meta lives in contexts.
             ggml_tensor * t = get_tensor_meta(name.c_str());
             if (t == nullptr) continue;
+            const std::string type_key =
+                std::string("dp_moe.tensor.") + name + ".canonical_ggml_type";
+            const int64_t type_id = gguf_find_key(metadata, type_key.c_str());
+            if (type_id >= 0) {
+                t->type = (enum ggml_type) gguf_get_val_u32(metadata, type_id);
+            }
             for (size_t d = 0; d < GGML_MAX_DIMS; ++d) {
                 t->ne[d] = new_ne[d];
-                t->nb[d] = (d == 0) ? ggml_type_size(t->type)
-                                    : t->nb[d-1] * t->ne[d-1];
+            }
+            t->nb[0] = ggml_type_size(t->type);
+            t->nb[1] = t->nb[0] * (t->ne[0] / ggml_blck_size(t->type));
+            for (size_t d = 2; d < GGML_MAX_DIMS; ++d) {
+                t->nb[d] = t->nb[d-1] * t->ne[d-1];
             }
             ++n_patched;
         }
         if (n_patched > 0) {
-            LLAMA_LOG_INFO("%s: streamllm-ext: %zu canonical placeholders "
+            LLAMA_LOG_INFO("%s: dp-moe-ext: %zu canonical placeholders "
                 "resized via canonical_shape KV\n",
                 __func__, n_patched);
         }
@@ -1613,13 +1624,13 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        // streamllm-ext: the F16 placeholder for a managed tensor is
+        // dp-moe-ext: the F16 placeholder for a managed tensor is
         // never read by the runtime (the mul_mat hook resolves it by
-        // name from the GGUF's streamllm.* blob instead). Skip the
+        // name from the GGUF's dp_moe.* blob instead). Skip the
         // disk copy entirely — the CUDA buffer has no allocation for
         // it either, so there's nothing to write into.
-        if (!streamllm_managed.empty() &&
-            streamllm_managed.find(cur->name) != streamllm_managed.end()) {
+        if (!dp_moe_managed.empty() &&
+            dp_moe_managed.find(cur->name) != dp_moe_managed.end()) {
             size_done += n_size;
             continue;
         }

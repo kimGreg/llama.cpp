@@ -23,42 +23,50 @@
 #include <utility>
 #include <vector>
 
-// streamllm-ext live precision dial — forward decls so server-context
-// doesn't take a hard include dependency on the streamllm-ext tree.
-// The symbols are linked in via the static lib when STREAMLLM_EXT is
+// dp-moe-ext live KBar dial — forward decls so server-context
+// doesn't take a hard include dependency on the dp-moe-ext tree.
+// The symbols are linked in via the static lib when DP_MOE_EXT is
 // enabled at build time.
-extern "C" bool streamllm_set_score_table(
-    const float * thresholds, int n_thresh,
-    const int   * chunks,     int n_chunks);
-namespace streamllm_ext {
-bool streamllm_get_score_table(
-    std::vector<float> & out_thresholds,
-    std::vector<int>   & out_chunks);
-} // namespace streamllm_ext
-using streamllm_ext::streamllm_get_score_table;
+extern "C" bool dp_moe_set_kbar(float kbar, int allocator_mode);
+extern "C" bool dp_moe_get_kbar(float * out_kbar, int * out_allocator_mode);
 
-// /streamllm/stats accessors. Each is a single atomic read from the
-// streamllm-ext runtime; safe to call at high frequency.
+extern "C" bool dp_moe_kbar_schedule_set(
+    const int * thresholds, int n_thresh,
+    const float * kbars, int n_kbars,
+    int allocator_mode);
+extern "C" void dp_moe_schedule_clear(void);
+extern "C" bool dp_moe_schedule_active(void);
+
+// /dp_moe/stats accessors. Each is a single atomic read from the
+// dp-moe-ext runtime; safe to call at high frequency.
 extern "C" {
-unsigned long long streamllm_stat_pool_used_bytes(void);
-unsigned long long streamllm_stat_pool_peak_bytes(void);
-unsigned long long streamllm_stat_pool_cap_bytes(void);
-unsigned long long streamllm_stat_pool_h2d_bytes(void);
-unsigned long long streamllm_stat_pool_h2d_calls(void);
-unsigned long long streamllm_stat_host_dram_bytes(void);
-unsigned long long streamllm_stat_hook_calls(void);
-unsigned long long streamllm_stat_dispatch_count(void);
-unsigned long long streamllm_stat_prefetch_attempts(void);
-unsigned long long streamllm_stat_prefetch_skipped(void);
-unsigned long long streamllm_stat_prefetch_issued(void);
-unsigned long long streamllm_stat_make_room_calls(void);
-unsigned long long streamllm_stat_mc_calls(void);
-unsigned long long streamllm_stat_mc_pread_ns(void);
-unsigned long long streamllm_stat_tier_attempts(void);
-unsigned long long streamllm_stat_tier_vram_hits(void);
-unsigned long long streamllm_stat_tier_dram_hits(void);
-unsigned long long streamllm_stat_tier_ssd_misses(void);
-int                streamllm_stat_diag_enabled(void);
+unsigned long long dp_moe_stat_pool_used_bytes(void);
+unsigned long long dp_moe_stat_pool_peak_bytes(void);
+unsigned long long dp_moe_stat_pool_cap_bytes(void);
+unsigned long long dp_moe_stat_pool_h2d_bytes(void);
+unsigned long long dp_moe_stat_pool_h2d_calls(void);
+unsigned long long dp_moe_stat_pool_required_chunks(void);
+unsigned long long dp_moe_stat_pool_resident_hits(void);
+unsigned long long dp_moe_stat_pool_prefill_required_chunks(void);
+unsigned long long dp_moe_stat_pool_prefill_resident_hits(void);
+unsigned long long dp_moe_stat_pool_decode_required_chunks(void);
+unsigned long long dp_moe_stat_pool_decode_resident_hits(void);
+unsigned long long dp_moe_stat_host_dram_bytes(void);
+unsigned long long dp_moe_stat_hook_calls(void);
+unsigned long long dp_moe_stat_dispatch_count(void);
+unsigned long long dp_moe_stat_async_load_attempts(void);
+unsigned long long dp_moe_stat_async_load_skipped(void);
+unsigned long long dp_moe_stat_async_load_issued(void);
+unsigned long long dp_moe_stat_make_room_calls(void);
+unsigned long long dp_moe_stat_mc_calls(void);
+unsigned long long dp_moe_stat_mc_pread_ns(void);
+unsigned long long dp_moe_stat_sentinel_claims(void);
+unsigned long long dp_moe_stat_forward_moe_layer_calls(void);
+unsigned long long dp_moe_stat_tier_attempts(void);
+unsigned long long dp_moe_stat_tier_vram_hits(void);
+unsigned long long dp_moe_stat_tier_dram_hits(void);
+unsigned long long dp_moe_stat_tier_ssd_misses(void);
+int                dp_moe_stat_diag_enabled(void);
 }
 
 // fix problem with std::min and std::max
@@ -2933,6 +2941,7 @@ private:
 
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
+                    common_sampler_dp_moe_begin_generation(slot.smpl.get());
 
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
@@ -4164,90 +4173,268 @@ void server_routes::init_routes() {
         return res;
     };
 
-    // streamllm-ext: live precision dial. POST a JSON body
-    //   {"thresholds": [0.4, 0.3, 0.1, 0.05], "chunks": [8, 6, 4, 2]}
-    // to swap the active score table. Safe to call mid-generation —
-    // the in-flight forward pass keeps using the snapshot it took on
-    // entry, the next layer's mul_mat_id picks up the new table.
-    this->post_streamllm_score_table = [this](const server_http_req & req) {
+    this->post_dp_moe_kbar = [this](const server_http_req & req) {
         auto res = create_response(true);  // bypass-sleep: no model needed
         bool ctx_server; GGML_UNUSED(ctx_server);
         const json body = json::parse(req.body);
         if (!body.is_object() ||
-            !body.contains("thresholds") || !body.contains("chunks") ||
-            !body["thresholds"].is_array() || !body["chunks"].is_array()) {
+            !body.contains("kbar") || !body["kbar"].is_number()) {
             res->error(format_error_response(
-                "body must be an object with array fields "
-                "'thresholds' and 'chunks'", ERROR_TYPE_INVALID_REQUEST));
+                "body must be {\"kbar\": number, \"allocator\": \"profile|uniform\"}",
+                ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        std::vector<float> th;
-        std::vector<int>   ch;
-        for (const auto & v : body["thresholds"]) th.push_back(v.get<float>());
-        for (const auto & v : body["chunks"])     ch.push_back(v.get<int>());
-        if (!streamllm_set_score_table(
-                th.data(), (int)th.size(),
-                ch.data(), (int)ch.size())) {
+        const std::string allocator =
+            body.value("allocator", std::string("profile"));
+        const int allocator_mode = allocator == "uniform" ? 1 : 0;
+        const float kbar = body["kbar"].get<float>();
+        if (!dp_moe_set_kbar(kbar, allocator_mode)) {
             res->error(format_error_response(
-                "streamllm: set_score_table rejected the table "
-                "(check sizes match, thresholds descending, chunks in [1, 16])",
+                "dp_moe runtime not active or KBar was rejected",
                 ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         res->ok({
-            {"thresholds", th},
-            {"chunks",     ch},
+            {"kbar", kbar},
+            {"allocator", allocator_mode == 1 ? "uniform" : "profile"},
+            {"status", "applied"},
+        });
+        return res;
+    };
+
+    this->get_dp_moe_kbar = [this](const server_http_req &) {
+        auto res = create_response(true);
+        bool ctx_server; GGML_UNUSED(ctx_server);
+        float kbar = 0.0f;
+        int allocator_mode = 0;
+        if (!dp_moe_get_kbar(&kbar, &allocator_mode)) {
+            res->error(format_error_response(
+                "dp_moe runtime not active — no model with "
+                "required_runtime=true is loaded.",
+                ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res->ok({
+            {"kbar", kbar},
+            {"allocator", allocator_mode == 1 ? "uniform" : "profile"},
+        });
+        return res;
+    };
+
+    this->post_dp_moe_kbar_schedule = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        bool ctx_server; GGML_UNUSED(ctx_server);
+        const json body = json::parse(req.body);
+        if (body.is_object() && body.value("clear", false)) {
+            dp_moe_schedule_clear();
+            res->ok({{"status", "cleared"}});
+            return res;
+        }
+        if (!body.is_object()) {
+            res->error(format_error_response(
+                "body must be {\"thresholds\":[ints],\"kbars\":[floats],"
+                "\"allocator\":\"profile|uniform\"} with |kbars|=|thresholds|+1, "
+                "{\"pp_budget\":7,\"tg_high_budget\":4,\"tg_low_budget\":2,"
+                "\"tg_decay_start\":128,\"tg_decay_end\":256,"
+                "\"allocator\":\"profile|uniform\"}, "
+                "{\"prefill\":7,\"front\":4,\"rear\":2,\"front_tokens\":128,"
+                "\"allocator\":\"profile|uniform\"}, or {\"clear\":true}",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<int>   thr;
+        std::vector<float> kbars;
+        if (body.contains("pp_budget")       && body.contains("tg_high_budget") &&
+            body.contains("tg_low_budget")   && body.contains("tg_decay_start") &&
+            body.contains("tg_decay_end"))
+        {
+            if (!body["pp_budget"].is_number() ||
+                !body["tg_high_budget"].is_number() ||
+                !body["tg_low_budget"].is_number() ||
+                !body["tg_decay_start"].is_number_integer() ||
+                !body["tg_decay_end"].is_number_integer())
+            {
+                res->error(format_error_response(
+                    "linear schedule must use numeric pp_budget/"
+                    "tg_high_budget/tg_low_budget and integer "
+                    "tg_decay_start/tg_decay_end",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const float pp_budget = body["pp_budget"].get<float>();
+            const float tg_high   = body["tg_high_budget"].get<float>();
+            const float tg_low    = body["tg_low_budget"].get<float>();
+            const int decay_start = body["tg_decay_start"].get<int>();
+            const int decay_end   = body["tg_decay_end"].get<int>();
+            if (pp_budget < 0.0f || tg_high < 0.0f || tg_low < 0.0f ||
+                decay_start < 0 || decay_end <= decay_start)
+            {
+                res->error(format_error_response(
+                    "linear schedule requires non-negative budgets, "
+                    "tg_decay_start >= 0, and tg_decay_end > tg_decay_start",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            thr.push_back(0);
+            kbars.push_back(pp_budget);
+            kbars.push_back(tg_high);
+            const int first_decay_threshold = std::max(1, decay_start);
+            for (int t = first_decay_threshold; t < decay_end; ++t) {
+                const int next_token = t + 1;
+                float kbar = tg_low;
+                if (next_token <= decay_start) {
+                    kbar = tg_high;
+                } else if (next_token < decay_end) {
+                    const float alpha =
+                        (float) (next_token - decay_start) /
+                        (float) (decay_end - decay_start);
+                    kbar = tg_high + alpha * (tg_low - tg_high);
+                }
+                thr.push_back(t);
+                kbars.push_back(kbar);
+            }
+        } else if (body.contains("prefill") && body.contains("front") &&
+            body.contains("rear")    && body.contains("front_tokens"))
+        {
+            if (!body["prefill"].is_number() || !body["front"].is_number() ||
+                !body["rear"].is_number()    || !body["front_tokens"].is_number_integer())
+            {
+                res->error(format_error_response(
+                    "compact schedule must use numeric prefill/front/rear and "
+                    "integer front_tokens",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const int front_tokens = body["front_tokens"].get<int>();
+            if (front_tokens <= 0) {
+                res->error(format_error_response(
+                    "compact schedule requires front_tokens > 0",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            thr = { 0, front_tokens };
+            kbars = {
+                body["prefill"].get<float>(),
+                body["front"].get<float>(),
+                body["rear"].get<float>(),
+            };
+        } else if (body.contains("thresholds") && body["thresholds"].is_array() &&
+                   body.contains("kbars")      && body["kbars"].is_array())
+        {
+            for (const auto & v : body["thresholds"]) thr.push_back(v.get<int>());
+            for (const auto & v : body["kbars"]) kbars.push_back(v.get<float>());
+        } else {
+            res->error(format_error_response(
+                "body must be {\"thresholds\":[ints],\"kbars\":[floats],"
+                "\"allocator\":\"profile|uniform\"} with |kbars|=|thresholds|+1, "
+                "{\"pp_budget\":7,\"tg_high_budget\":4,\"tg_low_budget\":2,"
+                "\"tg_decay_start\":128,\"tg_decay_end\":256,"
+                "\"allocator\":\"profile|uniform\"}, "
+                "{\"prefill\":7,\"front\":4,\"rear\":2,\"front_tokens\":128,"
+                "\"allocator\":\"profile|uniform\"}, or {\"clear\":true}",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string allocator =
+            body.value("allocator", std::string("profile"));
+        const int allocator_mode = allocator == "uniform" ? 1 : 0;
+        if (!dp_moe_kbar_schedule_set(
+                thr.data(), (int) thr.size(), kbars.data(), (int) kbars.size(),
+                allocator_mode))
+        {
+            res->error(format_error_response(
+                "dp_moe: kbar_schedule rejected (thresholds must be "
+                "ascending and |kbars|=|thresholds|+1)",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok({
+            {"thresholds", thr},
+            {"kbars",      kbars},
+            {"allocator",  allocator_mode == 1 ? "uniform" : "profile"},
             {"status",     "applied"},
         });
         return res;
     };
 
-    this->get_streamllm_score_table = [this](const server_http_req &) {
-        auto res = create_response(true);
-        bool ctx_server; GGML_UNUSED(ctx_server);
-        std::vector<float> th;
-        std::vector<int>   ch;
-        streamllm_get_score_table(th, ch);
-        res->ok({{"thresholds", th}, {"chunks", ch}});
-        return res;
-    };
 
-    // /streamllm/stats — realtime cache + prefetch counters. Each
+    // /dp_moe/stats — realtime cache + prefetch counters. Each
     // accessor is a single atomic load, so polling at 1 Hz adds
     // negligible overhead. Tier-hit aggregates are present only when
-    // STREAMLLM_DIAG=ON; otherwise they appear as zeros and the
+    // DP_MOE_DIAG=ON; otherwise they appear as zeros and the
     // diag_enabled flag is 0 so the panel can hide that section.
-    this->get_streamllm_stats = [this](const server_http_req &) {
+    this->get_dp_moe_stats = [this](const server_http_req &) {
         auto res = create_response(true);
         bool ctx_server; GGML_UNUSED(ctx_server);
-        const auto used  = streamllm_stat_pool_used_bytes();
-        const auto peak  = streamllm_stat_pool_peak_bytes();
-        const auto cap   = streamllm_stat_pool_cap_bytes();
-        const auto attempts = streamllm_stat_tier_attempts();
-        const auto vh = streamllm_stat_tier_vram_hits();
-        const auto dh = streamllm_stat_tier_dram_hits();
-        const auto sm = streamllm_stat_tier_ssd_misses();
+        const auto used  = dp_moe_stat_pool_used_bytes();
+        const auto peak  = dp_moe_stat_pool_peak_bytes();
+        const auto cap   = dp_moe_stat_pool_cap_bytes();
+        const auto req   = dp_moe_stat_pool_required_chunks();
+        const auto rh    = dp_moe_stat_pool_resident_hits();
+        const auto pre_req = dp_moe_stat_pool_prefill_required_chunks();
+        const auto pre_rh  = dp_moe_stat_pool_prefill_resident_hits();
+        const auto dec_req = dp_moe_stat_pool_decode_required_chunks();
+        const auto dec_rh  = dp_moe_stat_pool_decode_resident_hits();
+        const auto attempts = dp_moe_stat_tier_attempts();
+        const auto vh = dp_moe_stat_tier_vram_hits();
+        const auto dh = dp_moe_stat_tier_dram_hits();
+        const auto sm = dp_moe_stat_tier_ssd_misses();
         res->ok({
             {"pool", {
                 {"used_mb",        used / (1024.0 * 1024.0)},
                 {"peak_mb",        peak / (1024.0 * 1024.0)},
                 {"cap_mb",         cap  / (1024.0 * 1024.0)},
-                {"h2d_mb",         streamllm_stat_pool_h2d_bytes() / (1024.0 * 1024.0)},
-                {"h2d_calls",      streamllm_stat_pool_h2d_calls()},
-                {"make_room_calls",streamllm_stat_make_room_calls()},
-                {"host_dram_mb",   streamllm_stat_host_dram_bytes() / (1024.0 * 1024.0)},
+                {"h2d_mb",         dp_moe_stat_pool_h2d_bytes() / (1024.0 * 1024.0)},
+                {"h2d_calls",      dp_moe_stat_pool_h2d_calls()},
+                {"make_room_calls",dp_moe_stat_make_room_calls()},
+                {"host_dram_mb",   dp_moe_stat_host_dram_bytes() / (1024.0 * 1024.0)},
+                {"note",           "physical H2D/load counters; not logical cache-hit attempts"},
+            }},
+            {"physical_loads", {
+                {"h2d_mb",         dp_moe_stat_pool_h2d_bytes() / (1024.0 * 1024.0)},
+                {"h2d_calls",      dp_moe_stat_pool_h2d_calls()},
+                {"make_room_calls",dp_moe_stat_make_room_calls()},
+            }},
+            {"residency", {
+                {"required_chunks",          req},
+                {"resident_hits",            rh},
+                {"load_misses",              req > rh ? req - rh : 0},
+                {"hit_pct",                  req ? 100.0 * (double) rh / (double) req : 0.0},
+                {"prefill_required_chunks",  pre_req},
+                {"prefill_resident_hits",    pre_rh},
+                {"prefill_hit_pct",          pre_req ? 100.0 * (double) pre_rh / (double) pre_req : 0.0},
+                {"decode_required_chunks",   dec_req},
+                {"decode_resident_hits",     dec_rh},
+                {"decode_hit_pct",           dec_req ? 100.0 * (double) dec_rh / (double) dec_req : 0.0},
+                {"note",                     "VRAM pool required-set residency; comparable for uniform and dynamic"},
             }},
             {"hook", {
-                {"calls",             streamllm_stat_hook_calls()},
-                {"dispatches",        streamllm_stat_dispatch_count()},
-                {"prefetch_attempts", streamllm_stat_prefetch_attempts()},
-                {"prefetch_skipped",  streamllm_stat_prefetch_skipped()},
-                {"prefetch_issued",   streamllm_stat_prefetch_issued()},
-                {"mc_calls",          streamllm_stat_mc_calls()},
-                {"mc_pread_ns",       streamllm_stat_mc_pread_ns()},
+                {"calls",             dp_moe_stat_hook_calls()},
+                {"dispatches",        dp_moe_stat_dispatch_count()},
+                {"async_load_attempts", dp_moe_stat_async_load_attempts()},
+                {"async_load_skipped",  dp_moe_stat_async_load_skipped()},
+                {"async_load_issued",   dp_moe_stat_async_load_issued()},
+                {"mc_calls",          dp_moe_stat_mc_calls()},
+                {"mc_pread_ns",       dp_moe_stat_mc_pread_ns()},
+            }},
+            {"routing", {
+                {"sentinel_claims", dp_moe_stat_sentinel_claims()},
+                {"forward_moe_layer_calls", dp_moe_stat_forward_moe_layer_calls()},
             }},
             {"tier_hits", {
-                {"diag_enabled", streamllm_stat_diag_enabled() != 0},
+                {"diag_enabled", dp_moe_stat_diag_enabled() != 0},
+                {"attempts",     attempts},
+                {"vram_hits",    vh},
+                {"dram_hits",    dh},
+                {"ssd_misses",   sm},
+                {"vram_pct",  attempts ? 100.0 * (double)vh / (double)attempts : 0.0},
+                {"dram_pct",  attempts ? 100.0 * (double)dh / (double)attempts : 0.0},
+                {"ssd_pct",   attempts ? 100.0 * (double)sm / (double)attempts : 0.0},
+                {"note",      "logical chunk lookup attempts; not byte/load weighted"},
+            }},
+            {"logical_tier_hits", {
+                {"diag_enabled", dp_moe_stat_diag_enabled() != 0},
                 {"attempts",     attempts},
                 {"vram_hits",    vh},
                 {"dram_hits",    dh},

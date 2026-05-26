@@ -19,8 +19,8 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
-#if defined(STREAMLLM_EXT_ENABLED)
-#include "runtime_hook.h"
+#if defined(DP_MOE_EXT_ENABLED)
+#include "runtime_glue.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -651,8 +651,8 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 struct llama_model::impl {
     impl() = default;
     ~impl() {
-#if defined(STREAMLLM_EXT_ENABLED)
-        for (void * p : streamllm_seed_ptrs) {
+#if defined(DP_MOE_EXT_ENABLED)
+        for (void * p : dp_moe_seed_ptrs) {
             if (p) cudaFree(p);
         }
 #endif
@@ -674,12 +674,12 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
-#if defined(STREAMLLM_EXT_ENABLED)
-    // streamllm-ext: dummy CUDA allocations used as safe ``t->data``
+#if defined(DP_MOE_EXT_ENABLED)
+    // dp-moe-ext: dummy CUDA allocations used as safe ``t->data``
     // placeholders for managed-tensor weights. They prevent any stray
     // read from faulting; the actual weight bytes live in the runtime
     // pool.
-    std::vector<void *> streamllm_seed_ptrs;
+    std::vector<void *> dp_moe_seed_ptrs;
 #endif
 
     buft_list_t cpu_buft_list;
@@ -4631,8 +4631,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_post_norm_1 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_1, "weight", i), {n_embd}, 0);
                             layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
 
-                            // MoE FFN
-                            layer.ffn_gate_up_exps  = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS,  "weight", i), {n_embd, n_ff_exp * 2, n_expert}, 0);
+                            // MoE FFN — accept either the fused
+                            // ``ffn_gate_up_exps`` (default Gemma 4
+                            // GGUF) or separate ``ffn_gate_exps`` +
+                            // ``ffn_up_exps`` (what dp-moe-ext's
+                            // chunked_encoder writes, since AnyBCQ
+                            // calibrates the two matmuls
+                            // independently).
+                            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
                             layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,     "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
 
                             // per-expert scale will be loaded as down_exps_s at the end of the current switch case
@@ -7994,7 +8000,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                // streamllm-ext: managed weights are owned by the runtime,
+#if defined(DP_MOE_EXT_ENABLED)
+                // dp-moe-ext: managed weights are owned by the runtime,
                 // not the backend buffer. Seed ``t->data`` to a real
                 // CUDA allocation so ggml-alloc's size pass (see
                 // ggml_backend_alloc_ctx_tensors_from_buft_impl) treats
@@ -8004,32 +8011,35 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 // ``t->buffer`` to the CUDA buffer so ggml_backend_sched
                 // routes mul_mat to this backend; the hook claims the
                 // op before any kernel reads it.
-                void * streamllm_seed = nullptr;
+                void * dp_moe_seed = nullptr;
                 const bool has_managed =
-                    !ml.streamllm_managed.empty() &&
+                    !ml.dp_moe_managed.empty() &&
                     ggml_backend_buft_is_host(buft) == false &&
                     ggml_backend_buft_get_device(buft) != nullptr;
                 if (has_managed) {
-                    if (cudaMalloc(&streamllm_seed, 4096) != cudaSuccess) {
-                        streamllm_seed = nullptr;
+                    if (cudaMalloc(&dp_moe_seed, 4096) != cudaSuccess) {
+                        dp_moe_seed = nullptr;
                     }
                 }
-                if (streamllm_seed) {
-                    pimpl->streamllm_seed_ptrs.push_back(streamllm_seed);
+                if (dp_moe_seed) {
+                    pimpl->dp_moe_seed_ptrs.push_back(dp_moe_seed);
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                        if (ml.streamllm_managed.find(t->name) != ml.streamllm_managed.end()) {
-                            t->data = streamllm_seed;
+                        if (ml.dp_moe_managed.find(t->name) != ml.dp_moe_managed.end()) {
+                            t->data = dp_moe_seed;
                         }
                     }
                 }
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
-                if (buf != nullptr && streamllm_seed) {
+                if (buf != nullptr && dp_moe_seed) {
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                        if (t->data == streamllm_seed) {
+                        if (t->data == dp_moe_seed) {
                             t->buffer = buf;
                         }
                     }
                 }
+#else
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+#endif
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -9161,12 +9171,24 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
-#if defined(STREAMLLM_EXT_ENABLED)
+#if defined(DP_MOE_EXT_ENABLED)
+    // Mode A milestone 1, S1: unbind this model's dp_moe_executor
+    // slot from the ext FIRST so dp_moe_ext::clear()'s bound-slots
+    // walk never writes through a soon-to-be-freed address. The slot
+    // must still be a valid writable address at this point — true
+    // here, before `delete model` runs. unbind_model_slot is a no-op
+    // for models that were never bound (stock GGUF / model is null).
+    if (model != nullptr) {
+        dp_moe_ext::unbind_model_slot(&model->dp_moe_executor);
+    }
+
     // Unregister the mul_mat hook + tear down the VRAM pool before
     // the model itself goes away, so we release managed weights on
     // exactly the same device ``llama_model_load_from_file_impl``
-    // installed them on.
-    streamllm_ext::clear();
+    // installed them on. After the unbind above, g_bound_model_slots_
+    // is empty for M1's one-model-per-process contract, so the
+    // lookup-and-null walk inside clear() finds nothing to null.
+    dp_moe_ext::clear();
 #endif
     delete model;
 }

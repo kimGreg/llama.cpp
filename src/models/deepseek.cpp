@@ -71,20 +71,56 @@ llm_build_deepseek::llm_build_deepseek(const llama_model & model, const llm_grap
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                nullptr,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, false,
-                hparams.expert_weights_scale,
-                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                il);
-            cb(moe_out, "ffn_moe_out", il);
+            ggml_tensor * moe_out = nullptr;
+            if (model.dp_moe_executor != nullptr) {
+                static bool _dp_moe_log_once = false;
+                if (!_dp_moe_log_once) {
+                    std::fprintf(stderr,
+                        "dp-moe-ext / DeepSeek: sentinel branch active "
+                        "(first MoE layer = %d)\n", il);
+                    _dp_moe_log_once = true;
+                }
+                // DP_MoE Mode A — emit a per-layer sentinel that
+                // the runtime ``pre_op_hook`` routes to
+                // ``forward_moe_layer``.  DeepSeek-MoE-16B uses
+                // hard-coded SOFTMAX + SiLU + norm_w=false; the
+                // executor's default SiLU matches.
+                ggml_tensor * logits =
+                    build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+                cb(logits, "ffn_moe_logits", il);
 
-            // FFN shared expert
+                auto router = llm_build_moe_routing_softmax_topk(
+                    ctx0, logits, n_expert, n_expert_used,
+                    /*norm_w=*/false);
+
+                ggml_tensor * weights = router.weights;
+                if (hparams.expert_weights_scale != 0.0f &&
+                    hparams.expert_weights_scale != 1.0f) {
+                    weights = ggml_scale(ctx0, weights,
+                                          hparams.expert_weights_scale);
+                }
+                ggml_build_forward_expand(gf, weights);
+
+                moe_out = llm_build_moe_sentinel_pre_routed(
+                    ctx0, cur, router.ids, router.probs, weights, il);
+            } else {
+                moe_out = build_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    nullptr,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, false,
+                    hparams.expert_weights_scale,
+                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                    il);
+                cb(moe_out, "ffn_moe_out", il);
+            }
+
+            // FFN shared expert (always on the unmanaged path —
+            // matches the user directive: shared experts stay
+            // Q8_0, not routed through anybcq).
             {
                 ggml_tensor * ffn_shexp =
                     build_ffn(cur,

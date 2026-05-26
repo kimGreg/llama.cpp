@@ -56,6 +56,101 @@ enum llm_norm_type {
     LLM_NORM_GROUP,
 };
 
+// Mode A milestone 1, S3 — shared MoE router/topk/renorm helper.
+//
+// Factored out of ``llm_graph_context::build_moe_ffn`` so both the
+// reference MoE construction path and external callers (the
+// dp-moe-ext Qwen3-MoE executor in S5+) can share the same router
+// implementation without copy-paste divergence.
+//
+// Covers the SIMPLE case: SOFTMAX gating + optional norm_w
+// renormalisation, no exp_probs_b, no expert_groups, no LLAMA4 /
+// GROVEMOE arch quirks, no SOFTMAX_WEIGHT post-softmax. Suitable for
+// Qwen3-MoE, Qwen3.5-MoE, and any future arch that fits this shape.
+//
+// Inputs:
+//   ctx          — caller's ggml_context.
+//   logits       — pre-softmax logits, [n_expert, n_tokens] f32.
+//                  Caller computes via ggml_mul_mat / build_lora_mm
+//                  with any arch-specific bias adds already applied.
+//   n_expert     — total experts in the MoE block.
+//   n_expert_used— top-k expert count to select per token.
+//   norm_w       — true: renormalise weights so they sum to ~1 per
+//                  token (the standard Qwen3-MoE shape).
+//                  false: leave weights as raw probs values.
+//
+// Outputs:
+//   ids      — selected_experts: [n_expert_used, n_tokens] int32.
+//   probs    — softmax(logits): [n_expert, n_tokens] f32. Returned
+//              UNRESHAPED so external consumers (the executor's
+//              D2H of current routing) can read the full
+//              n_expert-wide row directly.
+//   weights  — gathered + (optionally renormalised) topk weights:
+//              [1, n_expert_used, n_tokens] f32.
+//
+// The ggml ops emitted match ``build_moe_ffn``'s simple SOFTMAX
+// path exactly so swapping in this helper is a verifiable no-op
+// on the cgraph topology.
+struct llm_moe_router_output {
+    ggml_tensor * ids;
+    ggml_tensor * probs;
+    ggml_tensor * weights;
+};
+
+llm_moe_router_output llm_build_moe_routing_softmax_topk(
+    ggml_context * ctx,
+    ggml_tensor *  logits,
+    int64_t        n_expert,
+    int64_t        n_expert_used,
+    bool           norm_w);
+
+// DP_MoE Mode A sentinel — single source of truth for the per-layer
+// MoE boundary in the cgraph. Emits the router/topk via the helper
+// above, then a ``ggml_dup(cur)`` node renamed to
+// ``"dp_moe.moe_layer_<il>"`` with ``src[1..3] = {ids, probs,
+// weights}`` manually wired. The runtime's ``pre_op_hook`` matches on
+// that exact name prefix and routes the dst to
+// ``Qwen3MoEAnyBcqExecutor::forward_moe_layer``; the residual + cvec
+// after this consumes the returned tensor as the final MoE block
+// output.
+//
+// Returns the sentinel tensor (== final layer_out). Shape F32 [n_embd,
+// n_tokens] — same shape as ``cur``.
+//
+// **Do not call ``cb()`` on the returned tensor.** ``cb()`` calls
+// ``ggml_format_name`` which would silently rename the sentinel away
+// from the ``"dp_moe.moe_layer_*"`` prefix that the dispatch rail
+// matches on. The cgraph audit (``DP_MOE_CGRAPH_AUDIT=1``) will
+// catch the breakage, but it's faster to avoid the rename in the
+// first place — keep the caller's branch ``cb()``-free for the
+// sentinel.
+//
+// ``norm_w`` controls weight renormalisation in the router (Qwen3-MoE
+// uses ``true``).
+ggml_tensor * llm_build_moe_sentinel(
+    ggml_context * ctx,
+    ggml_tensor *  cur,
+    ggml_tensor *  logits,
+    int64_t        n_expert,
+    int64_t        n_expert_used,
+    int            il,
+    bool           norm_w = true);
+
+// Pre-routed variant — the caller has already produced ``ids``,
+// ``probs``, ``weights`` (e.g. via a per-arch routing branch with
+// sigmoid gating, ``exp_probs_b`` bias, or a non-trivial logit
+// projection) and just wants the sentinel rail.  Used by arches
+// whose routing math doesn't match the simple softmax+topk path
+// hard-wired in ``llm_build_moe_sentinel``.  Same name + src wiring
+// convention; the dispatch hook can't tell the two variants apart.
+ggml_tensor * llm_build_moe_sentinel_pre_routed(
+    ggml_context * ctx,
+    ggml_tensor *  cur,
+    ggml_tensor *  ids,
+    ggml_tensor *  probs,
+    ggml_tensor *  weights,
+    int            il);
+
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
     // the output embeddings from the encoder as a ggml tensor

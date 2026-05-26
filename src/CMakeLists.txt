@@ -53,15 +53,15 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
-# --- streamllm-ext integration --------------------------------------------
+# --- dp-moe-ext integration --------------------------------------------
 # When the extension is enabled, link it into libllama so model load /
 # free can call the runtime-install hook directly, and define
-# STREAMLLM_EXT_ENABLED so llama.cpp + llama-model.cpp compile in the
+# DP_MOE_EXT_ENABLED so llama.cpp + llama-model.cpp compile in the
 # hook call-sites. Without this guard, libllama is bit-identical to
 # upstream at the pinned commit.
-if (STREAMLLM_EXT)
-    target_link_libraries(llama PRIVATE streamllm_ext)
-    target_compile_definitions(llama PRIVATE STREAMLLM_EXT_ENABLED=1)
+if (DP_MOE_EXT AND GGML_CUDA)
+    target_link_libraries(llama PRIVATE dp_moe_ext)
+    target_compile_definitions(llama PRIVATE DP_MOE_EXT_ENABLED=1)
 endif()
 
 if (BUILD_SHARED_LIBS)

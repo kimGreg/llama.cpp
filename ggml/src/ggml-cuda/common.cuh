@@ -1184,6 +1184,14 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // dp-moe-ext: cached score-table version. ``ggml_cuda_graph_
+    // update_required`` compares this against the value returned by
+    // the score-version hook (registered via
+    // ``ggml_cuda_set_dp_moe_score_version_hook``) and forces re-
+    // capture on mismatch. Default 0 matches the default
+    // unregistered-hook reply (0), so behaviour is unchanged when
+    // the hook is null.
+    uint64_t cached_dp_moe_score_version = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];

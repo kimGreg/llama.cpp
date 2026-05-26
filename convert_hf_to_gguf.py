@@ -1347,6 +1347,11 @@ class TextModel(ModelBase):
         if chkhsh == "049ecf7629871e3041641907f3de7c733e4dbfdc736f57d882ba0b0845599754":
             # ref: https://huggingface.co/deepseek-ai/deepseek-llm-7b-base
             res = "deepseek-llm"
+        if chkhsh == "93105512fde79bc726022fe3cbfb7efef9738465b988d0600beba1296e3a91d8":
+            # ref: https://huggingface.co/deepseek-ai/deepseek-moe-16b-chat
+            # Same Sequence([\r\n] + capital-letter regex) BPE pre-tokenizer
+            # family as deepseek-llm; pre-tokenizer name maps to "deepseek-llm".
+            res = "deepseek-llm"
         if chkhsh == "347715f544604f9118bb75ed199f68779f423cabb20db6de6f31b908d04d7821":
             # ref: https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-base
             res = "deepseek-coder"

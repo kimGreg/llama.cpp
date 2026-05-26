@@ -2233,22 +2233,10 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
-// streamllm-ext fusion-skip hook: returns true if the given weight
-// tensor is runtime-managed (src0 data is a placeholder) and must be
-// dispatched via the regular mul_mat path so the streamllm hook gets
-// a chance to claim it. Used by the ffn_up + ffn_gate + glu fusion
-// predicate and the mul_mat_vec fusion predicates. Definition is
-// early so the predicates below can refer to it.
-typedef bool (*ggml_cuda_fusion_skip_hook_t)(const ggml_tensor *);
-static ggml_cuda_fusion_skip_hook_t g_cuda_fusion_skip_hook = nullptr;
-
-extern "C" void ggml_cuda_set_fusion_skip_hook(void * hook_fn) {
-    g_cuda_fusion_skip_hook = (ggml_cuda_fusion_skip_hook_t) hook_fn;
-}
-
-static inline bool ggml_cuda_fusion_is_blocked(const ggml_tensor * w) {
-    return g_cuda_fusion_skip_hook != nullptr && g_cuda_fusion_skip_hook(w);
-}
+// dp-moe-ext fusion-skip hook was retired in the Mode A M1 cleanup —
+// managed canonicals no longer surface as dense MUL_MAT in the cgraph
+// (the per-layer sentinel rail owns managed MoE), so fusion decisions
+// no longer need dp_moe-aware overrides.
 
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
@@ -2267,14 +2255,6 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
-        return false;
-    }
-
-    // streamllm-ext: skip fusion if either weight is runtime-managed.
-    // The mul_mat must go through the regular dispatch so the hook can
-    // claim it; otherwise the fused kernel would dereference a placeholder.
-    if (ggml_cuda_fusion_is_blocked(ffn_up->src[0]) ||
-        ggml_cuda_fusion_is_blocked(ffn_gate->src[0])) {
         return false;
     }
 
@@ -2348,11 +2328,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    // streamllm-ext: skip fusion if the weight is runtime-managed.
-    if (ggml_cuda_fusion_is_blocked(src0)) {
-        return false;
-    }
-
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -2388,11 +2363,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    // streamllm-ext: skip fusion if the weight is runtime-managed.
-    if (ggml_cuda_fusion_is_blocked(src0)) {
-        return false;
-    }
-
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -2426,11 +2396,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-// streamllm-ext hook: optional override for GGML_OP_MUL_MAT. When set
-// (streamllm-ext's runtime registers it after model load), called before
+// dp-moe-ext hook: optional override for GGML_OP_MUL_MAT. When set
+// (dp-moe-ext's runtime registers it after model load), called before
 // the default dispatch. Return value true means the hook handled the op;
 // false falls through to the normal path. No-op when the hook pointer
-// is null (i.e. stock builds without streamllm-ext linked in).
+// is null (i.e. stock builds without dp-moe-ext linked in).
 typedef bool (*ggml_cuda_mul_mat_hook_t)(
     cudaStream_t stream,
     const ggml_tensor * src0,
@@ -2445,37 +2415,85 @@ extern "C" void ggml_cuda_set_mul_mat_hook(void * hook_fn) {
     g_cuda_mul_mat_hook = (ggml_cuda_mul_mat_hook_t) hook_fn;
 }
 
-// streamllm-ext mul_mat_id hook. Same pattern as the dense hook but for
-// GGML_OP_MUL_MAT_ID (MoE expert dispatch).
-typedef bool (*ggml_cuda_mul_mat_id_hook_t)(
-    cudaStream_t stream,
-    const ggml_tensor * src0,
-    const ggml_tensor * src1,
-    const ggml_tensor * ids,
-    ggml_tensor * dst);
+// dp-moe-ext mul_mat_id hook and topk_moe hook were retired in the
+// Mode A M1 cleanup. Managed MoE flows through the per-layer sentinel
+// rail claimed by the generic pre_op_hook (below); no per-canonical
+// MUL_MAT_ID interception or fused-topk_moe side channel remains.
 
-static ggml_cuda_mul_mat_id_hook_t g_cuda_mul_mat_id_hook = nullptr;
+// dp-moe-ext: graph-compute pre/post hooks. Fire at the top and
+// bottom of ggml_backend_cuda_graph_compute. See header.
+typedef void (*ggml_cuda_graph_compute_hook_t)(
+    cudaStream_t                stream,
+    const struct ggml_cgraph *  cgraph);
 
-extern "C" void ggml_cuda_set_mul_mat_id_hook(void * hook_fn) {
-    g_cuda_mul_mat_id_hook = (ggml_cuda_mul_mat_id_hook_t) hook_fn;
+static ggml_cuda_graph_compute_hook_t g_cuda_graph_compute_begin_hook = nullptr;
+static ggml_cuda_graph_compute_hook_t g_cuda_graph_compute_end_hook   = nullptr;
+
+extern "C" void ggml_cuda_set_graph_compute_begin_hook(void * hook_fn) {
+    g_cuda_graph_compute_begin_hook = (ggml_cuda_graph_compute_hook_t) hook_fn;
+}
+extern "C" void ggml_cuda_set_graph_compute_end_hook(void * hook_fn) {
+    g_cuda_graph_compute_end_hook = (ggml_cuda_graph_compute_hook_t) hook_fn;
 }
 
-// streamllm-ext: notification before ggml_cuda_op_topk_moe. See header.
-typedef void (*ggml_cuda_topk_moe_hook_t)(
-    cudaStream_t stream,
-    const ggml_tensor * logits,
-    ggml_tensor *       weights,
-    ggml_tensor *       ids);
+// dp-moe-ext: user-managed-node claim hook. See header. When set and
+// any node in a cgraph satisfies the predicate, cuda-graph capture for
+// that cgraph compute is disabled — every node runs eager, so the
+// per-op dp_moe hooks (mul_mat / mul_mat_id) execute their full
+// LOAD walk on each invocation instead of being captured once and
+// replayed with stale chunk pointers.
+typedef bool (*ggml_cuda_user_node_claims_hook_t)(const struct ggml_tensor *);
+static ggml_cuda_user_node_claims_hook_t g_cuda_user_node_claims_hook = nullptr;
 
-static ggml_cuda_topk_moe_hook_t g_cuda_topk_moe_hook = nullptr;
+extern "C" void ggml_cuda_set_user_node_claims_hook(void * hook_fn) {
+    g_cuda_user_node_claims_hook =
+        (ggml_cuda_user_node_claims_hook_t) hook_fn;
+}
 
-extern "C" void ggml_cuda_set_topk_moe_hook(void * hook_fn) {
-    g_cuda_topk_moe_hook = (ggml_cuda_topk_moe_hook_t) hook_fn;
+static inline bool ggml_cuda_cgraph_has_user_node(const ggml_cgraph * cgraph) {
+    if (g_cuda_user_node_claims_hook == nullptr || cgraph == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) continue;
+        if (g_cuda_user_node_claims_hook(node)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// dp-moe-ext: score-table version hook (see header). Returns the
+// scheduler's monotonic score_table_version counter; 0 if no runtime
+// is currently installed.
+typedef uint64_t (*ggml_cuda_dp_moe_score_version_hook_t)(void);
+static ggml_cuda_dp_moe_score_version_hook_t g_cuda_dp_moe_score_version_hook = nullptr;
+
+extern "C" void ggml_cuda_set_dp_moe_score_version_hook(void * hook_fn) {
+    g_cuda_dp_moe_score_version_hook =
+        (ggml_cuda_dp_moe_score_version_hook_t) hook_fn;
+}
+
+// dp-moe-ext integration: generic pre-op claim hook. Fires at the
+// very top of ggml_cuda_compute_forward, before the per-op dispatch
+// switch — gives a registered hook the chance to claim ANY op by
+// returning true. See ggml-cuda.h::ggml_cuda_set_pre_op_hook for the
+// public surface. Used by Mode A milestone-1's sentinel-dispatch
+// mechanism (a GGML_OP_DUP node named "dp_moe.moe_layer_<N>"
+// carries pre-built routing tensors in src[1..3]; the dp_moe
+// executor recognises the name, runs the managed MoE block as a
+// host-eager call, and returns true to skip the default DUP kernel).
+typedef bool (*ggml_cuda_pre_op_hook_t)(cudaStream_t, struct ggml_tensor *);
+static ggml_cuda_pre_op_hook_t g_cuda_pre_op_hook = nullptr;
+
+extern "C" void ggml_cuda_set_pre_op_hook(void * hook_fn) {
+    g_cuda_pre_op_hook = (ggml_cuda_pre_op_hook_t) hook_fn;
 }
 
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // streamllm-ext override path. Runs first so the extension can claim
+    // dp-moe-ext override path. Runs first so the extension can claim
     // managed weights before cuBLAS / custom quant kernels do anything.
     if (g_cuda_mul_mat_hook != nullptr &&
         g_cuda_mul_mat_hook(ctx.stream(), src0, src1, dst)) {
@@ -2571,13 +2589,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    // streamllm-ext override path. Mirrors the dense ggml_cuda_mul_mat
-    // hook protocol: returning true means "op handled", false falls
-    // through to the normal MoE dispatch below.
-    if (g_cuda_mul_mat_id_hook != nullptr &&
-        g_cuda_mul_mat_id_hook(ctx.stream(), src0, src1, ids, dst)) {
-        return;
-    }
+    // dp-moe-ext Mode A claims managed MoE through the generic
+    // pre_op_hook on a per-layer sentinel node, NOT through this
+    // per-canonical MUL_MAT_ID interception (which was retired in
+    // the M1 cleanup pass). Stock MoE dispatch continues unchanged.
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -2733,6 +2748,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // dp-moe-ext pre-op claim hook (Mode A milestone-1). When set,
+    // the hook inspects every node before its default dispatch and may
+    // claim it by returning true. Returning true short-circuits the
+    // switch below — the default kernel does NOT execute, so the hook
+    // is responsible for filling dst (or leaving it intentionally
+    // unwritten, e.g. when dst is a sentinel whose payload was already
+    // produced by a host-eager call). Returning false falls through to
+    // the regular switch dispatch.
+    if (g_cuda_pre_op_hook != nullptr &&
+        g_cuda_pre_op_hook(ctx.stream(), dst)) {
+        return true;
+    }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -3195,7 +3223,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
-    // streamllm-ext's mul_mat hook previously used per-call
+    // dp-moe-ext's mul_mat hook previously used per-call
     // cudaMallocAsync for pointer-array + acc_f32 staging, which is
     // graph-unsafe. Post-refactor the hook uses a runtime-owned
     // single-stream scratch and pre-uploaded per-tensor device ptr
@@ -3207,21 +3235,24 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // when registered + the env is on, our hook handles the op without
     // a stream sync, and the F16 mul_mat_id guard at the bottom of this
     // function gets bypassed too.
-    const bool stream_llm_hook =
-        (g_cuda_mul_mat_hook    != nullptr) ||
-        (g_cuda_mul_mat_id_hook != nullptr);
-    if (stream_llm_hook) {
-        const char * enable = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
-        const bool allow = enable && (enable[0] == '1' || enable[0] == 't' || enable[0] == 'T');
-        if (!allow) return false;
+    // dp-moe-ext: the mul_mat hook now serves only as the M1
+    // dense-managed clear-fail; managed MoE flows through the
+    // sentinel rail claimed via the generic pre_op_hook (and
+    // user_node_claims_hook already disables capture for those
+    // cgraphs). The dense hook being installed is still enough of a
+    // signal that dp_moe is active to gate capture off unless the
+    // operator explicitly opts in.
+    const bool dp_moe_hook =
+        (g_cuda_mul_mat_hook != nullptr) || (g_cuda_pre_op_hook != nullptr);
+    if (dp_moe_hook) {
+        // DP_MOE_ALLOW_CAPTURE is the only DPMoE graph-capture escape
+        // hatch. Runtime/TPS mode stays eager; benchmark mode sets this
+        // after requesting full pin through DP_MOE_PIN_ALL.
+        const char * allow_capture_env = std::getenv("DP_MOE_ALLOW_CAPTURE");
+        const bool allow_capture =
+            allow_capture_env && allow_capture_env[0] && allow_capture_env[0] != '0';
+        if (!allow_capture) return false;
     }
-    const bool stream_llm_id_hook_active =
-        (g_cuda_mul_mat_id_hook != nullptr) &&
-        ([] {
-            const char * e = std::getenv("STREAMLLM_ENABLE_CUDA_GRAPHS");
-            return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
-        })();
-
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
@@ -3241,22 +3272,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            // streamllm-ext: when our F1 fused MoE hook handles this
-            // op (no in-op stream sync), the upstream sync-required
-            // condition doesn't apply. Skip the disable check in that
-            // case so F2 (graph capture for MoE) can proceed.
-            if (!stream_llm_id_hook_active) {
-                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-                if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                    // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                    // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/18958
-                    use_cuda_graph = false;
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+                use_cuda_graph = false;
 #ifndef NDEBUG
-                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
-                }
             }
         }
 
@@ -3278,11 +3303,36 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    if (cgraph->uid != 0 &&
+    // dp-moe-ext: score-table version key. Kernel grid dims for
+    // managed mul_mat dispatches are derived host-side from the
+    // current dial during ``on_graph_compute_begin``; if the dial
+    // changes between captures the previously-captured graph would
+    // replay with stale grid dims. Force re-capture on any version
+    // mismatch.
+    bool dp_moe_version_changed = false;
+    if (g_cuda_dp_moe_score_version_hook != nullptr) {
+        const uint64_t cur = g_cuda_dp_moe_score_version_hook();
+        if (cur != graph->cached_dp_moe_score_version) {
+            graph->cached_dp_moe_score_version = cur;
+            dp_moe_version_changed = true;
+            static const bool log_cache = (getenv("DP_MOE_LOG_GRAPH_CACHE") != nullptr);
+            if (log_cache) {
+                GGML_LOG_INFO("[dp_moe] score_table_version=%llu → re-capture\n",
+                              (unsigned long long) cur);
+            }
+        }
+    }
+
+    if (!dp_moe_version_changed &&
+        cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
+    }
+
+    if (dp_moe_version_changed) {
+        res = true;
     }
 
     graph->uid = cgraph->uid;
@@ -3904,7 +3954,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
-                if (!disable_fusion) {
+                if (!disable_fusion && g_cuda_pre_op_hook == nullptr) {
                     ggml_cuda_topk_moe_args args;
 
                     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
@@ -3954,9 +4004,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
-                                    if (g_cuda_topk_moe_hook != nullptr) {
-                                        g_cuda_topk_moe_hook(cuda_ctx->stream(), logits, weights, ids);
-                                    }
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
@@ -3973,9 +4020,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                     ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
-                                    if (g_cuda_topk_moe_hook != nullptr) {
-                                        g_cuda_topk_moe_hook(cuda_ctx->stream(), logits, weights, ids);
-                                    }
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
@@ -4336,9 +4380,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // dp-moe-ext: graph-compute begin hook. Fires before any
+    // node-level dispatch so the scheduler can prewalk the cgraph
+    // (managed-tensor identification, prefetch, marker scan).
+    if (g_cuda_graph_compute_begin_hook != nullptr) {
+        g_cuda_graph_compute_begin_hook(cuda_ctx->stream(), cgraph);
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+
+    // dp-moe-ext: when the scheduler has claimed any node in this
+    // cgraph, force eager execution. The claimed nodes need their LOAD
+    // walk to run on every invocation; whole-cgraph cuda-graph capture
+    // would replay stale chunk pointers and produce garbage at tight
+    // VRAM caps. Per-segment capture is the right long-term answer
+    // (plan vigilant-stitching-heron); disabling capture entirely for
+    // affected cgraphs is the correct interim behaviour.
+    const bool dp_moe_force_eager =
+        ggml_cuda_cgraph_has_user_node(cgraph);
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4346,7 +4407,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (!dp_moe_force_eager && graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4386,6 +4447,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    // dp-moe-ext: graph-compute end hook. Symmetric with the begin
+    // hook above; the scheduler can release per-graph resources here.
+    if (g_cuda_graph_compute_end_hook != nullptr) {
+        g_cuda_graph_compute_end_hook(cuda_ctx->stream(), cgraph);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

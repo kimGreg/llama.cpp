@@ -11,9 +11,53 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
+
+// Forward declaration of the dp-moe-ext KBar setter so this
+// file doesn't take a hard include dependency on the dp-moe-ext tree.
+// Resolved at final link via the `llama` library's private dep on
+// `dp_moe_ext` when the CUDA extension is enabled. Weak fallbacks keep
+// stock and CPU-only tool builds linkable; a missing runtime is a no-op.
+extern "C" __attribute__((weak)) bool dp_moe_set_kbar(float, int) { return false; }
+extern "C" __attribute__((weak)) bool dp_moe_schedule_active(void) { return false; }
+namespace dp_moe_ext {
+__attribute__((weak)) bool dp_moe_schedule_get(
+    std::vector<int> *                out_thresholds,
+    std::vector<float> *              out_kbars,
+    int *                             out_allocator_mode) {
+    if (out_thresholds) out_thresholds->clear();
+    if (out_kbars) out_kbars->clear();
+    if (out_allocator_mode) *out_allocator_mode = 0;
+    return false;
+}
+}
+
+static bool parse_dp_moe_float(const char * s, float & out) {
+    if (!s || !*s) return false;
+    char * end = nullptr;
+    out = std::strtof(s, &end);
+    return end != s && out >= 0.0f;
+}
+
+static bool parse_dp_moe_int(const char * s, int & out) {
+    if (!s || !*s) return false;
+    char * end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s || v < 0 || v > INT_MAX) return false;
+    out = (int) v;
+    return true;
+}
+
+static const char * dp_moe_getenv2(const char * primary, const char * fallback) {
+    const char * v = std::getenv(primary);
+    if (v && *v) return v;
+    v = std::getenv(fallback);
+    return (v && *v) ? v : nullptr;
+}
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -121,10 +165,46 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    bool                          phase_aware_enabled = false;
+    float                         kbar_reasoning = 0.0f;
+    float                         kbar_generation = 0.0f;
+    common_reasoning_budget_state prev_rbudget_state  = REASONING_BUDGET_IDLE;
+
+    bool                          schedule_enabled = false;
+    std::vector<int>              schedule_thresholds;
+    std::vector<float>            schedule_kbars;
+    int                           schedule_allocator_mode = 0;
+    int                           n_tokens_generated = 0;
+    int                           schedule_next_idx  = 0;
+    bool                          schedule_generation_started = false;
+    bool                          schedule_linear_decay = false;
+    float                         schedule_pp_budget = 0.0f;
+    float                         schedule_tg_high_budget = 0.0f;
+    float                         schedule_tg_low_budget = 0.0f;
+    float                         schedule_last_applied_budget = -1.0f;
+    int                           schedule_tg_decay_start = 0;
+    int                           schedule_tg_decay_end = 0;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+
+        if (schedule_enabled) {
+            schedule_generation_started = false;
+            n_tokens_generated = 0;
+            schedule_next_idx = 0;
+            schedule_last_applied_budget = -1.0f;
+            const float kbar0 = schedule_linear_decay
+                ? schedule_pp_budget
+                : (!schedule_kbars.empty() ? schedule_kbars[0] : -1.0f);
+            if (kbar0 >= 0.0f) {
+                const bool ok = dp_moe_set_kbar(kbar0, schedule_allocator_mode);
+                schedule_last_applied_budget = kbar0;
+                LOG_INF("dp_moe kbar schedule: reset, primed kbar[0]=%s\n",
+                        ok ? "ok" : "no-op (no runtime)");
+            }
+        }
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -289,6 +369,42 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
+    // DP_MoE phase-aware extension: when the caller (typically a
+    // non-chat-template path like llama-completion or llama-perplexity)
+    // hasn't populated reasoning_budget_start/end from a chat template,
+    // honour direct token-id envs so the reasoning-budget sampler can
+    // still attach. Required for the phase-aware dial observer below
+    // to fire on <think>/</think> transitions.
+    if (params.reasoning_budget_start.empty() || params.reasoning_budget_end.empty()) {
+        auto parse_token_id_csv = [](const char * s) -> std::vector<llama_token> {
+            std::vector<llama_token> out;
+            if (!s || !*s) return out;
+            std::stringstream ss(s);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                try { out.push_back((llama_token) std::stoi(tok)); }
+                catch (...) { return {}; }
+            }
+            return out;
+        };
+        const char * open_csv  = std::getenv("DP_MOE_PHASE_OPEN_TOKEN_IDS");
+        const char * close_csv = std::getenv("DP_MOE_PHASE_CLOSE_TOKEN_IDS");
+        auto open_ids  = parse_token_id_csv(open_csv);
+        auto close_ids = parse_token_id_csv(close_csv);
+        if (!open_ids.empty() && !close_ids.empty()) {
+            params.reasoning_budget_start = std::move(open_ids);
+            params.reasoning_budget_end   = std::move(close_ids);
+            if (params.reasoning_budget_tokens < 0) {
+                params.reasoning_budget_tokens = INT_MAX;
+            }
+            LOG_INF("dp_moe phase-aware: reasoning_budget seeded from env "
+                    "(start_ids=%zu, end_ids=%zu, tokens=%d)\n",
+                    params.reasoning_budget_start.size(),
+                    params.reasoning_budget_end.size(),
+                    params.reasoning_budget_tokens);
+        }
+    }
+
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0)) {
         rbudget = common_reasoning_budget_init(
@@ -399,7 +515,211 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .phase_aware_enabled = */ false,
+        /* .kbar_reasoning = */ 0.0f,
+        /* .kbar_generation = */ 0.0f,
+        /* .prev_rbudget_state = */ REASONING_BUDGET_IDLE,
+        /* .schedule_enabled = */ false,
+        /* .schedule_thresholds = */ {},
+        /* .schedule_kbars = */ {},
+        /* .schedule_allocator_mode = */ 0,
+        /* .n_tokens_generated = */ 0,
+        /* .schedule_next_idx = */ 0,
+        /* .schedule_generation_started = */ false,
+        /* .schedule_linear_decay = */ false,
+        /* .schedule_pp_budget = */ 0.0f,
+        /* .schedule_tg_high_budget = */ 0.0f,
+        /* .schedule_tg_low_budget = */ 0.0f,
+        /* .schedule_last_applied_budget = */ -1.0f,
+        /* .schedule_tg_decay_start = */ 0,
+        /* .schedule_tg_decay_end = */ 0,
+        /* .t_total_us = */ 0,
     };
+
+    bool sch_from_api = false;
+    std::vector<int> sch_api_thr;
+    std::vector<float> sch_api_kbars;
+    int sch_api_allocator = 0;
+    if (dp_moe_schedule_active()) {
+        sch_from_api = dp_moe_ext::dp_moe_schedule_get(
+            &sch_api_thr, &sch_api_kbars, &sch_api_allocator);
+    }
+    if (sch_from_api) {
+        result->schedule_enabled    = true;
+        result->schedule_thresholds = std::move(sch_api_thr);
+        result->schedule_kbars      = std::move(sch_api_kbars);
+        result->schedule_allocator_mode = sch_api_allocator;
+        result->n_tokens_generated  = 0;
+        result->schedule_next_idx   = 0;
+        const bool ok = dp_moe_set_kbar(
+            result->schedule_kbars[0], result->schedule_allocator_mode);
+        LOG_INF("dp_moe kbar schedule (HTTP API): %zu transition(s); "
+                "primed kbar[0]=%s\n",
+                result->schedule_thresholds.size(),
+                ok ? "ok" : "no-op (no runtime)");
+    }
+    const char * sch_pp_env        = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_PP_BUDGET", "DP_MOE_PP_BUDGET") : nullptr;
+    const char * sch_tg_high_env   = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_HIGH_BUDGET", "DP_MOE_TG_HIGH_BUDGET") : nullptr;
+    const char * sch_tg_low_env    = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_LOW_BUDGET", "DP_MOE_TG_LOW_BUDGET") : nullptr;
+    const char * sch_decay_start_env = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_DECAY_START", "DP_MOE_TG_DECAY_START") : nullptr;
+    const char * sch_decay_end_env   = !sch_from_api ? dp_moe_getenv2("DP_MOE_KBAR_TG_DECAY_END", "DP_MOE_TG_DECAY_END") : nullptr;
+    float sch_pp = 0.0f;
+    float sch_tg_high = 0.0f;
+    float sch_tg_low = 0.0f;
+    int sch_decay_start = 0;
+    int sch_decay_end = 0;
+    const bool sch_linear_present =
+        sch_pp_env || sch_tg_high_env || sch_tg_low_env ||
+        sch_decay_start_env || sch_decay_end_env;
+    if (!sch_from_api && sch_linear_present) {
+        const bool valid =
+            parse_dp_moe_float(sch_pp_env,      sch_pp) &&
+            parse_dp_moe_float(sch_tg_high_env, sch_tg_high) &&
+            parse_dp_moe_float(sch_tg_low_env,  sch_tg_low) &&
+            parse_dp_moe_int  (sch_decay_start_env, sch_decay_start) &&
+            parse_dp_moe_int  (sch_decay_end_env,   sch_decay_end) &&
+            sch_decay_end > sch_decay_start;
+        if (valid) {
+            result->schedule_enabled          = true;
+            result->schedule_linear_decay     = true;
+            result->schedule_pp_budget        = sch_pp;
+            result->schedule_tg_high_budget   = sch_tg_high;
+            result->schedule_tg_low_budget    = sch_tg_low;
+            result->schedule_tg_decay_start   = sch_decay_start;
+            result->schedule_tg_decay_end     = sch_decay_end;
+            result->n_tokens_generated        = 0;
+            result->schedule_next_idx         = 0;
+            const bool ok = dp_moe_set_kbar(
+                result->schedule_pp_budget, result->schedule_allocator_mode);
+            result->schedule_last_applied_budget = result->schedule_pp_budget;
+            LOG_INF("dp_moe linear kbar schedule: pp=%.3f, tg_high=%.3f, "
+                    "tg_low=%.3f, decay=[%d,%d] (primed pp=%s)\n",
+                    sch_pp, sch_tg_high, sch_tg_low,
+                    sch_decay_start, sch_decay_end,
+                    ok ? "ok" : "no-op (no runtime)");
+        } else {
+            LOG_WRN("dp_moe linear kbar schedule: env vars present but "
+                    "malformed — expected PP/TG_HIGH/TG_LOW budgets and "
+                    "TG_DECAY_END > TG_DECAY_START — disabled\n");
+        }
+    }
+
+    const char * sch_prefill_env = (!sch_from_api && !result->schedule_enabled) ? std::getenv("DP_MOE_KBAR_PREFILL") : nullptr;
+    const char * sch_front_env   = !sch_from_api ? std::getenv("DP_MOE_KBAR_FRONT") : nullptr;
+    const char * sch_rear_env    = !sch_from_api ? std::getenv("DP_MOE_KBAR_REAR") : nullptr;
+    const char * sch_front_n_env = !sch_from_api ? std::getenv("DP_MOE_KBAR_FRONT_TOKENS") : nullptr;
+    float sch_prefill = 0.0f;
+    float sch_front   = 0.0f;
+    float sch_rear    = 0.0f;
+    int sch_front_tokens = 0;
+    const bool sch_three_present =
+        sch_prefill_env || sch_front_env || sch_rear_env || sch_front_n_env;
+    if (!sch_from_api && !result->schedule_enabled && sch_three_present) {
+        const bool valid =
+            parse_dp_moe_float(sch_prefill_env, sch_prefill) &&
+            parse_dp_moe_float(sch_front_env,   sch_front) &&
+            parse_dp_moe_float(sch_rear_env,    sch_rear) &&
+            parse_dp_moe_int  (sch_front_n_env, sch_front_tokens) &&
+            sch_front_tokens > 0;
+        if (valid) {
+            result->schedule_enabled    = true;
+            result->schedule_thresholds = { 0, sch_front_tokens };
+            result->schedule_kbars      = { sch_prefill, sch_front, sch_rear };
+            result->n_tokens_generated  = 0;
+            result->schedule_next_idx   = 0;
+            const bool ok = dp_moe_set_kbar(
+                result->schedule_kbars[0], result->schedule_allocator_mode);
+            LOG_INF("dp_moe 3-level kbar schedule: prefill=%.3f, "
+                    "front=%.3f for %d generated token(s), rear=%.3f "
+                    "(primed prefill=%s)\n",
+                    sch_prefill, sch_front, sch_front_tokens, sch_rear,
+                    ok ? "ok" : "no-op (no runtime)");
+        } else {
+            LOG_WRN("dp_moe 3-level kbar schedule: env vars present but "
+                    "malformed — expected DP_MOE_KBAR_PREFILL, "
+                    "DP_MOE_KBAR_FRONT, DP_MOE_KBAR_REAR, and "
+                    "DP_MOE_KBAR_FRONT_TOKENS>0 — disabled\n");
+        }
+    }
+    const char * sch_thr_csv  = (!sch_from_api && !result->schedule_enabled) ? std::getenv("DP_MOE_KBAR_SCHEDULE_TOKENS") : nullptr;
+    const char * sch_dial_csv = (!sch_from_api && !result->schedule_enabled) ? std::getenv("DP_MOE_KBAR_SCHEDULE_VALUES") : nullptr;
+    // Treat empty strings as unset — the orchestrator may clear env
+    // explicitly when using the HTTP API path.
+    if (sch_thr_csv  && !sch_thr_csv[0])  sch_thr_csv  = nullptr;
+    if (sch_dial_csv && !sch_dial_csv[0]) sch_dial_csv = nullptr;
+    if (sch_thr_csv && sch_dial_csv) {
+        auto parse_int_csv = [](const char * s) {
+            std::vector<int> out;
+            std::stringstream ss(s ? s : "");
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                try { out.push_back(std::stoi(tok)); }
+                catch (...) { return std::vector<int>{}; }
+            }
+            return out;
+        };
+        auto parse_kbars = [](const char * s) {
+            std::vector<float> out;
+            std::stringstream ss(s ? s : "");
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                try {
+                    float v = std::stof(tok);
+                    if (v < 0.0f) return std::vector<float>{};
+                    out.push_back(v);
+                } catch (...) {
+                    return std::vector<float>{};
+                }
+            }
+            return out;
+        };
+        auto sch_thr   = parse_int_csv(sch_thr_csv);
+        auto sch_kbars = parse_kbars(sch_dial_csv);
+        bool valid = (!sch_thr.empty() && sch_kbars.size() == sch_thr.size() + 1);
+        for (size_t i = 1; valid && i < sch_thr.size(); ++i) {
+            if (sch_thr[i] <= sch_thr[i - 1]) valid = false;
+        }
+        if (valid) {
+            result->schedule_enabled    = true;
+            result->schedule_thresholds = std::move(sch_thr);
+            result->schedule_kbars      = std::move(sch_kbars);
+            result->n_tokens_generated  = 0;
+            result->schedule_next_idx   = 0;
+            const bool ok = dp_moe_set_kbar(
+                result->schedule_kbars[0], result->schedule_allocator_mode);
+            LOG_INF("dp_moe kbar schedule: enabled with %zu transition(s); "
+                    "primed kbar[0]=%s\n",
+                    result->schedule_thresholds.size(),
+                    ok ? "ok" : "no-op (no runtime)");
+        } else {
+            LOG_WRN("dp_moe kbar schedule: env vars present but malformed "
+                    "(thresholds=%zu, kbars=%zu — expected kbars=thresholds+1, "
+                    "thresholds strictly ascending) — disabled\n",
+                    sch_thr.size(), sch_kbars.size());
+        }
+    }
+
+    if (rbudget && !result->schedule_enabled) {
+        const char * thr_r_csv = std::getenv("DP_MOE_PHASE_REASONING_KBAR");
+        const char * thr_g_csv = std::getenv("DP_MOE_PHASE_GENERATION_KBAR");
+        if (thr_r_csv && thr_g_csv) {
+            float kbar_r = 0.0f;
+            float kbar_g = 0.0f;
+            if (parse_dp_moe_float(thr_r_csv, kbar_r) &&
+                parse_dp_moe_float(thr_g_csv, kbar_g)) {
+                result->phase_aware_enabled = true;
+                result->kbar_reasoning      = kbar_r;
+                result->kbar_generation     = kbar_g;
+                result->prev_rbudget_state  = REASONING_BUDGET_IDLE;
+                const bool ok = dp_moe_set_kbar(result->kbar_reasoning, 0);
+                LOG_INF("dp_moe phase-aware dial: enabled, primed reasoning=%s\n",
+                        ok ? "ok" : "no-op (no runtime)");
+            } else {
+                LOG_WRN("dp_moe phase-aware dial: env vars present but "
+                        "KBar values malformed — disabled\n");
+            }
+        }
+    }
 
     return result;
 }
@@ -414,6 +734,62 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->chain);
 
     delete gsmpl;
+}
+
+static float dp_moe_linear_budget_for_token(const common_sampler * gsmpl, int token_idx) {
+    if (token_idx <= gsmpl->schedule_tg_decay_start) {
+        return gsmpl->schedule_tg_high_budget;
+    }
+    if (token_idx >= gsmpl->schedule_tg_decay_end) {
+        return gsmpl->schedule_tg_low_budget;
+    }
+    const float denom = (float) (gsmpl->schedule_tg_decay_end - gsmpl->schedule_tg_decay_start);
+    const float alpha = (float) (token_idx - gsmpl->schedule_tg_decay_start) / denom;
+    return gsmpl->schedule_tg_high_budget +
+           alpha * (gsmpl->schedule_tg_low_budget - gsmpl->schedule_tg_high_budget);
+}
+
+static bool dp_moe_apply_scheduled_kbar(common_sampler * gsmpl, float kbar) {
+    if (gsmpl->schedule_last_applied_budget >= 0.0f &&
+        std::fabs(gsmpl->schedule_last_applied_budget - kbar) < 1.0e-6f)
+    {
+        return true;
+    }
+    const bool ok = dp_moe_set_kbar(kbar, gsmpl->schedule_allocator_mode);
+    gsmpl->schedule_last_applied_budget = kbar;
+    return ok;
+}
+
+void common_sampler_dp_moe_begin_generation(struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->schedule_enabled || gsmpl->schedule_generation_started) {
+        return;
+    }
+
+    gsmpl->schedule_generation_started = true;
+    gsmpl->n_tokens_generated = 0;
+
+    if (gsmpl->schedule_linear_decay) {
+        const bool ok = dp_moe_apply_scheduled_kbar(
+            gsmpl, gsmpl->schedule_tg_high_budget);
+        LOG_INF("dp_moe linear kbar schedule: generation begin, "
+                "tg_high=%.3f (set_kbar=%s)\n",
+                gsmpl->schedule_tg_high_budget, ok ? "ok" : "no-op");
+        return;
+    }
+
+    while (gsmpl->schedule_next_idx <
+           (int) gsmpl->schedule_thresholds.size() &&
+           gsmpl->schedule_thresholds[gsmpl->schedule_next_idx] == 0)
+    {
+        const int next_dial = gsmpl->schedule_next_idx + 1;
+        const float kbar = gsmpl->schedule_kbars[next_dial];
+        const bool ok = dp_moe_set_kbar(
+            kbar, gsmpl->schedule_allocator_mode);
+        LOG_INF("dp_moe kbar schedule: generation begin, "
+                "swap to kbar[%d] (set_kbar=%s)\n",
+                next_dial, ok ? "ok" : "no-op");
+        gsmpl->schedule_next_idx++;
+    }
 }
 
 static bool grammar_should_apply(struct common_sampler * gsmpl) {
@@ -437,11 +813,73 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     }
 
     const auto tm = gsmpl->tm();
+    const bool is_generation_accept = accept_grammar;
 
     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
     accept_grammar = accept_grammar && grammar_should_apply(gsmpl);
 
     llama_sampler_accept(gsmpl->rbudget, token);
+
+    if (gsmpl->schedule_enabled && !gsmpl->schedule_generation_started && is_generation_accept) {
+        common_sampler_dp_moe_begin_generation(gsmpl);
+    }
+
+    if (gsmpl->schedule_enabled && gsmpl->schedule_generation_started) {
+        gsmpl->n_tokens_generated++;
+        if (gsmpl->schedule_linear_decay) {
+            const int next_token_idx = gsmpl->n_tokens_generated + 1;
+            const float next_kbar =
+                dp_moe_linear_budget_for_token(gsmpl, next_token_idx);
+            const bool ok = dp_moe_apply_scheduled_kbar(gsmpl, next_kbar);
+            if (gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_start ||
+                gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_end - 1 ||
+                gsmpl->n_tokens_generated == gsmpl->schedule_tg_decay_end)
+            {
+                LOG_INF("dp_moe linear kbar schedule: at token %d, "
+                        "next_token=%d kbar=%.3f (set_kbar=%s)\n",
+                        gsmpl->n_tokens_generated, next_token_idx,
+                        next_kbar, ok ? "ok" : "no-op");
+            }
+        } else {
+            while (gsmpl->schedule_next_idx <
+               (int) gsmpl->schedule_thresholds.size() &&
+               gsmpl->n_tokens_generated >=
+               gsmpl->schedule_thresholds[gsmpl->schedule_next_idx])
+            {
+                const int next_dial = gsmpl->schedule_next_idx + 1;
+                const float kbar = gsmpl->schedule_kbars[next_dial];
+                const bool ok = dp_moe_set_kbar(
+                    kbar, gsmpl->schedule_allocator_mode);
+                LOG_INF("dp_moe kbar schedule: at token %d, "
+                        "swap to kbar[%d] (set_kbar=%s)\n",
+                        gsmpl->n_tokens_generated, next_dial,
+                        ok ? "ok" : "no-op");
+                gsmpl->schedule_next_idx++;
+            }
+        }
+    }
+
+    // Phase-aware adaptive dial: observe the reasoning-budget state
+    // *after* the accept above has updated it. Flip the dp_moe score
+    // table on any transition into/out of the reasoning phase.
+    if (gsmpl->phase_aware_enabled && gsmpl->rbudget) {
+        const auto cur = common_reasoning_budget_get_state(gsmpl->rbudget);
+        if (cur != gsmpl->prev_rbudget_state) {
+            const bool in_reasoning =
+                (cur == REASONING_BUDGET_IDLE         ||
+                 cur == REASONING_BUDGET_COUNTING     ||
+                 cur == REASONING_BUDGET_WAITING_UTF8 ||
+                 cur == REASONING_BUDGET_FORCING);
+            const float kbar = in_reasoning ? gsmpl->kbar_reasoning
+                                            : gsmpl->kbar_generation;
+            const bool ok = dp_moe_set_kbar(kbar, 0);
+            LOG_INF("dp_moe phase-aware dial: %s -> %s (set_kbar=%s)\n",
+                    in_reasoning ? "non-reasoning" : "reasoning",
+                    in_reasoning ? "reasoning"     : "generation",
+                    ok ? "ok" : "no-op");
+            gsmpl->prev_rbudget_state = cur;
+        }
+    }
 
     if (gsmpl->grmr && accept_grammar) {
         llama_sampler_accept(gsmpl->grmr, token);
@@ -469,6 +907,25 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .phase_aware_enabled = */ gsmpl->phase_aware_enabled,
+        /* .kbar_reasoning = */ gsmpl->kbar_reasoning,
+        /* .kbar_generation = */ gsmpl->kbar_generation,
+        /* .prev_rbudget_state = */ gsmpl->prev_rbudget_state,
+        /* .schedule_enabled = */ gsmpl->schedule_enabled,
+        /* .schedule_thresholds = */ gsmpl->schedule_thresholds,
+        /* .schedule_kbars = */ gsmpl->schedule_kbars,
+        /* .schedule_allocator_mode = */ gsmpl->schedule_allocator_mode,
+        /* .n_tokens_generated = */ gsmpl->n_tokens_generated,
+        /* .schedule_next_idx = */ gsmpl->schedule_next_idx,
+        /* .schedule_generation_started = */ gsmpl->schedule_generation_started,
+        /* .schedule_linear_decay = */ gsmpl->schedule_linear_decay,
+        /* .schedule_pp_budget = */ gsmpl->schedule_pp_budget,
+        /* .schedule_tg_high_budget = */ gsmpl->schedule_tg_high_budget,
+        /* .schedule_tg_low_budget = */ gsmpl->schedule_tg_low_budget,
+        /* .schedule_last_applied_budget = */ gsmpl->schedule_last_applied_budget,
+        /* .schedule_tg_decay_start = */ gsmpl->schedule_tg_decay_start,
+        /* .schedule_tg_decay_end = */ gsmpl->schedule_tg_decay_end,
+        /* .t_total_us = */ gsmpl->t_total_us,
     };
 }
 

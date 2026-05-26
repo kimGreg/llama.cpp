@@ -155,21 +155,37 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
 
-            cur_moe = build_moe_ffn(cur_moe,
-                    nullptr, // gate_inp
-                    nullptr, // up_exps
-                    nullptr, // gate_exps
-                    model.layers[il].ffn_down_exps,
-                    nullptr, // exp_probs_b (not used for gemma4)
-                    n_expert, n_expert_used,
-                    LLM_FFN_GELU, true,
-                    1.0f,
-                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                    il, logits,
-                    model.layers[il].ffn_gate_up_exps,
-                    nullptr, // up_exps_s
-                    nullptr, // gate_exps_s
-                    model.layers[il].ffn_down_exps_s);
+            if (model.dp_moe_executor != nullptr) {
+                // DP_MoE Mode A — Gemma 4 MoE goes through the
+                // pre_routed sentinel.  We've already built the
+                // custom logits above; reuse them.  Gemma 4 uses
+                // SOFTMAX + norm_w=true + GELU; the executor must
+                // have set_activation(GELU) called at install time
+                // for this arch (see qwen3_runtime_glue.cpp).
+                auto router = llm_build_moe_routing_softmax_topk(
+                    ctx0, logits, n_expert, n_expert_used,
+                    /*norm_w=*/true);
+                ggml_build_forward_expand(gf, router.weights);
+                cur_moe = llm_build_moe_sentinel_pre_routed(
+                    ctx0, cur_moe, router.ids, router.probs,
+                    router.weights, il);
+            } else {
+                cur_moe = build_moe_ffn(cur_moe,
+                        nullptr, // gate_inp
+                        nullptr, // up_exps
+                        nullptr, // gate_exps
+                        model.layers[il].ffn_down_exps,
+                        nullptr, // exp_probs_b (not used for gemma4)
+                        n_expert, n_expert_used,
+                        LLM_FFN_GELU, true,
+                        1.0f,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        il, logits,
+                        model.layers[il].ffn_gate_up_exps,
+                        nullptr, // up_exps_s
+                        nullptr, // gate_exps_s
+                        model.layers[il].ffn_down_exps_s);
+            }
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);

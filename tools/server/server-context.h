@@ -122,14 +122,10 @@ struct server_routes {
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
-    // streamllm-ext live-tunable precision dial. POST a JSON body with
-    // {"thresholds": [...], "chunks": [...]} to swap the active score
-    // table; subsequent dispatches see the new table. Safe to call
-    // mid-generation from any thread — the in-flight forward pass keeps
-    // using the snapshot it took at entry, so output never tears.
-    server_http_context::handler_t post_streamllm_score_table;
-    server_http_context::handler_t get_streamllm_score_table;
-    server_http_context::handler_t get_streamllm_stats;
+    server_http_context::handler_t post_dp_moe_kbar;
+    server_http_context::handler_t get_dp_moe_kbar;
+    server_http_context::handler_t post_dp_moe_kbar_schedule;
+    server_http_context::handler_t get_dp_moe_stats;
 private:
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
